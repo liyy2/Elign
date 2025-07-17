@@ -6,7 +6,7 @@ This repository contains an E(3) Equivariant Diffusion Model for Molecule Genera
 
 ### 1. Access to UMA via Hugging Face
 
-First, you need to have access to the UMA (Unified Molecular Assay) models via Hugging Face:
+First, you need to have access to the UMA models via Hugging Face:
 
 1. **Create a Hugging Face account** at [huggingface.co](https://huggingface.co)
 2. **Request access** to the UMA model repository
