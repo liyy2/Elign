@@ -1,0 +1,17 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: eval_mlff_guided.py (with model_path)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "eval_mlff_guided.py",
+            "args": [
+                "--model_path",
+                "outputs/edm_qm9"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "/home/yl2428/e3_diffusion_for_molecules-main/e3_diffusion_for_molecules-main"
+        }
+    ]
+}

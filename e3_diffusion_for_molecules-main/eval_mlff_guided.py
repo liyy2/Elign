@@ -87,7 +87,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         context = None
         
         # Sample with different guidance scales
-        guidance_scales = [0.5, 1.0, 2.0]
+        guidance_scales = [0.0, 0.0005, 0.0007, 0.008]  # Include 0.0 to test consistency with baseline
         guided_results = {}
         
         for guidance_scale in guidance_scales:
@@ -246,47 +246,44 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
     if mlff_predictor is not None:
         print("2. Sampling guided chain...")
         
-        try:
-            # Create guided model
-            guided_model = create_mlff_guided_model(
-                flow, mlff_predictor, guidance_scale=1.0, dataset_info=dataset_info
-            )
+        # Create guided model
+        guided_model = create_mlff_guided_model(
+            flow, mlff_predictor, guidance_scale=1.0, dataset_info=dataset_info
+        )
+        
+        # Sample guided chain
+        n_samples = 1
+        node_mask = torch.ones(n_samples, n_nodes, 1, device=device)
+        edge_mask = torch.ones(n_samples, n_nodes, n_nodes, device=device)
+        diag_mask = ~torch.eye(n_nodes, dtype=torch.bool, device=device).unsqueeze(0)
+        edge_mask = edge_mask * diag_mask.unsqueeze(0)
+        edge_mask = edge_mask.view(n_samples * n_nodes * n_nodes, 1)
+        context = None
+        
+        # Sample chain with guidance
+        chain = guided_model.sample_chain(
+            n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=100
+        )
+        
+        # Process chain for visualization
+        x_guided = chain[:, :, :3]
+        h_guided_cat = chain[:, :, 3:-1] if guided_model.include_charges else chain[:, :, 3:]
+        h_guided_int = chain[:, :, -1:] if guided_model.include_charges else torch.zeros(chain.shape[0], chain.shape[1], 1, device=device)
+        
+        # Keep categorical features as one-hot encoded (don't convert to indices)
+        one_hot_guided = h_guided_cat
+        charges_guided = h_guided_int if guided_model.include_charges else torch.zeros(chain.shape[0], chain.shape[1], 1, device=device)
+        
+        # Save guided chain
+        target_path = 'eval/mlff_guided/chain_guided/'
+        vis.save_xyz_file(
+            join(eval_args.model_path, target_path),
+            one_hot_guided, charges_guided, x_guided,
+            dataset_info, id_from=0, name='chain_guided'
+        )
+        
+        print("   ✓ Guided chain saved")
             
-            # Sample guided chain
-            n_samples = 1
-            node_mask = torch.ones(n_samples, n_nodes, 1, device=device)
-            edge_mask = torch.ones(n_samples, n_nodes, n_nodes, device=device)
-            diag_mask = ~torch.eye(n_nodes, dtype=torch.bool, device=device).unsqueeze(0)
-            edge_mask = edge_mask * diag_mask.unsqueeze(0)
-            edge_mask = edge_mask.view(n_samples * n_nodes * n_nodes, 1)
-            context = None
-            
-            # Sample chain with guidance
-            chain = guided_model.sample_chain(
-                n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=100
-            )
-            
-            # Process chain for visualization
-            x_guided = chain[:, :, :3]
-            h_guided_cat = chain[:, :, 3:-1] if guided_model.include_charges else chain[:, :, 3:]
-            h_guided_int = chain[:, :, -1:] if guided_model.include_charges else torch.zeros(0, device=device)
-            
-            # Convert to proper format
-            one_hot_guided = torch.argmax(h_guided_cat, dim=2)
-            charges_guided = h_guided_int if guided_model.include_charges else torch.zeros_like(one_hot_guided)
-            
-            # Save guided chain
-            target_path = 'eval/mlff_guided/chain_guided/'
-            vis.save_xyz_file(
-                join(eval_args.model_path, target_path),
-                one_hot_guided, charges_guided, x_guided,
-                dataset_info, id_from=0, name='chain_guided'
-            )
-            
-            print("   ✓ Guided chain saved")
-            
-        except Exception as e:
-            print(f"   ✗ Error sampling guided chain: {e}")
     
     else:
         print("2. Skipping guided chain (predictor not available)")
@@ -313,7 +310,7 @@ def main():
     parser.add_argument('--task_name', type=str, default='omol',
                         help='Task name for MLFF predictor')
     parser.add_argument('--guidance_scales', type=float, nargs='+', 
-                        default=[0.5, 1.0, 2.0],
+                        default=[0.0, 0.5, 1.0, 2.0],
                         help='Guidance scales to test')
     
     # Evaluation options
@@ -395,26 +392,22 @@ def main():
             output_dir = join(eval_args.model_path, 'eval/mlff_guided/')
             
             # Visualize baseline
-            try:
-                vis.visualize(
-                    join(output_dir, 'baseline/'), dataset_info,
-                    max_num=100, spheres_3d=True
-                )
-                print("✓ Baseline visualization saved")
-            except Exception as e:
-                print(f"Warning: Could not create baseline visualization: {e}")
+            vis.visualize(
+                join(output_dir, 'baseline/'), dataset_info,
+                max_num=100, spheres_3d=True
+            )
+            print("✓ Baseline visualization saved")
             
             # Visualize guided results
             for guidance_scale in eval_args.guidance_scales:
                 if guidance_scale in results['guided'] and results['guided'][guidance_scale] is not None:
-                    try:
-                        vis.visualize(
-                            join(output_dir, f'guided_scale_{guidance_scale}/'), dataset_info,
-                            max_num=100, spheres_3d=True
-                        )
-                        print(f"✓ Guided visualization (scale {guidance_scale}) saved")
-                    except Exception as e:
-                        print(f"Warning: Could not create guided visualization (scale {guidance_scale}): {e}")
+
+                    vis.visualize(
+                        join(output_dir, f'guided_scale_{guidance_scale}/'), dataset_info,
+                        max_num=100, spheres_3d=True
+                    )
+                    print(f"✓ Guided visualization (scale {guidance_scale}) saved")
+
     
     # Run chain visualization
     if not eval_args.skip_chain:
@@ -431,23 +424,20 @@ def main():
         if not eval_args.skip_visualization:
             output_dir = join(eval_args.model_path, 'eval/mlff_guided/')
             
-            try:
-                vis.visualize_chain_uncertainty(
-                    join(output_dir, 'chain_baseline/'), dataset_info, spheres_3d=True
-                )
-                print("✓ Baseline chain visualization saved")
-            except Exception as e:
-                print(f"Warning: Could not create baseline chain visualization: {e}")
+            vis.visualize_chain_uncertainty(
+                join(output_dir, 'chain_baseline/'), dataset_info, spheres_3d=True
+            )
+            print("✓ Baseline chain visualization saved")
+
+
             
             if mlff_predictor is not None:
-                try:
-                    vis.visualize_chain_uncertainty(
-                        join(output_dir, 'chain_guided/'), dataset_info, spheres_3d=True
-                    )
-                    print("✓ Guided chain visualization saved")
-                except Exception as e:
-                    print(f"Warning: Could not create guided chain visualization: {e}")
-    
+
+                vis.visualize_chain_uncertainty(
+                    join(output_dir, 'chain_guided/'), dataset_info, spheres_3d=True
+                )
+                print("✓ Guided chain visualization saved")
+
     print("\n" + "="*50)
     print("EVALUATION COMPLETE")
     print("="*50)
