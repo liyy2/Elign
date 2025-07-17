@@ -173,9 +173,9 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         if self.mlff_predictor is None:
             return torch.zeros_like(z[:, :, :self.n_dims])
         
-        # Check if system is feasible for MLFF prediction
-        if not self.check_system_feasibility(z, node_mask, max_distance=6.0):
-            return torch.zeros_like(z[:, :, :self.n_dims])
+        # # Check if system is feasible for MLFF prediction
+        # if not self.check_system_feasibility(z, node_mask, max_distance=6.0):
+        #     return torch.zeros_like(z[:, :, :self.n_dims])
             
         # Convert to AtomicData format
         atomic_data_list = self.diffusion_to_atomic_data(z, node_mask, dataset_info)
@@ -246,8 +246,8 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         noise_level = sigma.mean().item() if sigma.numel() > 0 else 1.0
         max_distance = 6.0 if noise_level < 0.5 else 10.0  # More lenient for high noise
         
-        if not self.check_system_feasibility(z, node_mask, max_distance=max_distance):
-            return z
+        # if not self.check_system_feasibility(z, node_mask, max_distance=max_distance):
+        #     return z
             
         # Get MLFF forces
         forces = self.get_mlff_forces(z, node_mask, dataset_info)
@@ -394,24 +394,16 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
     Returns:
         MLFFGuidedDiffusion model
     """
-    # Detect noise schedule and loss type from original model
-    # Check if gamma is a GammaNetwork (learned) or PredefinedNoiseSchedule (fixed)
-    if hasattr(original_model.gamma, 'l1'):  # GammaNetwork has l1, l2, l3 layers
-        noise_schedule = 'learned'
-        loss_type = 'vlb'  # Learned schedules require vlb loss
-    else:  # PredefinedNoiseSchedule
-        noise_schedule = 'cosine'  # Default to cosine for safety
-        loss_type = original_model.loss_type
-    
     # Create guided model with same parameters as original
+    # Use dummy noise schedule since we'll copy the exact gamma later
     guided_model = MLFFGuidedDiffusion(
         dynamics=original_model.dynamics,
         in_node_nf=original_model.in_node_nf,
         n_dims=original_model.n_dims,
         timesteps=original_model.T,
         parametrization='eps',
-        noise_schedule=noise_schedule,
-        loss_type=loss_type,
+        noise_schedule='polynomial_2',  # Dummy - will be replaced
+        loss_type=original_model.loss_type,
         norm_values=original_model.norm_values,
         norm_biases=original_model.norm_biases,
         include_charges=original_model.include_charges,
@@ -424,8 +416,12 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
     device = next(original_model.parameters()).device
     guided_model = guided_model.to(device)
     
-    # Copy trained parameters
+    # Copy ALL trained parameters including the exact gamma schedule
     guided_model.load_state_dict(original_model.state_dict(), strict=False)
+    
+    # Directly copy the gamma schedule from the original model
+    # This ensures exactly the same noise schedule is used
+    guided_model.gamma = original_model.gamma
     
     return guided_model
 
