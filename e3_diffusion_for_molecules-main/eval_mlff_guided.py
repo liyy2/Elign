@@ -95,7 +95,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
             x_guided, h_guided = enhanced_sampling_with_mlff(
                 flow, mlff_predictor, batch_size, max_n_nodes, 
                 node_mask_guided, edge_mask, context, dataset_info,
-                guidance_scale=guidance_scale, fix_noise=False
+                guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, fix_noise=False
             )
             
             guided_results[guidance_scale] = {
@@ -248,7 +248,7 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
         
         # Create guided model
         guided_model = create_mlff_guided_model(
-            flow, mlff_predictor, guidance_scale=1.0, dataset_info=dataset_info
+            flow, mlff_predictor, guidance_scale=1.0, dataset_info=dataset_info, guidance_iterations=eval_args.guidance_iterations
         )
         
         # Sample guided chain
@@ -297,7 +297,7 @@ def main():
                         help='Path to trained diffusion model')
     
     # Sampling arguments
-    parser.add_argument('--n_samples', type=int, default=20,
+    parser.add_argument('--n_samples', type=int, default=200,
                         help='Number of samples for comparison')
     parser.add_argument('--n_tries', type=int, default=10,
                         help='Number of tries to find stable molecule for chain visualization')
@@ -312,6 +312,8 @@ def main():
     parser.add_argument('--guidance_scales', type=float, nargs='+', 
                         default=[0.0, 0.5, 1.0, 2.0],
                         help='Guidance scales to test')
+    parser.add_argument('--guidance_iterations', type=int, default=1,
+                        help='Number of iterative force field evaluations per diffusion step')
     
     # Evaluation options
     parser.add_argument('--skip_comparison', action='store_true',

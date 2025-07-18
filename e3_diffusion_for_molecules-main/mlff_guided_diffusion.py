@@ -18,7 +18,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
     """
     
     def __init__(self, *args, mlff_predictor=None, guidance_scale=1.0, 
-                 dataset_info=None, **kwargs):
+                 dataset_info=None, guidance_iterations=1, **kwargs):
         """
         Initialize MLFF-guided diffusion model.
         
@@ -27,12 +27,14 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             mlff_predictor: Pretrained MLFF predictor from fairchem
             guidance_scale: Scale factor for MLFF force guidance
             dataset_info: Dataset information with atom decoders
+            guidance_iterations: Number of iterative force field evaluations per diffusion step
             **kwargs: Keyword arguments for parent class
         """
         super().__init__(*args, **kwargs)
         self.mlff_predictor = mlff_predictor
         self.guidance_scale = guidance_scale
         self.dataset_info = dataset_info
+        self.guidance_iterations = guidance_iterations
         
         # Default molecule cell size for molecular systems
         self.molecule_cell_size = 20.0
@@ -227,7 +229,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
     
     def apply_mlff_guidance(self, z, node_mask, dataset_info, sigma):
         """
-        Apply MLFF force guidance to the diffusion process.
+        Apply MLFF force guidance to the diffusion process with iterative refinement.
         
         Args:
             z: Current diffusion state [batch_size, n_nodes, n_dims + n_features]
@@ -248,44 +250,47 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         
         # if not self.check_system_feasibility(z, node_mask, max_distance=max_distance):
         #     return z
-            
-        # Get MLFF forces
-        forces = self.get_mlff_forces(z, node_mask, dataset_info)
         
-        # Check if forces are meaningful (not all zeros)
-        if torch.all(forces == 0):
-            return z
-        
-        # Apply force guidance to positions only
         z_guided = z.clone()
         
-        # Scale forces by guidance scale and noise level
-        # Ensure sigma has the correct shape for broadcasting with forces
-        if sigma.dim() == 3:  # [batch_size, n_nodes, 1]
-            sigma_for_forces = sigma.squeeze(-1)  # [batch_size, n_nodes]
-        else:  # [batch_size, n_nodes]
-            sigma_for_forces = sigma
-        
-        # Match the shape of forces tensor
-        batch_size, n_nodes_forces, _ = forces.shape
-        if sigma_for_forces.shape[1] != n_nodes_forces:
-            # Take only the valid nodes that match forces
-            sigma_for_forces = sigma_for_forces[:, :n_nodes_forces]
-        
-        force_scale = self.guidance_scale * sigma_for_forces.unsqueeze(-1)  # [batch_size, n_nodes_forces, 1]
-        position_guidance = forces * force_scale
-        
-        # Apply guidance to positions (first n_dims dimensions)
-        # Ensure position guidance matches the z tensor shape
-        if position_guidance.shape[1] <= z_guided.shape[1]:
-            z_guided[:, :position_guidance.shape[1], :self.n_dims] += position_guidance
-        else:
-            z_guided[:, :, :self.n_dims] += position_guidance[:, :z_guided.shape[1], :]
-        
-        # Ensure mean-zero constraint is maintained
-        z_guided[:, :, :self.n_dims] = diffusion_utils.remove_mean_with_mask(
-            z_guided[:, :, :self.n_dims], node_mask
-        )
+        # Iterative force field guidance
+        for iteration in range(self.guidance_iterations):
+            # Get MLFF forces for current state
+            forces = self.get_mlff_forces(z_guided, node_mask, dataset_info)
+            
+            # Check if forces are meaningful (not all zeros)
+            if torch.all(forces == 0):
+                break
+            
+            # Scale forces by guidance scale and noise level
+            # Divide by guidance_iterations to avoid too large updates per iteration
+            # Ensure sigma has the correct shape for broadcasting with forces
+            if sigma.dim() == 3:  # [batch_size, n_nodes, 1]
+                sigma_for_forces = sigma.squeeze(-1)  # [batch_size, n_nodes]
+            else:  # [batch_size, n_nodes]
+                sigma_for_forces = sigma
+            
+            # Match the shape of forces tensor
+            batch_size, n_nodes_forces, _ = forces.shape
+            if sigma_for_forces.shape[1] != n_nodes_forces:
+                # Take only the valid nodes that match forces
+                sigma_for_forces = sigma_for_forces[:, :n_nodes_forces]
+            
+            # Scale forces by guidance scale, noise level, and number of iterations
+            force_scale = (self.guidance_scale / self.guidance_iterations) * sigma_for_forces.unsqueeze(-1)  # [batch_size, n_nodes_forces, 1]
+            position_guidance = forces * force_scale
+            
+            # Apply guidance to positions (first n_dims dimensions)
+            # Ensure position guidance matches the z tensor shape
+            if position_guidance.shape[1] <= z_guided.shape[1]:
+                z_guided[:, :position_guidance.shape[1], :self.n_dims] += position_guidance
+            else:
+                z_guided[:, :, :self.n_dims] += position_guidance[:, :z_guided.shape[1], :]
+            
+            # Ensure mean-zero constraint is maintained after each iteration
+            z_guided[:, :, :self.n_dims] = diffusion_utils.remove_mean_with_mask(
+                z_guided[:, :, :self.n_dims], node_mask
+            )
         
         return z_guided
     
@@ -381,7 +386,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         return x, h
 
 
-def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None):
+def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None, guidance_iterations=1):
     """
     Create an MLFF-guided version of an existing diffusion model.
     
@@ -390,6 +395,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         mlff_predictor: Pretrained MLFF predictor
         guidance_scale: Scale factor for force guidance
         dataset_info: Dataset information with atom decoders
+        guidance_iterations: Number of iterative force field evaluations per diffusion step
         
     Returns:
         MLFFGuidedDiffusion model
@@ -409,7 +415,8 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         include_charges=original_model.include_charges,
         mlff_predictor=mlff_predictor,
         guidance_scale=guidance_scale,
-        dataset_info=dataset_info
+        dataset_info=dataset_info,
+        guidance_iterations=guidance_iterations
     )
     
     # Move guided model to same device as original model
@@ -427,7 +434,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
 
 
 def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_mask, edge_mask, 
-                              context, dataset_info, guidance_scale=1.0, fix_noise=False):
+                              context, dataset_info, guidance_scale=1.0, guidance_iterations=1, fix_noise=False):
     """
     Convenience function for enhanced sampling with MLFF guidance.
     
@@ -441,6 +448,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
         context: Context tensor (optional)
         dataset_info: Dataset information
         guidance_scale: Scale factor for force guidance
+        guidance_iterations: Number of iterative force field evaluations per diffusion step
         fix_noise: Whether to fix noise for reproducibility
         
     Returns:
@@ -449,7 +457,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
     """
     # Create guided model
     guided_model = create_mlff_guided_model(
-        model, mlff_predictor, guidance_scale, dataset_info
+        model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations
     )
     
     # Generate samples with MLFF guidance
