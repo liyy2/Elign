@@ -185,7 +185,8 @@ class PredefinedNoiseSchedule(torch.nn.Module):
         else:
             raise ValueError(noise_schedule)
 
-        print('alphas2', alphas2)
+        # Debug print removed for cleaner DDP output
+        # print('alphas2', alphas2)
 
         sigmas2 = 1 - alphas2
 
@@ -194,7 +195,8 @@ class PredefinedNoiseSchedule(torch.nn.Module):
 
         log_alphas2_to_sigmas2 = log_alphas2 - log_sigmas2
 
-        print('gamma', -log_alphas2_to_sigmas2)
+        # Debug print removed for cleaner DDP output
+        # print('gamma', -log_alphas2_to_sigmas2)
 
         self.gamma = torch.nn.Parameter(
             torch.from_numpy(-log_alphas2_to_sigmas2).float(),
@@ -221,8 +223,9 @@ class GammaNetwork(torch.nn.Module):
     def show_schedule(self, num_steps=50):
         t = torch.linspace(0, 1, num_steps).view(num_steps, 1)
         gamma = self.forward(t)
-        print('Gamma schedule:')
-        print(gamma.detach().cpu().numpy().reshape(num_steps))
+        # Debug prints removed for cleaner DDP output
+        # print('Gamma schedule:')
+        # print(gamma.detach().cpu().numpy().reshape(num_steps))
 
     def gamma_tilde(self, t):
         l1_t = self.l1(t)

@@ -126,6 +126,8 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
     def check_system_feasibility(self, z, node_mask, max_distance=6.0):
         """
         Check if the system is feasible for MLFF prediction.
+        A system is considered feasible if it has multi-atom molecules where 
+        at least some atoms are within reasonable distance of each other.
         
         Args:
             z: Diffusion state tensor [batch_size, n_nodes, n_dims + n_features]
@@ -142,22 +144,25 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             mask = node_mask[batch_idx, :, 0].bool()
             valid_positions = positions[batch_idx, mask]  # [n_valid_nodes, 3]
             
+            # Skip single atoms or empty molecules
             if valid_positions.shape[0] <= 1:
-                continue  # Skip single atoms
+                continue
             
             # Calculate pairwise distances
             distances = torch.cdist(valid_positions, valid_positions)  # [n_valid, n_valid]
             
-            # Remove diagonal (self-distances)
+            # Remove diagonal (self-distances) by setting to infinity
             distances = distances + torch.eye(distances.shape[0], device=distances.device) * float('inf')
             
-            # Find minimum distance to any other atom
+            # Find minimum distance to any other atom for each atom
             min_distances = torch.min(distances, dim=1)[0]
             
             # Check if any atom has a neighbor within max_distance
+            # If so, this batch has a feasible molecular structure
             if torch.any(min_distances <= max_distance):
                 return True
         
+        # No batch had atoms within max_distance of each other
         return False
     
     def get_mlff_forces(self, z, node_mask, dataset_info):

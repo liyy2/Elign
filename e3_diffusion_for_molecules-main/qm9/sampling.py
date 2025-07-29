@@ -130,7 +130,11 @@ def sample(args, device, generative_model, dataset_info,
     # TODO FIX: This conditioning just zeros.
     if args.context_node_nf > 0:
         if context is None:
-            context = prop_dist.sample_batch(nodesxsample)
+            if prop_dist is not None:
+                context = prop_dist.sample_batch(nodesxsample)
+            else:
+                # Create zero context when prop_dist is not available
+                context = torch.zeros(batch_size, args.context_node_nf).to(device)
         context = context.unsqueeze(1).repeat(1, max_n_nodes, 1).to(device) * node_mask
     else:
         context = None
