@@ -222,6 +222,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         if mlff_predictor is not None:
             print(f"Guidance scales: {eval_args.guidance_scales}")
             print(f"Guidance iterations: {eval_args.guidance_iterations}")
+            print(f"Noise threshold: {eval_args.noise_threshold} (skip guidance when noise > threshold)")
     
     # Log sampling configuration (only from main process)
     if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
@@ -253,6 +254,9 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
     
     # Sample with MLFF guidance (if predictor available)
     if mlff_predictor is not None:
+        # Sample with different guidance scales
+        guidance_scales = eval_args.guidance_scales
+        
         if is_main_process():
             print(f"\n2. MLFF-GUIDED SAMPLING")
             print(f"   Testing {len(guidance_scales)} guidance scales: {guidance_scales}")
@@ -262,8 +266,6 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         total_samples = len(nodesxsample)
         internal_batch_size = eval_args.batch_size
         
-        # Sample with different guidance scales
-        guidance_scales = eval_args.guidance_scales
         guided_results = {}
         
         for guidance_scale in guidance_scales:
@@ -312,7 +314,8 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                 x_batch, h_batch = enhanced_sampling_with_mlff(
                     flow, mlff_predictor, batch_size, max_n_nodes, 
                     node_mask_batch, edge_mask_batch, context_batch, dataset_info,
-                    guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, fix_noise=False
+                    guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, 
+                    noise_threshold=eval_args.noise_threshold, fix_noise=False
                 )
                 
                 # Store batch results
@@ -540,7 +543,8 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
         
         # Create guided model with appropriate guidance scale
         guided_model = create_mlff_guided_model(
-            flow, mlff_predictor, guidance_scale=0.008, dataset_info=dataset_info, guidance_iterations=eval_args.guidance_iterations
+            flow, mlff_predictor, guidance_scale=0.008, dataset_info=dataset_info, 
+            guidance_iterations=eval_args.guidance_iterations, noise_threshold=eval_args.noise_threshold
         )
         
         # Sample guided chain
@@ -607,6 +611,8 @@ def main():
                         help='Guidance scales to test')
     parser.add_argument('--guidance_iterations', type=int, default=1,
                         help='Number of iterative force field evaluations per diffusion step')
+    parser.add_argument('--noise_threshold', type=float, default=0.8,
+                        help='Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20%% of steps)')
     
     # Evaluation options
     parser.add_argument('--skip_comparison', action='store_true',
@@ -765,6 +771,7 @@ def main():
             'mlff_available': mlff_predictor is not None,
             'guidance_scales': eval_args.guidance_scales,
             'guidance_iterations': eval_args.guidance_iterations,
+            'noise_threshold': eval_args.noise_threshold,
             
             # Dataset info
             'max_n_nodes': dataset_info['max_n_nodes'],

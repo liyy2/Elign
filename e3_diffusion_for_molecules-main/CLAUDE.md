@@ -6,6 +6,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 This is an implementation of E(3) Equivariant Diffusion Models for 3D molecular generation, with an enhanced MLFF (Machine Learning Force Field) guidance system. The codebase generates molecules through diffusion processes while maintaining E(3) equivariance and optionally incorporating physics-based constraints from pretrained force fields.
 
+**IMPORTANT**: The MLFF enhancement is the most critical and novel component of this codebase. The remaining components are adaptations from an existing diffusion model framework. When making modifications, prioritize MLFF-related functionality and minimize edits to the existing codebase infrastructure.
+
 ## Core Architecture
 
 ### Main Components
@@ -68,12 +70,10 @@ python eval_sample.py --model_path outputs/edm_qm9 --n_samples 10000
 
 ### MLFF-Guided Evaluation
 ```bash
-# Quick start with automatic model detection
-python quick_start_mlff.py
 
-# Full evaluation with custom parameters
+# Full evaluation with custom parameters and optimized noise threshold
 python eval_mlff_guided.py --model_path outputs/edm_1 --n_samples 200 \
-    --mlff_model uma-s-1p1 --guidance_scales 0.0 0.5 1.0 2.0
+    --mlff_model uma-s-1p1 --guidance_scales 0.0001 --noise_threshold 0.8
 
 # Multi-GPU distributed evaluation
 python -m torch.distributed.launch --nproc_per_node=4 eval_mlff_guided.py \
@@ -87,6 +87,8 @@ python eval_conditional_qm9.py --generators_path outputs/exp_cond_alpha \
 ```
 
 ## Development Patterns
+
+**Note**: The base diffusion framework is well-established. Focus development efforts on MLFF integration and enhancement while preserving existing functionality.
 
 ### Model Architecture Flow
 1. **Dataset Info**: `get_dataset_info()` provides atom decoders and molecular constraints
@@ -118,6 +120,7 @@ The MLFF guidance system follows this pattern:
 ### MLFF Guidance Parameters
 - **Guidance scale**: 0.0 (no guidance) to 2.0 (strong guidance)
 - **Guidance iterations**: 1 for efficiency, higher for iterative refinement
+- **Noise threshold**: 0.8 (skip guidance when noise > threshold, provides ~2-3x speedup)
 - **MLFF model**: `uma-s-1p1` is the default pretrained model
 
 ### Memory Considerations

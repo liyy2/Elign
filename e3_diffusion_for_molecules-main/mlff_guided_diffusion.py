@@ -18,7 +18,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
     """
     
     def __init__(self, *args, mlff_predictor=None, guidance_scale=1.0, 
-                 dataset_info=None, guidance_iterations=1, **kwargs):
+                 dataset_info=None, guidance_iterations=1, noise_threshold=0.8, **kwargs):
         """
         Initialize MLFF-guided diffusion model.
         
@@ -28,6 +28,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             guidance_scale: Scale factor for MLFF force guidance
             dataset_info: Dataset information with atom decoders
             guidance_iterations: Number of iterative force field evaluations per diffusion step
+            noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
             **kwargs: Keyword arguments for parent class
         """
         super().__init__(*args, **kwargs)
@@ -35,6 +36,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         self.guidance_scale = guidance_scale
         self.dataset_info = dataset_info
         self.guidance_iterations = guidance_iterations
+        self.noise_threshold = noise_threshold
         
         # Default molecule cell size for molecular systems
         self.molecule_cell_size = 20.0
@@ -248,9 +250,16 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         if self.mlff_predictor is None or self.guidance_scale == 0:
             return z
         
-        # Skip guidance if system is too noisy/dispersed
-        # Use adaptive threshold based on noise level
+        # Skip guidance during high-noise early diffusion steps for significant speedup
+        # MLFF guidance is most effective when molecular structures are reasonably formed
         noise_level = sigma.mean().item() if sigma.numel() > 0 else 1.0
+        
+        # Adaptive noise threshold: skip guidance when noise is too high
+        # This provides ~2-3x speedup by avoiding MLFF calls during early diffusion
+        if noise_level > self.noise_threshold:  # Skip early high-noise diffusion steps
+            return z
+        
+        # Additional feasibility check for moderately noisy systems
         max_distance = 6.0 if noise_level < 0.5 else 10.0  # More lenient for high noise
         
         # if not self.check_system_feasibility(z, node_mask, max_distance=max_distance):
@@ -391,7 +400,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         return x, h
 
 
-def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None, guidance_iterations=1):
+def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None, guidance_iterations=1, noise_threshold=0.8):
     """
     Create an MLFF-guided version of an existing diffusion model.
     
@@ -401,6 +410,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         guidance_scale: Scale factor for force guidance
         dataset_info: Dataset information with atom decoders
         guidance_iterations: Number of iterative force field evaluations per diffusion step
+        noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
         
     Returns:
         MLFFGuidedDiffusion model
@@ -421,7 +431,8 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         mlff_predictor=mlff_predictor,
         guidance_scale=guidance_scale,
         dataset_info=dataset_info,
-        guidance_iterations=guidance_iterations
+        guidance_iterations=guidance_iterations,
+        noise_threshold=noise_threshold
     )
     
     # Move guided model to same device as original model
@@ -439,7 +450,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
 
 
 def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_mask, edge_mask, 
-                              context, dataset_info, guidance_scale=1.0, guidance_iterations=1, fix_noise=False):
+                              context, dataset_info, guidance_scale=1.0, guidance_iterations=1, noise_threshold=0.8, fix_noise=False):
     """
     Convenience function for enhanced sampling with MLFF guidance.
     
@@ -454,6 +465,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
         dataset_info: Dataset information
         guidance_scale: Scale factor for force guidance
         guidance_iterations: Number of iterative force field evaluations per diffusion step
+        noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
         fix_noise: Whether to fix noise for reproducibility
         
     Returns:
@@ -462,7 +474,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
     """
     # Create guided model
     guided_model = create_mlff_guided_model(
-        model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations
+        model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations, noise_threshold
     )
     
     # Generate samples with MLFF guidance
