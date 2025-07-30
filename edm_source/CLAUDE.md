@@ -71,9 +71,9 @@ python eval_sample.py --model_path outputs/edm_qm9 --n_samples 10000
 ### MLFF-Guided Evaluation
 ```bash
 
-# Full evaluation with custom parameters and optimized noise threshold
+# Full evaluation with custom parameters and force clipping
 python eval_mlff_guided.py --model_path outputs/edm_1 --n_samples 200 \
-    --mlff_model uma-s-1p1 --guidance_scales 0.0001 --noise_threshold 0.8
+    --mlff_model uma-s-1p1 --guidance_scales 0.1 0.5 1.0 --force_clip_threshold 15.0
 
 # Multi-GPU distributed evaluation
 python -m torch.distributed.launch --nproc_per_node=4 eval_mlff_guided.py \
@@ -121,6 +121,7 @@ The MLFF guidance system follows this pattern:
 - **Guidance scale**: 0.0 (no guidance) to 2.0 (strong guidance)
 - **Guidance iterations**: 1 for efficiency, higher for iterative refinement
 - **Noise threshold**: 0.8 (skip guidance when noise > threshold, provides ~2-3x speedup)
+- **Force clip threshold**: Maximum force magnitude allowed (None = no clipping, 10.0-20.0 recommended)
 - **MLFF model**: `uma-s-1p1` is the default pretrained model
 
 ### Memory Considerations

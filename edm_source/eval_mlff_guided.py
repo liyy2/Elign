@@ -230,6 +230,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
             print(f"Guidance scales: {eval_args.guidance_scales}")
             print(f"Guidance iterations: {eval_args.guidance_iterations}")
             print(f"Noise threshold: {eval_args.noise_threshold} (skip guidance when noise > threshold)")
+            print(f"Force clip threshold: {eval_args.force_clip_threshold} (None = no clipping)")
     
     # Log sampling configuration (only from main process)
     if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
@@ -346,7 +347,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                     flow, mlff_predictor, batch_size, max_n_nodes, 
                     node_mask_batch, edge_mask_batch, context_batch, dataset_info,
                     guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, 
-                    noise_threshold=eval_args.noise_threshold, fix_noise=False
+                    noise_threshold=eval_args.noise_threshold, force_clip_threshold=eval_args.force_clip_threshold, fix_noise=False
                 )
                 
                 # Store batch results
@@ -581,7 +582,8 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
         # Create guided model with appropriate guidance scale
         guided_model = create_mlff_guided_model(
             flow, mlff_predictor, guidance_scale=0.008, dataset_info=dataset_info, 
-            guidance_iterations=eval_args.guidance_iterations, noise_threshold=eval_args.noise_threshold
+            guidance_iterations=eval_args.guidance_iterations, noise_threshold=eval_args.noise_threshold,
+            force_clip_threshold=eval_args.force_clip_threshold
         )
         
         # Sample guided chain
@@ -650,6 +652,8 @@ def main():
                         help='Number of iterative force field evaluations per diffusion step')
     parser.add_argument('--noise_threshold', type=float, default=0.8,
                         help='Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20%% of steps)')
+    parser.add_argument('--force_clip_threshold', type=float, default=None,
+                        help='Clip MLFF forces to this maximum magnitude (None = no clipping)')
     
     # Evaluation options
     parser.add_argument('--skip_comparison', action='store_true',
@@ -815,6 +819,7 @@ def main():
             'guidance_scales': eval_args.guidance_scales,
             'guidance_iterations': eval_args.guidance_iterations,
             'noise_threshold': eval_args.noise_threshold,
+            'force_clip_threshold': eval_args.force_clip_threshold,
             
             # Dataset info
             'max_n_nodes': dataset_info['max_n_nodes'],

@@ -18,7 +18,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
     """
     
     def __init__(self, *args, mlff_predictor=None, guidance_scale=1.0, 
-                 dataset_info=None, guidance_iterations=1, noise_threshold=0.8, **kwargs):
+                 dataset_info=None, guidance_iterations=1, noise_threshold=0.8, force_clip_threshold=None, **kwargs):
         """
         Initialize MLFF-guided diffusion model.
         
@@ -29,6 +29,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             dataset_info: Dataset information with atom decoders
             guidance_iterations: Number of iterative force field evaluations per diffusion step
             noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
+            force_clip_threshold: Maximum force magnitude allowed (None = no clipping)
             **kwargs: Keyword arguments for parent class
         """
         super().__init__(*args, **kwargs)
@@ -37,6 +38,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         self.dataset_info = dataset_info
         self.guidance_iterations = guidance_iterations
         self.noise_threshold = noise_threshold
+        self.force_clip_threshold = force_clip_threshold
         
         # Default molecule cell size for molecular systems
         self.molecule_cell_size = 20.0
@@ -276,6 +278,21 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             if torch.all(forces == 0):
                 break
             
+            # Apply force clipping if threshold is specified
+            if self.force_clip_threshold is not None:
+                # Compute force magnitudes for each atom
+                force_magnitudes = torch.norm(forces, dim=-1, keepdim=True)  # [batch_size, n_nodes, 1]
+                
+                # Create mask for forces that exceed the threshold
+                force_clip_mask = force_magnitudes > self.force_clip_threshold
+                
+                # Clip forces while preserving direction
+                forces = torch.where(
+                    force_clip_mask,
+                    forces * (self.force_clip_threshold / force_magnitudes),
+                    forces
+                )
+            
             # Scale forces by guidance scale and noise level
             # Divide by guidance_iterations to avoid too large updates per iteration
             # Ensure sigma has the correct shape for broadcasting with forces
@@ -400,7 +417,7 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         return x, h
 
 
-def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None, guidance_iterations=1, noise_threshold=0.8):
+def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0, dataset_info=None, guidance_iterations=1, noise_threshold=0.8, force_clip_threshold=None):
     """
     Create an MLFF-guided version of an existing diffusion model.
     
@@ -411,6 +428,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         dataset_info: Dataset information with atom decoders
         guidance_iterations: Number of iterative force field evaluations per diffusion step
         noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
+        force_clip_threshold: Maximum force magnitude allowed (None = no clipping)
         
     Returns:
         MLFFGuidedDiffusion model
@@ -432,7 +450,8 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
         guidance_scale=guidance_scale,
         dataset_info=dataset_info,
         guidance_iterations=guidance_iterations,
-        noise_threshold=noise_threshold
+        noise_threshold=noise_threshold,
+        force_clip_threshold=force_clip_threshold
     )
     
     # Move guided model to same device as original model
@@ -450,7 +469,7 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
 
 
 def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_mask, edge_mask, 
-                              context, dataset_info, guidance_scale=1.0, guidance_iterations=1, noise_threshold=0.8, fix_noise=False):
+                              context, dataset_info, guidance_scale=1.0, guidance_iterations=1, noise_threshold=0.8, force_clip_threshold=None, fix_noise=False):
     """
     Convenience function for enhanced sampling with MLFF guidance.
     
@@ -466,6 +485,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
         guidance_scale: Scale factor for force guidance
         guidance_iterations: Number of iterative force field evaluations per diffusion step
         noise_threshold: Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20% of steps)
+        force_clip_threshold: Maximum force magnitude allowed (None = no clipping)
         fix_noise: Whether to fix noise for reproducibility
         
     Returns:
@@ -474,7 +494,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
     """
     # Create guided model
     guided_model = create_mlff_guided_model(
-        model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations, noise_threshold
+        model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations, noise_threshold, force_clip_threshold
     )
     
     # Generate samples with MLFF guidance
