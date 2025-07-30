@@ -42,6 +42,10 @@ Logged metrics include:
 import utils
 import argparse
 from configs.datasets_config import get_dataset_info
+
+# Set matplotlib backend before any plotting imports to prevent hanging on headless servers
+import matplotlib
+matplotlib.use('Agg')
 from qm9 import dataset
 from qm9.models import get_model
 from fairchem.core import pretrained_mlip, FAIRChemCalculator
@@ -112,12 +116,14 @@ def all_gather_results(results, device):
         return results
     
     # Gather baseline results - all tensors now have same size due to even sample splitting
-    baseline_gathered = {}
-    for key in ['one_hot', 'charges', 'positions', 'node_mask']:
-        local_tensor = results['baseline'][key]
-        tensor_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
-        dist.all_gather(tensor_list, local_tensor)
-        baseline_gathered[key] = torch.cat(tensor_list, dim=0)
+    baseline_gathered = None
+    if results['baseline'] is not None:
+        baseline_gathered = {}
+        for key in ['one_hot', 'charges', 'positions', 'node_mask']:
+            local_tensor = results['baseline'][key]
+            tensor_list = [torch.empty_like(local_tensor) for _ in range(world_size)]
+            dist.all_gather(tensor_list, local_tensor)
+            baseline_gathered[key] = torch.cat(tensor_list, dim=0)
     
     # Gather guided results
     guided_gathered = {}
@@ -219,6 +225,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         print(f"GPUs: {get_rank_and_world_size()[1]}")
         print(f"Samples per GPU: {local_n_samples}")
         print(f"MLFF predictor: {'Available' if mlff_predictor is not None else 'Not available'}")
+        print(f"Skip baseline: {eval_args.skip_baseline}")
         if mlff_predictor is not None:
             print(f"Guidance scales: {eval_args.guidance_scales}")
             print(f"Guidance iterations: {eval_args.guidance_iterations}")
@@ -232,25 +239,46 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
             "sampling/world_size": get_rank_and_world_size()[1],
             "sampling/mlff_available": mlff_predictor is not None,
             "sampling/guidance_iterations": eval_args.guidance_iterations,
+            "sampling/skip_baseline": eval_args.skip_baseline,
         })
     
-    # Sample baseline (without guidance)
-    if is_main_process():
-        print(f"\n1. BASELINE SAMPLING (No MLFF guidance)")
-        print(f"   Sampling {n_samples} molecules...")
-    
-    # Use local sample count for each GPU
-    nodesxsample = nodes_dist.sample(local_n_samples)
-    one_hot_baseline, charges_baseline, x_baseline, node_mask = sample(
-        args, device, flow, dataset_info, nodesxsample=nodesxsample)
-    
-    rank, world_size = get_rank_and_world_size()
-    # Synchronize before reporting completion
-    if dist.is_initialized():
-        dist.barrier()
-    
-    if is_main_process():
-        print(f"   ✓ All ranks completed baseline sampling ({local_n_samples} molecules per rank)")
+    # Sample baseline (without guidance) - skip if requested
+    baseline_results = None
+    if not eval_args.skip_baseline:
+        if is_main_process():
+            print(f"\n1. BASELINE SAMPLING (No MLFF guidance)")
+            print(f"   Sampling {n_samples} molecules...")
+        
+        # Set seed for reproducible baseline sampling
+        rank, _ = get_rank_and_world_size()
+        torch.manual_seed(eval_args.seed + rank)
+        
+        # Use local sample count for each GPU
+        nodesxsample = nodes_dist.sample(local_n_samples)
+        one_hot_baseline, charges_baseline, x_baseline, node_mask = sample(
+            args, device, flow, dataset_info, nodesxsample=nodesxsample)
+        
+        rank, world_size = get_rank_and_world_size()
+        # Synchronize before reporting completion
+        if dist.is_initialized():
+            dist.barrier()
+        
+        if is_main_process():
+            print(f"   ✓ All ranks completed baseline sampling ({local_n_samples} molecules per rank)")
+        
+        baseline_results = {
+            'one_hot': one_hot_baseline,
+            'charges': charges_baseline,
+            'positions': x_baseline,
+            'node_mask': node_mask
+        }
+    else:
+        if is_main_process():
+            print(f"\n1. BASELINE SAMPLING SKIPPED")
+        # Still need nodesxsample for guided sampling
+        rank, _ = get_rank_and_world_size()
+        torch.manual_seed(eval_args.seed + rank)
+        nodesxsample = nodes_dist.sample(local_n_samples)
     
     # Sample with MLFF guidance (if predictor available)
     if mlff_predictor is not None:
@@ -271,6 +299,9 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         for guidance_scale in guidance_scales:
             if is_main_process():
                 print(f"\n   → Guidance scale {guidance_scale}:")
+            
+            # Set same seed as baseline for reproducible comparison
+            torch.manual_seed(eval_args.seed + rank)
             
             # Initialize storage for this guidance scale
             all_x_guided = []
@@ -353,12 +384,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         guided_results = {}
     
     return {
-        'baseline': {
-            'one_hot': one_hot_baseline,
-            'charges': charges_baseline,
-            'positions': x_baseline,
-            'node_mask': node_mask
-        },
+        'baseline': baseline_results,
         'guided': guided_results
     }
 
@@ -437,23 +463,28 @@ def save_comparison_results(results, eval_args, dataset_info):
     # Initialize summary for wandb logging
     summary_stats = {}
     
-    # Save baseline results
-    baseline = results['baseline']
-    print(f"\nSaving baseline results to {output_dir}")
-    
-    vis.save_xyz_file(
-        join(output_dir, 'baseline/'), 
-        baseline['one_hot'], baseline['charges'], baseline['positions'],
-        dataset_info, id_from=0, name='molecule_baseline',
-        node_mask=baseline['node_mask']
-    )
-    
-    # Analyze baseline stability
-    baseline_stability, baseline_percentage = analyze_stability(
-        baseline['positions'], baseline['one_hot'], 
-        baseline['node_mask'], dataset_info, name="baseline"
-    )
-    summary_stats['baseline_stability'] = baseline_percentage
+    # Save baseline results (if available)
+    baseline_percentage = 0.0
+    if results['baseline'] is not None:
+        baseline = results['baseline']
+        print(f"\nSaving baseline results to {output_dir}")
+        
+        vis.save_xyz_file(
+            join(output_dir, 'baseline/'), 
+            baseline['one_hot'], baseline['charges'], baseline['positions'],
+            dataset_info, id_from=0, name='molecule_baseline',
+            node_mask=baseline['node_mask']
+        )
+        
+        # Analyze baseline stability
+        baseline_stability, baseline_percentage = analyze_stability(
+            baseline['positions'], baseline['one_hot'], 
+            baseline['node_mask'], dataset_info, name="baseline"
+        )
+        summary_stats['baseline_stability'] = baseline_percentage
+    else:
+        print(f"\nSkipping baseline results (not computed)")
+        summary_stats['baseline_stability'] = None
     
     # Save guided results
     guided = results['guided']
@@ -493,20 +524,26 @@ def save_comparison_results(results, eval_args, dataset_info):
         # Create comparison table
         if guidance_scale_stats:
             comparison_data = []
-            comparison_data.append(['baseline', baseline_percentage])
+            if results['baseline'] is not None:
+                comparison_data.append(['baseline', baseline_percentage])
             for scale, percentage in guidance_scale_stats.items():
                 comparison_data.append([f'guided_{scale}', percentage])
             
             # Log summary metrics
             summary_stats['best_guided_stability'] = max(guidance_scale_stats.values()) if guidance_scale_stats else 0
             summary_stats['best_guidance_scale'] = max(guidance_scale_stats.keys(), key=guidance_scale_stats.get) if guidance_scale_stats else None
-            summary_stats['stability_improvement'] = summary_stats['best_guided_stability'] - baseline_percentage if guidance_scale_stats else 0
+            
+            if results['baseline'] is not None:
+                summary_stats['stability_improvement'] = summary_stats['best_guided_stability'] - baseline_percentage if guidance_scale_stats else 0
+            else:
+                summary_stats['stability_improvement'] = None  # Cannot compute without baseline
             
             wandb.log(summary_stats)
             
-            # Create wandb table for comparison
-            table = wandb.Table(data=comparison_data, columns=['method', 'stability_percentage'])
-            wandb.log({'stability_comparison': wandb.plot.bar(table, 'method', 'stability_percentage', title='Stability Comparison by Method')})
+            # Create wandb table for comparison (only if we have data)
+            if comparison_data:
+                table = wandb.Table(data=comparison_data, columns=['method', 'stability_percentage'])
+                wandb.log({'stability_comparison': wandb.plot.bar(table, 'method', 'stability_percentage', title='Stability Comparison by Method')})
     
     print(f"\n✓ All results saved to {output_dir}")
     return summary_stats
@@ -607,7 +644,7 @@ def main():
     parser.add_argument('--task_name', type=str, default='omol',
                         help='Task name for MLFF predictor')
     parser.add_argument('--guidance_scales', type=float, nargs='+', 
-                        default=[0.0005, 0.0004, 0.0003],
+                        default=[0.001, 0.002, 0.003],
                         help='Guidance scales to test')
     parser.add_argument('--guidance_iterations', type=int, default=1,
                         help='Number of iterative force field evaluations per diffusion step')
@@ -617,6 +654,8 @@ def main():
     # Evaluation options
     parser.add_argument('--skip_comparison', action='store_true',
                         help='Skip comparison sampling')
+    parser.add_argument('--skip_baseline', action='store_true',
+                        help='Skip baseline comparison sampling (only run MLFF-guided)')
     parser.add_argument('--skip_chain', action='store_true',
                         help='Skip chain visualization')
     parser.add_argument('--skip_visualization', action='store_true',
@@ -631,6 +670,10 @@ def main():
                         help='Total number of processes (set automatically by launch script)')
     parser.add_argument('--dist_backend', type=str, default='nccl',
                         help='Distributed backend (nccl or gloo)')
+    
+    # Random seed argument
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducible results')
     
     # Wandb arguments
     parser.add_argument('--use_wandb', action='store_true',
@@ -780,6 +823,7 @@ def main():
             
             # Evaluation options
             'skip_comparison': eval_args.skip_comparison,
+            'skip_baseline': eval_args.skip_baseline,
             'skip_chain': eval_args.skip_chain,
             'skip_visualization': eval_args.skip_visualization,
             
@@ -837,22 +881,30 @@ def main():
             print("\nGenerating visualizations...")
             output_dir = join(eval_args.model_path, 'eval/mlff_guided/')
             
-            # Visualize baseline
-            vis.visualize(
-                join(output_dir, 'baseline/'), dataset_info,
-                max_num=100, spheres_3d=True
-            )
-            print("✓ Baseline visualization saved")
+            # Visualize baseline (if available)
+            if results['baseline'] is not None:
+                try:
+                    vis.visualize(
+                        join(output_dir, 'baseline/'), dataset_info,
+                        max_num=100, spheres_3d=True
+                    )
+                    print("✓ Baseline visualization saved")
+                except Exception as e:
+                    print(f"Warning: Failed to create baseline visualization: {e}")
+            else:
+                print("Skipping baseline visualization (baseline not computed)")
             
             # Visualize guided results
             for guidance_scale in results['guided'].keys():
                 if results['guided'][guidance_scale] is not None:
-
-                    vis.visualize(
-                        join(output_dir, f'guided_scale_{guidance_scale}/'), dataset_info,
-                        max_num=100, spheres_3d=True
-                    )
-                    print(f"✓ Guided visualization (scale {guidance_scale}) saved")
+                    try:
+                        vis.visualize(
+                            join(output_dir, f'guided_scale_{guidance_scale}/'), dataset_info,
+                            max_num=100, spheres_3d=True
+                        )
+                        print(f"✓ Guided visualization (scale {guidance_scale}) saved")
+                    except Exception as e:
+                        print(f"Warning: Failed to create guided visualization (scale {guidance_scale}): {e}")
 
     
     # Run chain visualization
@@ -888,16 +940,22 @@ def main():
         if not eval_args.skip_visualization and is_main_process():
             output_dir = join(eval_args.model_path, 'eval/mlff_guided/')
             
-            vis.visualize_chain_uncertainty(
-                join(output_dir, 'chain_baseline/'), dataset_info, spheres_3d=True
-            )
-            print("✓ Baseline chain visualization saved")
+            try:
+                vis.visualize_chain_uncertainty(
+                    join(output_dir, 'chain_baseline/'), dataset_info, spheres_3d=True
+                )
+                print("✓ Baseline chain visualization saved")
+            except Exception as e:
+                print(f"Warning: Failed to create baseline chain visualization: {e}")
 
             if mlff_predictor is not None:
-                vis.visualize_chain_uncertainty(
-                    join(output_dir, 'chain_guided/'), dataset_info, spheres_3d=True
-                )
-                print("✓ Guided chain visualization saved")
+                try:
+                    vis.visualize_chain_uncertainty(
+                        join(output_dir, 'chain_guided/'), dataset_info, spheres_3d=True
+                    )
+                    print("✓ Guided chain visualization saved")
+                except Exception as e:
+                    print(f"Warning: Failed to create guided chain visualization: {e}")
                 
         # Log chain visualization completion (only from main process)
         if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
