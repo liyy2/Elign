@@ -10,6 +10,7 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import sys
+import logging
 
 """
 MLFF-Guided Diffusion Evaluation with Weights & Biases Logging and Multi-GPU Support
@@ -343,12 +344,28 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                     context_batch = None
                 
                 # Sample this batch
+                # Log sampling parameters for debugging
+                if is_main_process():
+                    logging.info(f"Starting MLFF-guided sampling with guidance_scale={guidance_scale:.6f}, "
+                               f"guidance_iterations={eval_args.guidance_iterations}, "
+                               f"noise_threshold={eval_args.noise_threshold:.3f}, "
+                               f"force_clip_threshold={eval_args.force_clip_threshold}")
+                
                 x_batch, h_batch = enhanced_sampling_with_mlff(
                     flow, mlff_predictor, batch_size, max_n_nodes, 
                     node_mask_batch, edge_mask_batch, context_batch, dataset_info,
                     guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, 
                     noise_threshold=eval_args.noise_threshold, force_clip_threshold=eval_args.force_clip_threshold, fix_noise=False
                 )
+                
+                # Log completion and check for issues
+                if is_main_process():
+                    # Check for potential issues in generated samples
+                    position_magnitudes = torch.norm(x_batch, dim=-1)
+                    logging.info(f"Completed MLFF-guided sampling batch - "
+                               f"position magnitudes: mean={position_magnitudes.mean().item():.4f}, "
+                               f"max={position_magnitudes.max().item():.4f}, "
+                               f"min={position_magnitudes.min().item():.4f}")
                 
                 # Store batch results
                 all_x_guided.append(x_batch)
@@ -519,6 +536,29 @@ def save_comparison_results(results, eval_args, dataset_info):
             # Store stats for summary
             guidance_scale_stats[guidance_scale] = guided_percentage
             summary_stats[f'guided_scale_{guidance_scale}_stability'] = guided_percentage
+            
+            # Log detailed comparison for debugging performance degradation
+            if results['baseline'] is not None:
+                degradation = guided_percentage - baseline_percentage
+                logging.info(f"PERFORMANCE ANALYSIS - Guidance scale {guidance_scale:.6f}:")
+                logging.info(f"  Baseline stability: {baseline_percentage:.2f}%")
+                logging.info(f"  Guided stability: {guided_percentage:.2f}%")
+                logging.info(f"  Performance change: {degradation:+.2f}% {'(DEGRADATION)' if degradation < 0 else '(IMPROVEMENT)'}")
+                
+                if degradation < -5.0:  # Flag significant degradations
+                    logging.warning(f"SIGNIFICANT PERFORMANCE DEGRADATION DETECTED: {degradation:.2f}% with guidance scale {guidance_scale:.6f}")
+                    
+                    # Additional analysis for degraded cases
+                    position_stats = {
+                        'mean_dist': torch.cdist(positions.view(-1, 3), positions.view(-1, 3)).mean().item(),
+                        'position_variance': positions.var().item(),
+                        'position_range': (positions.max() - positions.min()).item()
+                    }
+                    logging.info(f"  Position statistics: mean_distance={position_stats['mean_dist']:.4f}, "
+                               f"variance={position_stats['position_variance']:.6f}, "
+                               f"range={position_stats['position_range']:.4f}")
+            else:
+                logging.info(f"Guided stability (scale {guidance_scale:.6f}): {guided_percentage:.2f}% (no baseline for comparison)")
     
     # Log summary comparison to wandb (main process only)
     if WANDB_AVAILABLE and wandb.run is not None:
@@ -545,6 +585,35 @@ def save_comparison_results(results, eval_args, dataset_info):
             if comparison_data:
                 table = wandb.Table(data=comparison_data, columns=['method', 'stability_percentage'])
                 wandb.log({'stability_comparison': wandb.plot.bar(table, 'method', 'stability_percentage', title='Stability Comparison by Method')})
+    
+    # Final summary logging for debugging
+    if guidance_scale_stats and results['baseline'] is not None:
+        logging.info("\n" + "="*60)
+        logging.info("FINAL PERFORMANCE SUMMARY:")
+        logging.info(f"Baseline stability: {baseline_percentage:.2f}%")
+        
+        best_scale = max(guidance_scale_stats.keys(), key=guidance_scale_stats.get)
+        best_stability = guidance_scale_stats[best_scale]
+        worst_scale = min(guidance_scale_stats.keys(), key=guidance_scale_stats.get)
+        worst_stability = guidance_scale_stats[worst_scale]
+        
+        logging.info(f"Best guided stability: {best_stability:.2f}% (scale={best_scale:.6f})")
+        logging.info(f"Worst guided stability: {worst_stability:.2f}% (scale={worst_scale:.6f})")
+        logging.info(f"Best improvement: {best_stability - baseline_percentage:+.2f}%")
+        logging.info(f"Worst degradation: {worst_stability - baseline_percentage:+.2f}%")
+        
+        # Check if small scales are causing issues
+        small_scales = [s for s in guidance_scale_stats.keys() if s <= 0.1]
+        if small_scales:
+            small_scale_performances = [(s, guidance_scale_stats[s] - baseline_percentage) for s in small_scales]
+            logging.info(f"Small scale performance changes (≤0.1): {small_scale_performances}")
+            
+            avg_small_scale_change = np.mean([perf for _, perf in small_scale_performances])
+            if avg_small_scale_change < -2.0:
+                logging.warning(f"ISSUE IDENTIFIED: Small guidance scales show average degradation of {avg_small_scale_change:.2f}%")
+                logging.warning("This suggests the mathematical scaling in MLFF guidance may be problematic for small values")
+        
+        logging.info("="*60 + "\n")
     
     print(f"\n✓ All results saved to {output_dir}")
     return summary_stats
@@ -733,6 +802,22 @@ def main():
         args.normalization_factor = 1
     if not hasattr(args, 'aggregation_method'):
         args.aggregation_method = 'sum'
+    
+    # Setup detailed logging for debugging MLFF guidance issues
+    log_level = logging.DEBUG if eval_args.use_wandb else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='[%(asctime)s] [GPU-%(levelname)s] %(message)s',
+        handlers=[logging.StreamHandler()]
+    )
+    
+    # Set up MLFF-specific logger
+    mlff_logger = logging.getLogger('mlff_guided_diffusion')
+    mlff_logger.setLevel(logging.INFO)
+    
+    if is_main_process():
+        print(f"Logging level set to {log_level}")
+        print(f"MLFF guidance debugging enabled")
     
     # Setup device
     args.cuda = device.type == 'cuda'

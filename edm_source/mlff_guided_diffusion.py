@@ -1,12 +1,30 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+import logging
 from ase import Atoms
 from ase.constraints import FixAtoms
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets import data_list_collater
 from equivariant_diffusion import utils as diffusion_utils
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
+
+# Set up logger for MLFF guidance debugging
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(asctime)s] MLFF: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+# Wandb import with error handling for logging
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+    logger.warning("wandb not available for MLFF logging")
 
 
 class MLFFGuidedDiffusion(EnVariationalDiffusion):
@@ -169,6 +187,25 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         # No batch had atoms within max_distance of each other
         return False
     
+    def check_numerical_stability(self, tensor, name="tensor"):
+        """
+        Check for NaN or infinity values in tensor and log warnings.
+        
+        Args:
+            tensor: Tensor to check
+            name: Name for logging purposes
+            
+        Returns:
+            Boolean indicating if tensor is numerically stable
+        """
+        if torch.isnan(tensor).any():
+            logger.warning(f"NaN detected in {name}: {torch.isnan(tensor).sum().item()} values")
+            return False
+        if torch.isinf(tensor).any():
+            logger.warning(f"Infinity detected in {name}: {torch.isinf(tensor).sum().item()} values")
+            return False
+        return True
+    
     def get_mlff_forces(self, z, node_mask, dataset_info):
         """
         Get forces from MLFF predictor for current diffusion state.
@@ -182,6 +219,11 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             Forces tensor [batch_size, n_nodes, 3] (zero for masked nodes)
         """
         if self.mlff_predictor is None:
+            return torch.zeros_like(z[:, :, :self.n_dims])
+        
+        # Check input stability
+        if not self.check_numerical_stability(z, "input z"):
+            logger.warning("Unstable input detected, returning zero forces")
             return torch.zeros_like(z[:, :, :self.n_dims])
         
         # # Check if system is feasible for MLFF prediction
@@ -207,9 +249,37 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
                 predictions = self.mlff_predictor.predict(batch)
                 
             if 'forces' not in predictions:
+                logger.warning("No forces in MLFF predictions")
                 return torch.zeros_like(z[:, :, :self.n_dims])
                 
             forces = predictions['forces']  # [total_atoms, 3]
+            
+            # Check forces numerical stability
+            if not self.check_numerical_stability(forces, "MLFF forces"):
+                logger.warning("Unstable MLFF forces detected, returning zero forces")
+                return torch.zeros_like(z[:, :, :self.n_dims])
+            
+            # Log force statistics
+            force_magnitudes = torch.norm(forces, dim=-1)
+            force_stats = {
+                'mean_magnitude': force_magnitudes.mean().item(),
+                'max_magnitude': force_magnitudes.max().item(),
+                'min_magnitude': force_magnitudes.min().item(),
+                'std_magnitude': force_magnitudes.std().item()
+            }
+            
+            logger.info(f"MLFF forces - mean magnitude: {force_stats['mean_magnitude']:.6f}, "
+                       f"max magnitude: {force_stats['max_magnitude']:.6f}, "
+                       f"min magnitude: {force_stats['min_magnitude']:.6f}")
+            
+            # Log to wandb if available
+            if WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({
+                    'mlff_forces/mean_magnitude': force_stats['mean_magnitude'],
+                    'mlff_forces/max_magnitude': force_stats['max_magnitude'],
+                    'mlff_forces/min_magnitude': force_stats['min_magnitude'],
+                    'mlff_forces/std_magnitude': force_stats['std_magnitude']
+                })
             
         except Exception as e:
             print(f"Warning: MLFF prediction failed: {e}")
@@ -256,9 +326,28 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         # MLFF guidance is most effective when molecular structures are reasonably formed
         noise_level = sigma.mean().item() if sigma.numel() > 0 else 1.0
         
+        # Log noise level and guidance decision
+        logger.info(f"Noise level: {noise_level:.6f}, threshold: {self.noise_threshold:.6f}, "
+                   f"guidance_scale: {self.guidance_scale:.6f}")
+        
+        # Log to wandb if available
+        if WANDB_AVAILABLE and wandb.run is not None:
+            wandb.log({
+                'guidance/noise_level': noise_level,
+                'guidance/noise_threshold': self.noise_threshold,
+                'guidance/guidance_scale': self.guidance_scale,
+                'guidance/guidance_iterations': self.guidance_iterations
+            })
+        
         # Adaptive noise threshold: skip guidance when noise is too high
         # This provides ~2-3x speedup by avoiding MLFF calls during early diffusion
         if noise_level > self.noise_threshold:  # Skip early high-noise diffusion steps
+            logger.info(f"Skipping guidance due to high noise: {noise_level:.6f} > {self.noise_threshold:.6f}")
+            
+            # Log skip decision to wandb
+            if WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({'guidance/skipped_due_to_noise': True})
+            
             return z
         
         # Additional feasibility check for moderately noisy systems
@@ -276,7 +365,32 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             
             # Check if forces are meaningful (not all zeros)
             if torch.all(forces == 0):
+                logger.info(f"All forces are zero at iteration {iteration + 1}, breaking")
                 break
+            
+            # Check forces numerical stability
+            if not self.check_numerical_stability(forces, f"forces iteration {iteration + 1}"):
+                logger.warning(f"Unstable forces at iteration {iteration + 1}, breaking")
+                break
+            
+            # Log force statistics for this iteration
+            force_magnitudes = torch.norm(forces, dim=-1)
+            iteration_force_stats = {
+                'mean': force_magnitudes.mean().item(),
+                'max': force_magnitudes.max().item(),
+                'std': force_magnitudes.std().item()
+            }
+            
+            logger.info(f"Iteration {iteration + 1}: force magnitudes - mean: {iteration_force_stats['mean']:.6f}, "
+                       f"max: {iteration_force_stats['max']:.6f}")
+            
+            # Log iteration-specific metrics to wandb
+            if WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({
+                    f'guidance_iteration_{iteration + 1}/force_mean': iteration_force_stats['mean'],
+                    f'guidance_iteration_{iteration + 1}/force_max': iteration_force_stats['max'],
+                    f'guidance_iteration_{iteration + 1}/force_std': iteration_force_stats['std']
+                })
             
             # Apply force clipping if threshold is specified
             if self.force_clip_threshold is not None:
@@ -308,8 +422,56 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
                 sigma_for_forces = sigma_for_forces[:, :n_nodes_forces]
             
             # Scale forces by guidance scale, noise level, and number of iterations
-            force_scale = (self.guidance_scale / self.guidance_iterations) * sigma_for_forces.unsqueeze(-1)  # [batch_size, n_nodes_forces, 1]
+            # Check for potential division issues
+            if self.guidance_iterations == 0:
+                logger.warning("guidance_iterations is 0, skipping guidance")
+                break
+                
+            base_scale = self.guidance_scale / self.guidance_iterations
+            force_scale = base_scale * sigma_for_forces.unsqueeze(-1)  # [batch_size, n_nodes_forces, 1]
+            
+            # Check force_scale stability
+            if not self.check_numerical_stability(force_scale, "force_scale"):
+                logger.warning(f"Unstable force_scale at iteration {iteration + 1}, breaking")
+                break
+            
             position_guidance = forces * force_scale
+            
+            # Log guidance statistics
+            guidance_magnitudes = torch.norm(position_guidance, dim=-1)
+            guidance_stats = {
+                'base_scale': base_scale,
+                'effective_noise_level': sigma_for_forces.mean().item(),
+                'guidance_mean': guidance_magnitudes.mean().item(),
+                'guidance_max': guidance_magnitudes.max().item(),
+                'guidance_std': guidance_magnitudes.std().item(),
+                'force_to_guidance_ratio': guidance_magnitudes.mean().item() / iteration_force_stats['mean'] if iteration_force_stats['mean'] > 0 else 0
+            }
+            
+            logger.info(f"Iteration {iteration + 1}: guidance scale={guidance_stats['base_scale']:.6f}, "
+                       f"noise_level={guidance_stats['effective_noise_level']:.6f}, "
+                       f"guidance magnitudes - mean: {guidance_stats['guidance_mean']:.6f}, "
+                       f"max: {guidance_stats['guidance_max']:.6f}")
+            
+            # Log detailed guidance metrics to wandb - this is crucial for diagnosing small scale issues
+            if WANDB_AVAILABLE and wandb.run is not None:
+                wandb.log({
+                    f'guidance_iteration_{iteration + 1}/base_scale': guidance_stats['base_scale'],
+                    f'guidance_iteration_{iteration + 1}/effective_noise_level': guidance_stats['effective_noise_level'],
+                    f'guidance_iteration_{iteration + 1}/guidance_mean': guidance_stats['guidance_mean'],
+                    f'guidance_iteration_{iteration + 1}/guidance_max': guidance_stats['guidance_max'],
+                    f'guidance_iteration_{iteration + 1}/guidance_std': guidance_stats['guidance_std'],
+                    f'guidance_iteration_{iteration + 1}/force_to_guidance_ratio': guidance_stats['force_to_guidance_ratio'],
+                    # Track the mathematical operations that might cause issues with small scales
+                    f'guidance_iteration_{iteration + 1}/raw_guidance_scale': self.guidance_scale,
+                    f'guidance_iteration_{iteration + 1}/guidance_iterations': self.guidance_iterations,
+                    f'guidance_iteration_{iteration + 1}/scale_division_result': self.guidance_scale / self.guidance_iterations,
+                })
+            
+            # Check position guidance stability
+            if not self.check_numerical_stability(position_guidance, "position_guidance"):
+                logger.warning(f"Unstable position_guidance at iteration {iteration + 1}, breaking")
+                break
             
             # Apply guidance to positions (first n_dims dimensions)
             # Ensure position guidance matches the z tensor shape
@@ -322,6 +484,19 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             z_guided[:, :, :self.n_dims] = diffusion_utils.remove_mean_with_mask(
                 z_guided[:, :, :self.n_dims], node_mask
             )
+        
+        # Log final guidance summary to wandb
+        if WANDB_AVAILABLE and wandb.run is not None:
+            # Calculate total position change from guidance
+            position_change = torch.norm(z_guided[:, :, :self.n_dims] - z[:, :, :self.n_dims], dim=-1)
+            
+            wandb.log({
+                'guidance_summary/total_iterations_completed': iteration + 1,
+                'guidance_summary/mean_position_change': position_change.mean().item(),
+                'guidance_summary/max_position_change': position_change.max().item(),
+                'guidance_summary/guidance_applied': True,
+                'guidance_summary/final_noise_level': noise_level
+            })
         
         return z_guided
     
