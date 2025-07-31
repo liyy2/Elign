@@ -4,8 +4,7 @@ import numpy as np
 import logging
 from ase import Atoms
 from ase.constraints import FixAtoms
-from fairchem.core.datasets.atomic_data import AtomicData
-from fairchem.core.datasets import data_list_collater
+from fairchem.core.datasets.atomic_data import AtomicData, atomicdata_list_to_batch
 from equivariant_diffusion import utils as diffusion_utils
 from equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 
@@ -236,9 +235,9 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         if not atomic_data_list:
             return torch.zeros_like(z[:, :, :self.n_dims])
         
-        # Batch the atomic data
+        # Batch the atomic data using recommended UMA approach
         try:
-            batch = data_list_collater(atomic_data_list, otf_graph=True)
+            batch = atomicdata_list_to_batch(atomic_data_list)
         except Exception as e:
             print(f"Warning: Could not batch atomic data: {e}")
             return torch.zeros_like(z[:, :, :self.n_dims])
@@ -275,34 +274,32 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             # Log to wandb if available
             if WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
-                    'mlff_forces/mean_magnitude': force_stats['mean_magnitude'],
-                    'mlff_forces/max_magnitude': force_stats['max_magnitude'],
-                    'mlff_forces/min_magnitude': force_stats['min_magnitude'],
-                    'mlff_forces/std_magnitude': force_stats['std_magnitude']
+                    'mlff/forces_mean_magnitude': force_stats['mean_magnitude'],
+                    'mlff/forces_max_magnitude': force_stats['max_magnitude'],
+                    'mlff/forces_min_magnitude': force_stats['min_magnitude'],
+                    'mlff/forces_std_magnitude': force_stats['std_magnitude']
                 })
             
         except Exception as e:
             print(f"Warning: MLFF prediction failed: {e}")
             return torch.zeros_like(z[:, :, :self.n_dims])
         
-        # Reshape forces back to original batch format
+        # Reshape forces back to original batch format using UMA batch approach
         forces_batched = torch.zeros_like(z[:, :, :self.n_dims])
         
-        atom_idx = 0
+        # Extract forces for each system in the batch using batch.batch attribute
         for batch_idx, atomic_data in enumerate(atomic_data_list):
-            n_atoms = atomic_data.natoms.item()
-            batch_forces = forces[atom_idx:atom_idx + n_atoms]  # [n_atoms, 3]
+            # Get forces for this system using batch.batch indexing
+            system_forces = forces[batch.batch == batch_idx]  # [n_atoms_in_system, 3]
             
             # Get valid node indices for this batch
             mask = node_mask[batch_idx, :, 0]
             valid_indices = torch.where(mask)[0]
             
-            if len(valid_indices) == n_atoms:
-                # Ensure batch_forces is on the same device as forces_batched
-                batch_forces = batch_forces.to(forces_batched.device)
-                forces_batched[batch_idx, valid_indices] = batch_forces
-                
-            atom_idx += n_atoms
+            if len(valid_indices) == len(system_forces):
+                # Ensure system_forces is on the same device as forces_batched
+                system_forces = system_forces.to(forces_batched.device)
+                forces_batched[batch_idx, valid_indices] = system_forces
             
         return forces_batched
     
@@ -322,33 +319,22 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         if self.mlff_predictor is None or self.guidance_scale == 0:
             return z
         
-        # Skip guidance during high-noise early diffusion steps for significant speedup
-        # MLFF guidance is most effective when molecular structures are reasonably formed
-        noise_level = sigma.mean().item() if sigma.numel() > 0 else 1.0
+        # Note: Noise threshold check is already done in DPM-Solver++ loop
+        # This function is only called when guidance should be applied
         
-        # Log noise level and guidance decision
-        logger.info(f"Noise level: {noise_level:.6f}, threshold: {self.noise_threshold:.6f}, "
-                   f"guidance_scale: {self.guidance_scale:.6f}")
+        # Log guidance application
+        noise_level = sigma.mean().item() if sigma.numel() > 0 else 1.0
+        logger.info(f"Applying MLFF guidance: noise_level={noise_level:.6f}, "
+                   f"guidance_scale={self.guidance_scale:.6f}")
         
         # Log to wandb if available
         if WANDB_AVAILABLE and wandb.run is not None:
             wandb.log({
-                'guidance/noise_level': noise_level,
-                'guidance/noise_threshold': self.noise_threshold,
-                'guidance/guidance_scale': self.guidance_scale,
-                'guidance/guidance_iterations': self.guidance_iterations
+                'mlff/noise_level': noise_level,
+                'mlff/guidance_scale': self.guidance_scale,
+                'mlff/guidance_iterations': self.guidance_iterations,
+                'mlff/guidance_applied': True
             })
-        
-        # Adaptive noise threshold: skip guidance when noise is too high
-        # This provides ~2-3x speedup by avoiding MLFF calls during early diffusion
-        if noise_level > self.noise_threshold:  # Skip early high-noise diffusion steps
-            logger.info(f"Skipping guidance due to high noise: {noise_level:.6f} > {self.noise_threshold:.6f}")
-            
-            # Log skip decision to wandb
-            if WANDB_AVAILABLE and wandb.run is not None:
-                wandb.log({'guidance/skipped_due_to_noise': True})
-            
-            return z
         
         # Additional feasibility check for moderately noisy systems
         max_distance = 6.0 if noise_level < 0.5 else 10.0  # More lenient for high noise
@@ -387,9 +373,9 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             # Log iteration-specific metrics to wandb
             if WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
-                    f'guidance_iteration_{iteration + 1}/force_mean': iteration_force_stats['mean'],
-                    f'guidance_iteration_{iteration + 1}/force_max': iteration_force_stats['max'],
-                    f'guidance_iteration_{iteration + 1}/force_std': iteration_force_stats['std']
+                    f'mlff/iteration_{iteration + 1}_force_mean': iteration_force_stats['mean'],
+                    f'mlff/iteration_{iteration + 1}_force_max': iteration_force_stats['max'],
+                    f'mlff/iteration_{iteration + 1}_force_std': iteration_force_stats['std']
                 })
             
             # Apply force clipping if threshold is specified
@@ -456,16 +442,16 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             # Log detailed guidance metrics to wandb - this is crucial for diagnosing small scale issues
             if WANDB_AVAILABLE and wandb.run is not None:
                 wandb.log({
-                    f'guidance_iteration_{iteration + 1}/base_scale': guidance_stats['base_scale'],
-                    f'guidance_iteration_{iteration + 1}/effective_noise_level': guidance_stats['effective_noise_level'],
-                    f'guidance_iteration_{iteration + 1}/guidance_mean': guidance_stats['guidance_mean'],
-                    f'guidance_iteration_{iteration + 1}/guidance_max': guidance_stats['guidance_max'],
-                    f'guidance_iteration_{iteration + 1}/guidance_std': guidance_stats['guidance_std'],
-                    f'guidance_iteration_{iteration + 1}/force_to_guidance_ratio': guidance_stats['force_to_guidance_ratio'],
+                    f'mlff/iteration_{iteration + 1}_base_scale': guidance_stats['base_scale'],
+                    f'mlff/iteration_{iteration + 1}_effective_noise_level': guidance_stats['effective_noise_level'],
+                    f'mlff/iteration_{iteration + 1}_guidance_mean': guidance_stats['guidance_mean'],
+                    f'mlff/iteration_{iteration + 1}_guidance_max': guidance_stats['guidance_max'],
+                    f'mlff/iteration_{iteration + 1}_guidance_std': guidance_stats['guidance_std'],
+                    f'mlff/iteration_{iteration + 1}_force_to_guidance_ratio': guidance_stats['force_to_guidance_ratio'],
                     # Track the mathematical operations that might cause issues with small scales
-                    f'guidance_iteration_{iteration + 1}/raw_guidance_scale': self.guidance_scale,
-                    f'guidance_iteration_{iteration + 1}/guidance_iterations': self.guidance_iterations,
-                    f'guidance_iteration_{iteration + 1}/scale_division_result': self.guidance_scale / self.guidance_iterations,
+                    f'mlff/iteration_{iteration + 1}_raw_guidance_scale': self.guidance_scale,
+                    f'mlff/iteration_{iteration + 1}_guidance_iterations': self.guidance_iterations,
+                    f'mlff/iteration_{iteration + 1}_scale_division_result': self.guidance_scale / self.guidance_iterations,
                 })
             
             # Check position guidance stability
@@ -491,11 +477,11 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
             position_change = torch.norm(z_guided[:, :, :self.n_dims] - z[:, :, :self.n_dims], dim=-1)
             
             wandb.log({
-                'guidance_summary/total_iterations_completed': iteration + 1,
-                'guidance_summary/mean_position_change': position_change.mean().item(),
-                'guidance_summary/max_position_change': position_change.max().item(),
-                'guidance_summary/guidance_applied': True,
-                'guidance_summary/final_noise_level': noise_level
+                'mlff/total_iterations_completed': iteration + 1,
+                'mlff/mean_position_change': position_change.mean().item(),
+                'mlff/max_position_change': position_change.max().item(),
+                'mlff/guidance_applied': True,
+                'mlff/final_noise_level': noise_level
             })
         
         return z_guided
@@ -540,6 +526,132 @@ class MLFFGuidedDiffusion(EnVariationalDiffusion):
         ], dim=2)
         
         return zs
+    
+    @torch.no_grad()
+    def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False, **kwargs):
+        """
+        Override the main sample method to handle both DDPM and DPM-Solver++ with MLFF guidance.
+        """
+        # Extract dataset_info from kwargs if available (needed for MLFF guidance)
+        dataset_info = kwargs.get('dataset_info', None)
+        
+        if self.sampling_method == 'dpm_solver++':
+            return self.sample_dpm_solver_with_mlff_guidance(
+                n_samples, n_nodes, node_mask, edge_mask, context, dataset_info, fix_noise
+            )
+        else:
+            # Use existing DDPM sampling with MLFF guidance
+            return self.sample_with_mlff_guidance(
+                n_samples, n_nodes, node_mask, edge_mask, context, dataset_info, fix_noise
+            )
+    
+    @torch.no_grad()
+    def sample_dpm_solver_with_mlff_guidance(self, n_samples, n_nodes, node_mask, edge_mask, context, dataset_info, fix_noise=False):
+        """
+        DPM-Solver++ sampling with MLFF guidance applied at each solver step.
+        """
+        if dataset_info is None:
+            logger.warning("No dataset_info provided, falling back to unguided DPM-Solver++ sampling")
+            return super().sample(n_samples, n_nodes, node_mask, edge_mask, context, fix_noise)
+        
+        # Initialize noise
+        if fix_noise:
+            z = self.sample_combined_position_feature_noise(1, n_nodes, node_mask)
+        else:
+            z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
+
+        diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+
+        # Initialize DPM-Solver++ lazily if needed
+        if self.dpm_solver is None:
+            from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus
+            self.dpm_solver = DPMSolverPlusPlus(
+                model_fn=self.phi,
+                noise_schedule_fn=self.gamma,
+                order=self.dpm_solver_order,
+                timesteps=self.T  # Pass number of training timesteps for DPM linear schedule
+            )
+        
+        # Generate timesteps for DPM-Solver++
+        from equivariant_diffusion.dpm_solver import get_time_steps_for_dpm_solver
+        timesteps = get_time_steps_for_dpm_solver(self.dpm_solver_steps, z.device)
+        
+        logger.info(f"Starting DPM-Solver++ with MLFF guidance: {len(timesteps)} timesteps, "
+                   f"guidance_scale={self.guidance_scale}, iterations={self.guidance_iterations}")
+        
+        # Clear DPM-Solver++ cache
+        self.dpm_solver.model_prev_list = []
+        self.dpm_solver.t_prev_list = []
+        
+        n_dims = z.size(2) if len(z.shape) > 2 else 3  # Assume first 3 dims are positions
+        
+        # DPM-Solver++ sampling loop with MLFF guidance
+        for i in range(len(timesteps) - 1):
+            t_prev = timesteps[i].item()
+            t = timesteps[i + 1].item()
+            
+            # Compute noise level for guidance threshold
+            noise_level = t  # t goes from 1.0 to 0.0
+            
+            
+            # Perform one DPM-Solver++ step
+            if self.dpm_solver.order == 2:
+                z_before_guidance, model_current = self.dpm_solver.multistep_dpm_solver_second_update(
+                    z, t_prev, t, node_mask, edge_mask, context)
+            elif self.dpm_solver.order == 3:
+                z_before_guidance, model_current = self.dpm_solver.multistep_dpm_solver_third_update(
+                    z, t_prev, t, node_mask, edge_mask, context)
+            else:
+                raise ValueError(f"DPM-Solver++ order {self.dpm_solver.order} not supported")
+            
+            # Apply MLFF guidance if noise level is below threshold
+            # Use simple timestep-based threshold to avoid memory issues
+            if t <= self.noise_threshold:
+                # Convert current noise level to sigma for guidance scaling
+                t_tensor = torch.tensor([t], device=z.device)  # Make it 1D instead of scalar
+                gamma_t = self.gamma(t_tensor)
+                sigma_t = self.sigma(gamma_t, target_tensor=z_before_guidance)
+                
+                # Apply MLFF guidance
+                z = self.apply_mlff_guidance(z_before_guidance, node_mask, dataset_info, sigma_t)
+                
+                logger.info(f"DPM-Solver++ step {i+1}/{len(timesteps)-1}: t={t:.3f}, "
+                           f"noise_level={noise_level:.3f}, MLFF guidance applied")
+            else:
+                z = z_before_guidance
+                logger.info(f"DPM-Solver++ step {i+1}/{len(timesteps)-1}: t={t:.3f}, "
+                           f"noise_level={noise_level:.3f}, guidance skipped (above threshold)")
+            
+            # Preserve molecular constraints - remove center of mass drift
+            if len(z.shape) > 2:  # Handle molecular data
+                x_pos = z[:, :, :n_dims]
+                x_features = z[:, :, n_dims:]
+                x_pos = diffusion_utils.remove_mean_with_mask(x_pos, node_mask)
+                z = torch.cat([x_pos, x_features], dim=-1)
+            
+            # Update DPM-Solver++ cache for next iteration - reuse computed model prediction
+            if i < len(timesteps) - 2:  # Don't store on the last iteration
+                if len(self.dpm_solver.model_prev_list) >= self.dpm_solver.order - 1:
+                    self.dpm_solver.model_prev_list.pop(0)
+                    self.dpm_solver.t_prev_list.pop(0)
+                
+                # Store the already computed prediction (no redundant computation!)
+                self.dpm_solver.model_prev_list.append(model_current)
+                self.dpm_solver.t_prev_list.append(t)
+
+        # Finally sample p(x, h | z_0)
+        x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
+
+        diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
+
+        # Check for center of mass drift
+        max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
+        if max_cog > 5e-2:
+            logger.warning(f'DPM-Solver++ + MLFF: Center of mass drift {max_cog:.3f}. Projecting positions.')
+            x = diffusion_utils.remove_mean_with_mask(x, node_mask)
+
+        logger.info("DPM-Solver++ with MLFF guidance completed successfully")
+        return x, h
     
     @torch.no_grad()
     def sample_with_mlff_guidance(self, n_samples, n_nodes, node_mask, edge_mask, context, dataset_info, fix_noise=False):
@@ -640,6 +752,12 @@ def create_mlff_guided_model(original_model, mlff_predictor, guidance_scale=1.0,
     # This ensures exactly the same noise schedule is used
     guided_model.gamma = original_model.gamma
     
+    # Copy sampling method and DPM solver configuration
+    guided_model.sampling_method = original_model.sampling_method
+    guided_model.dpm_solver_order = getattr(original_model, 'dpm_solver_order', 2)
+    guided_model.dpm_solver_steps = getattr(original_model, 'dpm_solver_steps', 20)
+    guided_model.dpm_solver = getattr(original_model, 'dpm_solver', None)
+    
     return guided_model
 
 
@@ -672,7 +790,7 @@ def enhanced_sampling_with_mlff(model, mlff_predictor, n_samples, n_nodes, node_
         model, mlff_predictor, guidance_scale, dataset_info, guidance_iterations, noise_threshold, force_clip_threshold
     )
     
-    # Generate samples with MLFF guidance
-    return guided_model.sample_with_mlff_guidance(
-        n_samples, n_nodes, node_mask, edge_mask, context, dataset_info, fix_noise
+    # Generate samples with MLFF guidance (automatically routes to DPM-Solver++ or DDPM)
+    return guided_model.sample(
+        n_samples, n_nodes, node_mask, edge_mask, context, fix_noise, dataset_info=dataset_info
     ) 

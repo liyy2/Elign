@@ -5,6 +5,7 @@ import torch
 from egnn import models
 from torch.nn import functional as F
 from equivariant_diffusion import utils as diffusion_utils
+from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus, get_time_steps_for_dpm_solver
 
 
 # Defining some useful util functions.
@@ -261,7 +262,8 @@ class EnVariationalDiffusion(torch.nn.Module):
             dynamics: models.EGNN_dynamics_QM9, in_node_nf: int, n_dims: int,
             timesteps: int = 1000, parametrization='eps', noise_schedule='learned',
             noise_precision=1e-4, loss_type='vlb', norm_values=(1., 1., 1.),
-            norm_biases=(None, 0., 0.), include_charges=True):
+            norm_biases=(None, 0., 0.), include_charges=True, 
+            sampling_method='ddpm', dpm_solver_order=2, dpm_solver_steps=20):
         super().__init__()
 
         assert loss_type in {'vlb', 'l2'}
@@ -293,6 +295,16 @@ class EnVariationalDiffusion(torch.nn.Module):
         self.norm_values = norm_values
         self.norm_biases = norm_biases
         self.register_buffer('buffer', torch.zeros(1))
+
+        # Sampling method configuration
+        assert sampling_method in {'ddpm', 'dpm_solver++'}, f"Unknown sampling method: {sampling_method}"
+        self.sampling_method = sampling_method
+        self.dpm_solver_order = dpm_solver_order
+        self.dpm_solver_steps = dpm_solver_steps
+        
+        # DPM-Solver++ will be initialized lazily when first used
+        # since it depends on self.phi which may not be ready during init
+        self.dpm_solver = None
 
         if noise_schedule != 'learned':
             self.check_issues_norm_values()
@@ -763,7 +775,7 @@ class EnVariationalDiffusion(torch.nn.Module):
     @torch.no_grad()
     def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False):
         """
-        Draw samples from the generative model.
+        Draw samples from the generative model using selected sampling method.
         """
         if fix_noise:
             # Noise is broadcasted over the batch axis, useful for visualizations.
@@ -773,14 +785,29 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
-        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in reversed(range(0, self.T)):
-            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
-            t_array = s_array + 1
-            s_array = s_array / self.T
-            t_array = t_array / self.T
+        if self.sampling_method == 'dpm_solver++':
+            # Initialize DPM-Solver++ lazily if needed
+            if self.dpm_solver is None:
+                self.dpm_solver = DPMSolverPlusPlus(
+                    model_fn=self.phi,
+                    noise_schedule_fn=self.gamma,
+                    order=self.dpm_solver_order,
+                    timesteps=self.T  # Pass number of training timesteps for DPM linear schedule
+                )
+            
+            # Use DPM-Solver++ for fast sampling
+            timesteps = get_time_steps_for_dpm_solver(self.dpm_solver_steps, z.device)
+            z = self.dpm_solver.sample(z, timesteps, node_mask, edge_mask, context)
+        else:
+            # Use default DDPM sampling
+            # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+            for s in reversed(range(0, self.T)):
+                s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
+                t_array = s_array + 1
+                s_array = s_array / self.T
+                t_array = t_array / self.T
 
-            z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
+                z = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
 
         # Finally sample p(x, h | z_0).
         x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
@@ -804,27 +831,67 @@ class EnVariationalDiffusion(torch.nn.Module):
 
         diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
-        if keep_frames is None:
-            keep_frames = self.T
+        if self.sampling_method == 'dpm_solver++':
+            # Initialize DPM-Solver++ lazily if needed
+            if self.dpm_solver is None:
+                self.dpm_solver = DPMSolverPlusPlus(
+                    model_fn=self.phi,
+                    noise_schedule_fn=self.gamma,
+                    order=self.dpm_solver_order,
+                    timesteps=self.T  # Pass number of training timesteps for DPM linear schedule
+                )
+            
+            # For DPM-Solver++, adapt keep_frames to the number of solver steps
+            if keep_frames is None:
+                keep_frames = self.dpm_solver_steps
+            else:
+                keep_frames = min(keep_frames, self.dpm_solver_steps)
+            
+            chain = torch.zeros((keep_frames,) + z.size(), device=z.device)
+            timesteps = get_time_steps_for_dpm_solver(self.dpm_solver_steps, z.device)
+            
+            # Store initial state
+            chain[0] = self.unnormalize_z(z, node_mask)
+            
+            # Sample with DPM-Solver++ and store intermediate states
+            for i in range(len(timesteps) - 1):
+                t_prev = timesteps[i:i+1]
+                t = timesteps[i+1:i+2]
+                
+                # Perform one step of DPM-Solver++
+                if self.dpm_solver.order == 2:
+                    z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
+                        z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                else:
+                    z, _ = self.dpm_solver.multistep_dpm_solver_third_update(
+                        z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                
+                # Store intermediate state
+                write_index = min(i + 1, keep_frames - 1)
+                chain[write_index] = self.unnormalize_z(z, node_mask)
         else:
-            assert keep_frames <= self.T
-        chain = torch.zeros((keep_frames,) + z.size(), device=z.device)
+            # Use default DDPM chain sampling
+            if keep_frames is None:
+                keep_frames = self.T
+            else:
+                assert keep_frames <= self.T
+            chain = torch.zeros((keep_frames,) + z.size(), device=z.device)
 
-        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in reversed(range(0, self.T)):
-            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
-            t_array = s_array + 1
-            s_array = s_array / self.T
-            t_array = t_array / self.T
+            # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+            for s in reversed(range(0, self.T)):
+                s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
+                t_array = s_array + 1
+                s_array = s_array / self.T
+                t_array = t_array / self.T
 
-            z = self.sample_p_zs_given_zt(
-                s_array, t_array, z, node_mask, edge_mask, context)
+                z = self.sample_p_zs_given_zt(
+                    s_array, t_array, z, node_mask, edge_mask, context)
 
-            diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
+                diffusion_utils.assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
 
-            # Write to chain tensor.
-            write_index = (s * keep_frames) // self.T
-            chain[write_index] = self.unnormalize_z(z, node_mask)
+                # Write to chain tensor.
+                write_index = (s * keep_frames) // self.T
+                chain[write_index] = self.unnormalize_z(z, node_mask)
 
         # Finally sample p(x, h | z_0).
         x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context)

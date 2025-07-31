@@ -11,6 +11,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import os
 import sys
 import logging
+import time
 
 """
 MLFF-Guided Diffusion Evaluation with Weights & Biases Logging and Multi-GPU Support
@@ -72,6 +73,15 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
     print("Warning: wandb not available. Install with 'pip install wandb' to enable logging.")
+
+# Set up main logger
+logger = logging.getLogger(__name__)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
 
 def setup_distributed(rank, world_size, backend='nccl'):
@@ -218,47 +228,67 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
     # Split samples across GPUs
     local_n_samples = split_samples_across_gpus(n_samples)
     
+    # Initialize timing and throughput tracking
+    sampling_start_time = time.time()
+    
     if is_main_process():
-        print(f"\n{'='*50}")
-        print(f"MOLECULAR SAMPLING COMPARISON")
-        print(f"{'='*50}")
-        print(f"Total samples: {n_samples}")
-        print(f"GPUs: {get_rank_and_world_size()[1]}")
-        print(f"Samples per GPU: {local_n_samples}")
-        print(f"MLFF predictor: {'Available' if mlff_predictor is not None else 'Not available'}")
-        print(f"Skip baseline: {eval_args.skip_baseline}")
+        logger.info(f"{'='*50}")
+        logger.info(f"MOLECULAR SAMPLING COMPARISON")
+        logger.info(f"{'='*50}")
+        logger.info(f"Total samples: {n_samples}")
+        logger.info(f"GPUs: {get_rank_and_world_size()[1]}")
+        logger.info(f"Samples per GPU: {local_n_samples}")
+        logger.info(f"MLFF predictor: {'Available' if mlff_predictor is not None else 'Not available'}")
+        logger.info(f"Skip baseline: {eval_args.skip_baseline}")
         if mlff_predictor is not None:
-            print(f"Guidance scales: {eval_args.guidance_scales}")
-            print(f"Guidance iterations: {eval_args.guidance_iterations}")
-            print(f"Noise threshold: {eval_args.noise_threshold} (skip guidance when noise > threshold)")
-            print(f"Force clip threshold: {eval_args.force_clip_threshold} (None = no clipping)")
+            logger.info(f"Guidance scales: {eval_args.guidance_scales}")
+            logger.info(f"Guidance iterations: {eval_args.guidance_iterations}")
+            logger.info(f"Noise threshold: {eval_args.noise_threshold} (skip guidance when noise > threshold)")
+            logger.info(f"Force clip threshold: {eval_args.force_clip_threshold} (None = no clipping)")
     
     # Log sampling configuration (only from main process)
     if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
         wandb.log({
-            "sampling/n_samples": n_samples,
-            "sampling/local_n_samples": local_n_samples,
-            "sampling/world_size": get_rank_and_world_size()[1],
-            "sampling/mlff_available": mlff_predictor is not None,
-            "sampling/guidance_iterations": eval_args.guidance_iterations,
-            "sampling/skip_baseline": eval_args.skip_baseline,
+            "performance/n_samples": n_samples,
+            "performance/local_n_samples": local_n_samples,
+            "performance/world_size": get_rank_and_world_size()[1],
+            "performance/mlff_available": mlff_predictor is not None,
+            "performance/guidance_iterations": eval_args.guidance_iterations,
+            "performance/skip_baseline": eval_args.skip_baseline,
         })
     
     # Sample baseline (without guidance) - skip if requested
     baseline_results = None
     if not eval_args.skip_baseline:
         if is_main_process():
-            print(f"\n1. BASELINE SAMPLING (No MLFF guidance)")
-            print(f"   Sampling {n_samples} molecules...")
+            logger.info(f"1. BASELINE SAMPLING (No MLFF guidance)")
+            logger.info(f"   Sampling {n_samples} molecules...")
         
         # Set seed for reproducible baseline sampling
         rank, _ = get_rank_and_world_size()
         torch.manual_seed(eval_args.seed + rank)
         
         # Use local sample count for each GPU
+        baseline_start_time = time.time()
         nodesxsample = nodes_dist.sample(local_n_samples)
         one_hot_baseline, charges_baseline, x_baseline, node_mask = sample(
             args, device, flow, dataset_info, nodesxsample=nodesxsample)
+        baseline_end_time = time.time()
+        
+        # Calculate baseline sampling throughput
+        baseline_duration = baseline_end_time - baseline_start_time
+        baseline_samples_per_sec = local_n_samples / baseline_duration if baseline_duration > 0 else 0
+        
+        if is_main_process():
+            logger.info(f"Baseline sampling: {local_n_samples} samples in {baseline_duration:.2f}s ({baseline_samples_per_sec:.2f} samples/sec)")
+        
+        # Log baseline performance
+        if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
+            wandb.log({
+                "performance/baseline_duration_sec": baseline_duration,
+                "performance/baseline_samples_per_sec": baseline_samples_per_sec,
+                "performance/baseline_molecules_per_minute": baseline_samples_per_sec * 60
+            })
         
         rank, world_size = get_rank_and_world_size()
         # Synchronize before reporting completion
@@ -266,7 +296,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
             dist.barrier()
         
         if is_main_process():
-            print(f"   ✓ All ranks completed baseline sampling ({local_n_samples} molecules per rank)")
+            logger.info(f"   ✓ All ranks completed baseline sampling ({local_n_samples} molecules per rank)")
         
         baseline_results = {
             'one_hot': one_hot_baseline,
@@ -276,7 +306,7 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         }
     else:
         if is_main_process():
-            print(f"\n1. BASELINE SAMPLING SKIPPED")
+            logger.info(f"1. BASELINE SAMPLING SKIPPED")
         # Still need nodesxsample for guided sampling
         rank, _ = get_rank_and_world_size()
         torch.manual_seed(eval_args.seed + rank)
@@ -288,8 +318,8 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         guidance_scales = eval_args.guidance_scales
         
         if is_main_process():
-            print(f"\n2. MLFF-GUIDED SAMPLING")
-            print(f"   Testing {len(guidance_scales)} guidance scales: {guidance_scales}")
+            logger.info(f"2. MLFF-GUIDED SAMPLING")
+            logger.info(f"   Testing {len(guidance_scales)} guidance scales: {guidance_scales}")
         
         # Setup for batched sampling
         max_n_nodes = dataset_info['max_n_nodes']
@@ -300,10 +330,14 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         
         for guidance_scale in guidance_scales:
             if is_main_process():
-                print(f"\n   → Guidance scale {guidance_scale}:")
+                logger.info(f"   → Guidance scale {guidance_scale}:")
             
             # Set same seed as baseline for reproducible comparison
             torch.manual_seed(eval_args.seed + rank)
+            
+            # Track timing for this guidance scale
+            guidance_start_time = time.time()
+            mlff_force_evaluations = 0
             
             # Initialize storage for this guidance scale
             all_x_guided = []
@@ -351,12 +385,22 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                                f"noise_threshold={eval_args.noise_threshold:.3f}, "
                                f"force_clip_threshold={eval_args.force_clip_threshold}")
                 
+                batch_start_time = time.time()
                 x_batch, h_batch = enhanced_sampling_with_mlff(
                     flow, mlff_predictor, batch_size, max_n_nodes, 
                     node_mask_batch, edge_mask_batch, context_batch, dataset_info,
                     guidance_scale=guidance_scale, guidance_iterations=eval_args.guidance_iterations, 
                     noise_threshold=eval_args.noise_threshold, force_clip_threshold=eval_args.force_clip_threshold, fix_noise=False
                 )
+                batch_end_time = time.time()
+                
+                # Track MLFF force evaluations for this batch (approximate)
+                batch_mlff_evals = batch_size * 1000 * eval_args.guidance_iterations  # diffusion steps * iterations
+                mlff_force_evaluations += batch_mlff_evals
+                
+                # Calculate batch throughput
+                batch_duration = batch_end_time - batch_start_time
+                batch_samples_per_sec = batch_size / batch_duration if batch_duration > 0 else 0
                 
                 # Log completion and check for issues
                 if is_main_process():
@@ -365,7 +409,8 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                     logging.info(f"Completed MLFF-guided sampling batch - "
                                f"position magnitudes: mean={position_magnitudes.mean().item():.4f}, "
                                f"max={position_magnitudes.max().item():.4f}, "
-                               f"min={position_magnitudes.min().item():.4f}")
+                               f"min={position_magnitudes.min().item():.4f}, "
+                               f"throughput: {batch_samples_per_sec:.2f} samples/sec")
                 
                 # Store batch results
                 all_x_guided.append(x_batch)
@@ -384,22 +429,52 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
                 'node_mask': node_mask_guided
             }
             
+            # Calculate guidance scale performance metrics
+            guidance_end_time = time.time()
+            guidance_duration = guidance_end_time - guidance_start_time
+            guidance_samples_per_sec = total_samples / guidance_duration if guidance_duration > 0 else 0
+            mlff_evals_per_sec = mlff_force_evaluations / guidance_duration if guidance_duration > 0 else 0
+            
             # Synchronize before reporting completion
             if dist.is_initialized():
                 dist.barrier()
             
             if is_main_process():
-                print(f"   ✓ All ranks completed guidance scale {guidance_scale} ({total_samples} molecules per rank)")
+                logger.info(f"   ✓ All ranks completed guidance scale {guidance_scale} ({total_samples} molecules per rank)")
+                logger.info(f"     Performance: {guidance_samples_per_sec:.2f} samples/sec, {mlff_evals_per_sec:.0f} MLFF evals/sec")
             
-            # Log guidance scale completion (only from main process)
+            # Log guidance scale completion and performance (only from main process)
             if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
-                wandb.log({f"sampling/guidance_scale_{guidance_scale}_completed": True})
+                wandb.log({
+                    f"performance/guidance_{guidance_scale}_duration_sec": guidance_duration,
+                    f"performance/guidance_{guidance_scale}_samples_per_sec": guidance_samples_per_sec,
+                    f"performance/guidance_{guidance_scale}_molecules_per_minute": guidance_samples_per_sec * 60,
+                    f"performance/guidance_{guidance_scale}_mlff_evals_per_sec": mlff_evals_per_sec,
+                    f"performance/guidance_{guidance_scale}_completed": True
+                })
             
     else:
         if is_main_process():
-            print(f"\n2. MLFF GUIDANCE SKIPPED")
-            print(f"   Reason: Predictor not available")
+            logger.info(f"2. MLFF GUIDANCE SKIPPED")
+            logger.info(f"   Reason: Predictor not available")
         guided_results = {}
+    
+    # Calculate total sampling performance
+    total_sampling_time = time.time() - sampling_start_time
+    total_samples_generated = n_samples * (1 + len(guidance_scales)) if not eval_args.skip_baseline else n_samples * len(guidance_scales)
+    overall_samples_per_sec = total_samples_generated / total_sampling_time if total_sampling_time > 0 else 0
+    
+    if is_main_process():
+        logger.info(f"Total sampling completed in {total_sampling_time:.2f}s - overall throughput: {overall_samples_per_sec:.2f} samples/sec")
+    
+    # Log overall performance
+    if WANDB_AVAILABLE and wandb.run is not None and is_main_process():
+        wandb.log({
+            "performance/total_sampling_time_sec": total_sampling_time,
+            "performance/total_samples_generated": total_samples_generated,
+            "performance/overall_samples_per_sec": overall_samples_per_sec,
+            "performance/overall_molecules_per_minute": overall_samples_per_sec * 60
+        })
     
     return {
         'baseline': baseline_results,
@@ -627,10 +702,10 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
     if not is_main_process():
         return
     
-    print(f"\nSampling visualization chain with {n_nodes} nodes...")
+    logger.info(f"Sampling visualization chain with {n_nodes} nodes...")
     
     # Sample baseline chain
-    print("1. Sampling baseline chain...")
+    logger.info("1. Sampling baseline chain...")
     one_hot_baseline, charges_baseline, x_baseline = sample_chain(
         args, device, flow, n_tries, dataset_info)
     
@@ -642,11 +717,11 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
         dataset_info, id_from=0, name='chain_baseline'
     )
     
-    print("   ✓ Baseline chain saved")
+    logger.info("   ✓ Baseline chain saved")
     
     # Sample guided chain (if predictor available)
     if mlff_predictor is not None:
-        print("2. Sampling guided chain...")
+        logger.info("2. Sampling guided chain...")
         
         # Create guided model with appropriate guidance scale
         guided_model = create_mlff_guided_model(
@@ -686,10 +761,10 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
             dataset_info, id_from=0, name='chain_guided'
         )
         
-        print("   ✓ Guided chain saved")
+        logger.info("   ✓ Guided chain saved")
     
     else:
-        print("2. Skipping guided chain (predictor not available)")
+        logger.info("2. Skipping guided chain (predictor not available)")
 
 
 def main():
@@ -723,6 +798,15 @@ def main():
                         help='Skip guidance when noise level exceeds this threshold (0.8 = skip first ~20%% of steps)')
     parser.add_argument('--force_clip_threshold', type=float, default=None,
                         help='Clip MLFF forces to this maximum magnitude (None = no clipping)')
+    
+    # Sampling method arguments
+    parser.add_argument('--sampling_method', type=str, default='ddpm', 
+                        choices=['ddpm', 'dpm_solver++'],
+                        help='Sampling method: ddpm (default) or dpm_solver++')
+    parser.add_argument('--dpm_solver_order', type=int, default=2,
+                        choices=[2, 3], help='Order for DPM-Solver++ (2 or 3)')
+    parser.add_argument('--dpm_solver_steps', type=int, default=20,
+                        help='Number of steps for DPM-Solver++ sampling')
     
     # Evaluation options
     parser.add_argument('--skip_comparison', action='store_true',
@@ -872,6 +956,23 @@ def main():
     fn = 'generative_model_ema.npy' if args.ema_decay > 0 else 'generative_model.npy'
     flow_state_dict = torch.load(join(eval_args.model_path, fn), map_location=device)
     flow.load_state_dict(flow_state_dict)
+    
+    # Override sampling method if specified
+    if eval_args.sampling_method != 'ddpm':
+        flow.sampling_method = eval_args.sampling_method
+        flow.dpm_solver_order = eval_args.dpm_solver_order
+        flow.dpm_solver_steps = eval_args.dpm_solver_steps
+        
+        # Initialize DPM-Solver++ if needed
+        if eval_args.sampling_method == 'dpm_solver++':
+            from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus
+            flow.dpm_solver = DPMSolverPlusPlus(
+                model_fn=flow.phi,
+                noise_schedule_fn=flow.gamma,
+                order=eval_args.dpm_solver_order
+            )
+            if is_main_process():
+                print(f"✓ DPM-Solver++ initialized (order={eval_args.dpm_solver_order}, steps={eval_args.dpm_solver_steps})")
     
     # For evaluation, we don't need DDP wrapping - it causes issues with sampling
     if is_main_process():

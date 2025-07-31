@@ -104,6 +104,13 @@ def main():
         help='N tries to find stable molecule for gif animation')
     parser.add_argument('--n_nodes', type=int, default=19,
                         help='number of atoms in molecule for gif animation')
+    parser.add_argument('--sampling_method', type=str, default='ddpm', 
+                        choices=['ddpm', 'dpm_solver++'],
+                        help='Sampling method: ddpm (default) or dpm_solver++')
+    parser.add_argument('--dpm_solver_order', type=int, default=2,
+                        choices=[2, 3], help='Order for DPM-Solver++ (2 or 3)')
+    parser.add_argument('--dpm_solver_steps', type=int, default=20,
+                        help='Number of steps for DPM-Solver++ sampling')
 
     eval_args, unparsed_args = parser.parse_known_args()
 
@@ -138,6 +145,21 @@ def main():
                                  map_location=device)
 
     flow.load_state_dict(flow_state_dict)
+    
+    # Override sampling method if specified
+    if eval_args.sampling_method != 'ddpm':
+        flow.sampling_method = eval_args.sampling_method
+        flow.dpm_solver_order = eval_args.dpm_solver_order
+        flow.dpm_solver_steps = eval_args.dpm_solver_steps
+        
+        # Initialize DPM-Solver++ if needed
+        if eval_args.sampling_method == 'dpm_solver++':
+            from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus
+            flow.dpm_solver = DPMSolverPlusPlus(
+                model_fn=flow.phi,
+                noise_schedule_fn=flow.gamma,
+                order=eval_args.dpm_solver_order
+            )
 
     print('Sampling handful of molecules.')
     sample_different_sizes_and_save(
