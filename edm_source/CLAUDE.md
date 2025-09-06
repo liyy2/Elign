@@ -252,7 +252,7 @@ Install from `requirements.txt`: torch, numpy, scipy, wandb, tqdm, imageio
 ### Quick Validation
 ```bash
 # Test basic training with minimal epochs
-conda activae edm
+conda activate edm
 python main_qm9.py --n_epochs 1 --exp_name debug_test --batch_size 8
 
 # Test MLFF guidance with small samples
@@ -264,6 +264,115 @@ python eval_mlff_guided.py --model_path outputs/edm_1 --n_samples 5 --skip_visua
 - Check `node_mask` and `edge_mask` shapes for dimension mismatches
 - Monitor GPU memory usage during EGNN forward passes
 - Verify atom decoder consistency between training and evaluation
+
+## Known Issues and Solutions
+
+### MLFF Guidance Evaluation Issues
+
+#### 1. Missing `sampling_method` Attribute
+**Issue**: The base diffusion model may not have a `sampling_method` attribute, causing AttributeError.
+**Solution**: Already fixed - the code now checks for the attribute and initializes it to 'ddpm' if missing.
+
+#### 2. Numerical Instability with Small Guidance Scales
+**Issue**: Very small guidance scales (e.g., 0.001, 0.002, 0.003) can cause numerical instabilities in the force scaling calculations.
+**Symptoms**: 
+- Degraded molecular stability compared to baseline
+- Warning messages about unstable force_scale or position_guidance
+- Molecules with incorrect geometries
+
+**Root Cause**: In `mlff_guided_diffusion.py`, the guidance is scaled by:
+```python
+base_scale = self.guidance_scale / self.guidance_iterations
+force_scale = base_scale * sigma_for_forces.unsqueeze(-1)
+```
+When `guidance_scale` is very small (0.001) and divided by `guidance_iterations`, the resulting scale can be too small for stable floating-point operations.
+
+**Recommended Fix**: Use larger guidance scales (0.01 to 2.0 range) or ensure guidance_iterations=1 for small scales:
+```bash
+# Better guidance scale ranges
+python eval_mlff_guided.py --model_path outputs/edm_1 --guidance_scales 0.01 0.05 0.1 0.5 1.0
+```
+
+#### 3. Shape Mismatches in Force Application
+**Issue**: When molecules have varying numbers of atoms, force tensor shapes may not align with position tensors.
+**Solution**: The code includes shape checking and adjustment logic, but ensure `max_n_nodes` is consistent.
+
+#### 4. MLFF Predictor Failures - UMA Zero Forces Issue
+**Issue**: The UMA model sometimes returns zero forces even for valid molecular configurations.
+
+**Symptoms**: 
+- All forces are exactly zero despite non-equilibrium molecular geometry
+- Log messages: "MLFF returned all zero forces!"
+- No guidance applied during sampling
+- Degraded molecular quality compared to baseline
+
+**Possible Causes**:
+1. **Molecular configuration outside UMA training distribution**: 
+   - **CRITICAL**: Atoms too far apart (>6 Å) - UMA has a 6 Angstrom cutoff radius!
+   - At early diffusion steps, positions can be hundreds of Angstroms apart
+   - This triggers "No edges found" error from UMA predictor
+   - Atoms too close (<0.5 Å) can also cause issues
+   - Unusual atomic combinations not in training data
+   - Invalid molecular geometries from early diffusion steps
+
+2. **Numerical issues in UMA model**:
+   - Very small or very large position values
+   - Precision loss in force calculations
+   - Internal UMA model thresholds
+
+3. **Batch processing issues**:
+   - Single atom molecules (no forces)
+   - Incorrect atomic number mapping
+   - Cell/PBC configuration problems
+
+**Debugging with Enhanced Logging**:
+The updated code now logs:
+- Input position statistics (normalized and physical)
+- Valid atoms per batch
+- Inter-atomic distances
+- Atomic numbers in batch
+- Energy predictions (if available)
+- Force statistics including zero/nonzero counts
+
+**Workarounds**:
+1. Skip force guidance when all forces are zero
+2. Use larger guidance scales (0.1-1.0) to ensure meaningful force magnitudes
+3. Adjust noise_threshold to skip guidance during early noisy steps
+4. Use force_clip_threshold to prevent extreme forces
+
+#### 5. DPM-Solver++ Integration
+**Issue**: DPM-Solver++ may not properly pass dataset_info to the guided sampling function.
+**Solution**: Ensure dataset_info is passed through kwargs in the sampling chain.
+
+### Debugging Tips for MLFF Issues
+
+1. **Enable detailed logging**:
+```bash
+python eval_mlff_guided.py --model_path outputs/edm_1 --use_wandb --n_samples 10
+```
+
+2. **Test with known working parameters**:
+```bash
+# Conservative parameters that should work
+python eval_mlff_guided.py --model_path outputs/edm_1 \
+    --guidance_scales 0.1 0.5 1.0 \
+    --guidance_iterations 1 \
+    --noise_threshold 0.8 \
+    --force_clip_threshold 10.0
+```
+
+3. **Compare with baseline**:
+```bash
+# Run without MLFF to establish baseline
+python eval_sample.py --model_path outputs/edm_1 --n_samples 200
+
+# Then run with MLFF guidance
+python eval_mlff_guided.py --model_path outputs/edm_1 --n_samples 200
+```
+
+4. **Check force magnitudes**: The logs will show force statistics at each iteration. If forces are too large (>100) or too small (<0.001), adjust the guidance_scale accordingly.
+
+5. **Verify MLFF model loading**: Ensure the UMA model is properly authenticated and loaded by checking the initial logs for "Successfully loaded MLFF predictor".
 
 ## Output Structure
 

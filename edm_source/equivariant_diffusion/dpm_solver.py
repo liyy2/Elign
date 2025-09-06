@@ -71,17 +71,22 @@ class DPMSolverPlusPlus:
         sigma_t_squared = np.maximum(sigma_t_squared, 1e-8)
         log_sigma_t = 0.5 * np.log(sigma_t_squared)
         
-        # Compute gamma = log(alpha_t) - log(sigma_t) = log_alpha_t - log_sigma_t
-        log_alphas2_to_sigmas2 = log_alpha_t - log_sigma_t
-        
-        # Create gamma lookup table for DPM sampling
-        self.dpm_gamma_schedule = torch.from_numpy(log_alphas2_to_sigmas2).float()
+        # Compute lambda = log(alpha_t / sigma_t)
+        lambda_t = log_alpha_t - log_sigma_t
+
+        # Convert to base-model gamma parameterization: gamma_pre = -2 * lambda
+        # This matches EnVariationalDiffusion where:
+        #   alpha = sqrt(sigmoid(-gamma)), sigma = sqrt(sigmoid(gamma))
+        gamma_pre = -2.0 * lambda_t
+
+        # Create gamma lookup table for DPM sampling (in base-model gamma parameterization)
+        self.dpm_gamma_schedule = torch.from_numpy(gamma_pre).float()
         self.timesteps = timesteps
         
         print(f"DPM-Solver++: Using official linear schedule (β₀={beta_0}, β₁={beta_1})")
     
     def noise_schedule_fn(self, t: torch.Tensor) -> torch.Tensor:
-        """DPM-compatible linear noise schedule function."""
+        """DPM-compatible linear noise schedule in base-model gamma parameterization."""
         t_int = torch.round(t * self.timesteps).long()
         t_int = torch.clamp(t_int, 0, self.timesteps - 1)
         
@@ -92,19 +97,21 @@ class DPMSolverPlusPlus:
         return self.dpm_gamma_schedule[t_int]
     
     def marginal_log_mean_coeff(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute log mean coefficient alpha_t using DPM linear schedule."""
+        """Compute log mean coefficient alpha_t using DPM linear schedule (base gamma)."""
         gamma_t = self.noise_schedule_fn(t)
         return -0.5 * F.softplus(gamma_t)  # log(alpha_t) = -0.5 * softplus(gamma_t)
     
     def marginal_std(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute standard deviation sigma_t using DPM linear schedule."""
+        """Compute standard deviation sigma_t using DPM linear schedule (base gamma)."""
         gamma_t = self.noise_schedule_fn(t)
         return torch.sqrt(torch.sigmoid(gamma_t))  # sigma_t = sqrt(sigmoid(gamma_t))
     
     def marginal_lambda(self, t: torch.Tensor) -> torch.Tensor:
-        """Compute lambda_t = log(alpha_t/sigma_t) using DPM linear schedule."""
+        """Compute lambda_t = log(alpha_t/sigma_t) using DPM linear schedule.
+        With base gamma parameterization: lambda = -0.5 * gamma.
+        """
         gamma_t = self.noise_schedule_fn(t)
-        return -gamma_t  # lambda_t = -gamma_t
+        return -0.5 * gamma_t
     
     def data_prediction_fn(self, x: torch.Tensor, t: torch.Tensor,
                           node_mask: torch.Tensor, edge_mask: torch.Tensor,

@@ -958,6 +958,10 @@ def main():
     flow.load_state_dict(flow_state_dict)
     
     # Override sampling method if specified
+    # Initialize sampling_method attribute if it doesn't exist
+    if not hasattr(flow, 'sampling_method'):
+        flow.sampling_method = 'ddpm'  # Default to DDPM
+    
     if eval_args.sampling_method != 'ddpm':
         flow.sampling_method = eval_args.sampling_method
         flow.dpm_solver_order = eval_args.dpm_solver_order

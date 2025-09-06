@@ -4,7 +4,7 @@
 #SBATCH --error=exp_cond_alpha_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=32G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:4
 #SBATCH --partition=gpu
@@ -35,4 +35,4 @@ python main_qm9.py \
   --batch_size 64 \
   --normalize_factors '[1,8,1]' \
   --conditioning alpha \
-  --dataset qm9_second_half
+  --dataset qm9_second_half 

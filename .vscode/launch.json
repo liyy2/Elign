@@ -12,6 +12,49 @@
             ],
             "console": "integratedTerminal",
             "cwd": "/home/yl2428/e3_diffusion_for_molecules-main/e3_diffusion_for_molecules-main"
+        },
+        {
+            "name": "@eval_train_diffusion.sh",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "torch.distributed.launch",
+            "args": [
+                "--nproc_per_node=1",
+                "eval_mlff_guided.py",
+                "--model_path",
+                "outputs/exp_cond_alpha",
+                "--use_distributed",
+                "--n_samples",
+                "1000",
+                "--guidance_iterations",
+                "3",
+                "--use_wandb",
+                "--guidance_scales",
+                "0.001",
+                "0.002",
+                "0.003",
+                "--skip_visualization",
+                "--skip_analysis",
+                "--skip_chain",
+                "--noise_threshold",
+                "0.2",
+                "--force_clip_threshold",
+                "10",
+                "--sampling_method",
+                "ddpm",
+                "--dpm_solver_order",
+                "2",
+                "--dpm_solver_steps",
+                "20",
+                "--batch_size",
+                "5",
+                "--skip_baseline"
+            ],
+            "console": "integratedTerminal",
+            "cwd": "/nfs/roberts/project/pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source",
+            "env": {
+                "CUDA_VISIBLE_DEVICES": "0"
+            }
         }
     ]
 }
