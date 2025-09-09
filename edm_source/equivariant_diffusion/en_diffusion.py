@@ -873,17 +873,38 @@ class EnVariationalDiffusion(torch.nn.Module):
                         cache_backup = (list(self.dpm_solver.model_prev_list), list(self.dpm_solver.t_prev_list))
                         self.dpm_solver.model_prev_list = []
                         self.dpm_solver.t_prev_list = []
-                        z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
+                        z, x0_s = self.dpm_solver.multistep_dpm_solver_second_update(
                             z, t_prev.item(), t.item(), node_mask, edge_mask, context)
                         self.dpm_solver.model_prev_list, self.dpm_solver.t_prev_list = cache_backup
                     else:
-                        z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
+                        z, x0_s = self.dpm_solver.multistep_dpm_solver_second_update(
                             z, t_prev.item(), t.item(), node_mask, edge_mask, context)
-                else:
-                    # order=3 is disabled in solver; raising here keeps behavior explicit
-                    z, _ = self.dpm_solver.multistep_dpm_solver_third_update(
-                        z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                elif self.dpm_solver.order == 3:
+                    if i == n_steps - 1:
+                        # degrade to 1st order via 2nd update with cleared cache
+                        cache_backup = (list(self.dpm_solver.model_prev_list), list(self.dpm_solver.t_prev_list))
+                        self.dpm_solver.model_prev_list = []
+                        self.dpm_solver.t_prev_list = []
+                        z, x0_s = self.dpm_solver.multistep_dpm_solver_second_update(
+                            z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                        self.dpm_solver.model_prev_list, self.dpm_solver.t_prev_list = cache_backup
+                    elif i == n_steps - 2:
+                        # degrade to 2nd order
+                        z, x0_s = self.dpm_solver.multistep_dpm_solver_second_update(
+                            z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                    else:
+                        z, x0_s = self.dpm_solver.multistep_dpm_solver_third_update(
+                            z, t_prev.item(), t.item(), node_mask, edge_mask, context)
                 
+                # Update solver caches like in non-chain sampling
+                if i < n_steps - 1:
+                    capacity = max(1, self.dpm_solver.order - 1)
+                    if len(self.dpm_solver.model_prev_list) >= capacity:
+                        self.dpm_solver.model_prev_list.pop(0)
+                        self.dpm_solver.t_prev_list.pop(0)
+                    self.dpm_solver.model_prev_list.append(x0_s)
+                    self.dpm_solver.t_prev_list.append(t_prev.item())
+
                 # Store intermediate state
                 write_index = min(i + 1, keep_frames - 1)
                 chain[write_index] = self.unnormalize_z(z, node_mask)

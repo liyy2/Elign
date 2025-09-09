@@ -189,6 +189,29 @@ class DPMSolverPlusPlus:
         return torch.expm1(-h)
 
     @staticmethod
+    def _phi2_minus(h: torch.Tensor) -> torch.Tensor:
+        """phi2(-h) = phi1(-h)/h + 1 with small-h series for stability."""
+        eps = 1e-6
+        small = h.abs() < eps
+        # series: h/2 - h^2/6 + h^3/24
+        series = 0.5 * h - (h * h) / 6.0 + (h * h * h) / 24.0
+        general = torch.expm1(-h) / (h + (~small).float() * 0 + small.float() * 1) + 1.0
+        # Avoid division by zero; override general where not small
+        out = torch.where(small, series, (torch.expm1(-h) / h) + 1.0)
+        return out
+
+    @staticmethod
+    def _phi3_minus(h: torch.Tensor) -> torch.Tensor:
+        """phi3(-h) = phi2(-h)/h - 1/2 with small-h series for stability."""
+        eps = 1e-6
+        small = h.abs() < eps
+        # series: -h/6 + h^2/24
+        series = -(h / 6.0) + (h * h) / 24.0
+        out = DPMSolverPlusPlus._phi2_minus(h) / (h + (~small).float() * 0 + small.float() * 1) - 0.5
+        out = torch.where(small, series, DPMSolverPlusPlus._phi2_minus(h) / h - 0.5)
+        return out
+
+    @staticmethod
     def _as_column(t: torch.Tensor, B: int) -> torch.Tensor:
         """Ensure t has shape [B,1]."""
         if t.dim() == 0:
@@ -275,14 +298,87 @@ class DPMSolverPlusPlus:
     def multistep_dpm_solver_third_update(self, x: torch.Tensor, t_prev: float, t: float,
                                         node_mask: torch.Tensor, edge_mask: torch.Tensor,
                                         context: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
-        """Third-order dpmsolver++ is disabled for guided setups.
+        """Third-order DPM-Solver++ (3M) update in data-prediction form.
 
-        Rationale: 3rd order in dpmsolver++ (data-pred) requires the exact
-        official formulation with D1/D2 in λ-space. To avoid future footguns
-        and because order=2 is recommended for guided/CoM-constrained models,
-        we disable it here. Use order=2.
+        Official form:
+            x_t = (σ_t/σ_s) x_s - α_t φ1(-h) x0_s + α_t φ2(-h) D1 - α_t φ3(-h) D2
+        with r0 = h0/h, r1 = h1/h, h0 = λ_s - λ_{s-1}, h1 = λ_{s-1} - λ_{s-2},
+             D1 = (1/r0)(x0_s - x0_{s-1}), D1_prev = (1/r1)(x0_{s-1} - x0_{s-2}),
+             D2 = (D1 - D1_prev)/(r0 + r1).
         """
-        raise NotImplementedError("dpmsolver++ order=3 is disabled. Use order=2.")
+        alpha_prev, alpha_t, sigma_prev, sigma_t, h = self._compute_step_coefficients(t_prev, t, x.device)
+        lambda_prev = self.marginal_lambda(torch.tensor([t_prev], device=x.device))
+
+        # Evaluate model at current state/time (t_prev)
+        x0_s = self.data_prediction_fn(x, torch.tensor([t_prev], device=x.device),
+                                       node_mask, edge_mask, context)
+
+        # Ensure dtype matches x
+        alpha_t = alpha_t.to(x.dtype)
+        sigma_prev = sigma_prev.to(x.dtype)
+        sigma_t = sigma_t.to(x.dtype)
+        h = h.to(x.dtype)
+
+        phi1 = DPMSolverPlusPlus._phi1_minus(h)
+        phi2 = DPMSolverPlusPlus._phi2_minus(h)
+        phi3 = DPMSolverPlusPlus._phi3_minus(h)
+
+        # If insufficient history, degrade to lower order
+        if len(self.model_prev_list) == 0:
+            x_t = (sigma_t / sigma_prev) * x - alpha_t * phi1 * x0_s
+            x_t = self._project_com(x_t, node_mask)
+            return x_t, x0_s
+        elif len(self.model_prev_list) == 1:
+            # Fall back to second order
+            x0_s_minus = self.model_prev_list[-1]
+            t_s_minus = self.t_prev_list[-1]
+            lambda_s_minus = self.marginal_lambda(torch.tensor([t_s_minus], device=x.device))
+            h0 = lambda_prev - lambda_s_minus
+            if torch.any(h0.abs() < 1e-8):
+                x_t = (sigma_t / sigma_prev) * x - alpha_t * phi1 * x0_s
+            else:
+                r0 = h0 / h
+                D1_0 = (1.0 / r0) * (x0_s - x0_s_minus)
+                # Use 2M fallback: x_t = ratio - α φ1 x0 - 0.5 α φ1 D1_0
+                x_t = (sigma_t / sigma_prev) * x - alpha_t * phi1 * x0_s - 0.5 * alpha_t * phi1 * D1_0
+            x_t = self._project_com(x_t, node_mask)
+            return x_t, x0_s
+
+        # Use full 3M with two historical model evaluations
+        x0_s_minus = self.model_prev_list[-1]
+        x0_s_minus2 = self.model_prev_list[-2]
+        t_s_minus = self.t_prev_list[-1]
+        t_s_minus2 = self.t_prev_list[-2]
+
+        lambda_s_minus = self.marginal_lambda(torch.tensor([t_s_minus], device=x.device))
+        lambda_s_minus2 = self.marginal_lambda(torch.tensor([t_s_minus2], device=x.device))
+
+        h0 = lambda_prev - lambda_s_minus
+        h1 = lambda_s_minus - lambda_s_minus2
+
+        # Guard for tiny history steps: degrade gracefully
+        if torch.any(h0.abs() < 1e-8) or torch.any(h1.abs() < 1e-8):
+            # Use 2M fallback with the most recent previous model
+            r0 = torch.where(h0.abs() < 1e-8, torch.ones_like(h0), h0 / h)
+            D1_0 = (1.0 / r0) * (x0_s - x0_s_minus)
+            x_t = (sigma_t / sigma_prev) * x - alpha_t * phi1 * x0_s - 0.5 * alpha_t * phi1 * D1_0
+            x_t = self._project_com(x_t, node_mask)
+            return x_t, x0_s
+
+        r0 = h0 / h
+        r1 = h1 / h
+        D1_0 = (1.0 / r0) * (x0_s - x0_s_minus)
+        D1_1 = (1.0 / r1) * (x0_s_minus - x0_s_minus2)
+        D2_0 = (D1_0 - D1_1) / (r0 + r1)
+
+        x_t = (sigma_t / sigma_prev) * x \
+              - alpha_t * phi1 * x0_s \
+              + alpha_t * phi2 * D1_0 \
+              - alpha_t * phi3 * D2_0
+
+        # Project and mask after update
+        x_t = self._project_com(x_t, node_mask)
+        return x_t, x0_s
     
     def sample(self, 
                x: torch.Tensor,
@@ -334,8 +430,21 @@ class DPMSolverPlusPlus:
                 x, x0_s = self.multistep_dpm_solver_second_update(
                     x, t_prev, t, node_mask, edge_mask, context)
             elif self.order == 3:
-                x, x0_s = self.multistep_dpm_solver_third_update(
-                    x, t_prev, t, node_mask, edge_mask, context)
+                # lower_order_final for order=3: second-last step uses 2nd order,
+                # last step uses 1st order.
+                if i == n_steps - 1:
+                    cache_backup = (list(self.model_prev_list), list(self.t_prev_list))
+                    self.model_prev_list = []
+                    self.t_prev_list = []
+                    x, x0_s = self.multistep_dpm_solver_second_update(
+                        x, t_prev, t, node_mask, edge_mask, context)
+                    self.model_prev_list, self.t_prev_list = cache_backup
+                elif i == n_steps - 2:
+                    x, x0_s = self.multistep_dpm_solver_second_update(
+                        x, t_prev, t, node_mask, edge_mask, context)
+                else:
+                    x, x0_s = self.multistep_dpm_solver_third_update(
+                        x, t_prev, t, node_mask, edge_mask, context)
             else:
                 raise ValueError(f"Order {self.order} not supported")
             
@@ -344,11 +453,15 @@ class DPMSolverPlusPlus:
                 x_pos = x[:, :, :n_dims]
                 x_features = x[:, :, n_dims:]
                 x_pos = diffusion_utils.remove_mean_with_mask(x_pos, node_mask)
+                if x_features.numel() > 0:
+                    x_features = x_features * node_mask
                 x = torch.cat([x_pos, x_features], dim=-1)
             
             # Store for next iteration - reuse the already computed model prediction
             if i < len(timesteps) - 2:  # Don't store on the last iteration
-                if len(self.model_prev_list) >= 1:
+                # Keep up to (order-1) previous predictions
+                capacity = max(1, self.order - 1)
+                if len(self.model_prev_list) >= capacity:
                     self.model_prev_list.pop(0)
                     self.t_prev_list.pop(0)
                 # Cache x0 at current step time (t_prev) for multistep use
