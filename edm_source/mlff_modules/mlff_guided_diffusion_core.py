@@ -26,6 +26,7 @@ class MLFFGuidedDiffusion:
         self,
         base_diffusion,
         mlff_model='uma-s-1p1',
+        mlff_predictor=None,
         guidance_scale=1.0,
         guidance_iterations=1,
         noise_threshold=0.8,
@@ -69,8 +70,14 @@ class MLFFGuidedDiffusion:
         
         # Initialize components
         self.logger = MLFFLogger(use_wandb=use_wandb)
-        self.mlff_predictor = get_mlff_predictor(mlff_model, device) if guidance_scale > 0 else None
-        
+        # Prefer externally provided predictor; otherwise, lazily load by name if guidance enabled
+        if mlff_predictor is not None:
+            self.mlff_predictor = mlff_predictor
+        elif guidance_scale > 0 and mlff_model is not None:
+            self.mlff_predictor = get_mlff_predictor(mlff_model, device)
+        else:
+            self.mlff_predictor = None
+
         if self.mlff_predictor is not None:
             self.force_computer = MLFFForceComputer(
                 mlff_predictor=self.mlff_predictor,

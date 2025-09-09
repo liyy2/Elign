@@ -204,10 +204,16 @@ def load_mlff_predictor(model_name, device):
     
     # Normalize/validate model name
     if model_name is None or str(model_name).lower() in {"none", "", "null"}:
-        # Fallback to a safe default UMA model
-        model_name = 'uma-s-1'
+        # Fallback to canonical default UMA model
+        model_name = 'uma-s-1p1'
         if is_main_process():
-            print("MLFF model not specified; defaulting to 'uma-s-1'")
+            print("MLFF model not specified; defaulting to 'uma-s-1p1'")
+
+    # Map legacy name to canonical current model
+    if model_name == 'uma-s-1':
+        model_name = 'uma-s-1p1'
+        if is_main_process():
+            print("Mapping 'uma-s-1' -> 'uma-s-1p1'")
     
     if is_main_process():
         print(f"Loading MLFF predictor: {model_name}")

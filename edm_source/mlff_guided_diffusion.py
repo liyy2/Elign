@@ -64,6 +64,7 @@ def create_mlff_guided_model(
     guided_model = MLFFGuidedDiffusion(
         base_diffusion=base_diffusion,
         mlff_model=None,  # We already have the predictor
+        mlff_predictor=mlff_predictor,
         guidance_scale=guidance_scale,
         guidance_iterations=guidance_iterations,
         noise_threshold=noise_threshold,
@@ -74,14 +75,6 @@ def create_mlff_guided_model(
         device=device
     )
     
-    # Override the mlff_predictor since we're passing it directly
-    guided_model.mlff_predictor = mlff_predictor
-    if mlff_predictor is not None:
-        guided_model.force_computer = MLFFForceComputer(
-            mlff_predictor=mlff_predictor,
-            position_scale=position_scale,
-            device=device
-        )
     
     # Store dataset_info for use during sampling
     guided_model.dataset_info = dataset_info

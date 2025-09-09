@@ -25,9 +25,13 @@ def get_mlff_predictor(mlff_model: str = 'uma-s-1p1', device: str = 'cuda'):
     try:
         from fairchem.core import pretrained_mlip
         
-        # Map model names to the new API format
-        if mlff_model == 'uma-s-1p1':
-            model_name = 'uma-s-1'
+        # Normalize None/empty to the canonical default
+        if mlff_model is None or str(mlff_model).lower() in {"none", "", "null"}:
+            mlff_model = 'uma-s-1p1'
+
+        # Map legacy name 'uma-s-1' to 'uma-s-1p1'; otherwise use as-is
+        if mlff_model == 'uma-s-1':
+            model_name = 'uma-s-1p1'
         else:
             model_name = mlff_model
         
