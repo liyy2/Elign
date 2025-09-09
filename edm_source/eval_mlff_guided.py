@@ -202,6 +202,13 @@ def load_mlff_predictor(model_name, device):
     """Load MLFF predictor with error handling."""
     rank, world_size = get_rank_and_world_size()
     
+    # Normalize/validate model name
+    if model_name is None or str(model_name).lower() in {"none", "", "null"}:
+        # Fallback to a safe default UMA model
+        model_name = 'uma-s-1'
+        if is_main_process():
+            print("MLFF model not specified; defaulting to 'uma-s-1'")
+    
     if is_main_process():
         print(f"Loading MLFF predictor: {model_name}")
     
@@ -312,6 +319,9 @@ def sample_with_mlff_comparison(args, eval_args, device, flow, nodes_dist,
         torch.manual_seed(eval_args.seed + rank)
         nodesxsample = nodes_dist.sample(local_n_samples)
     
+    # Prepare guidance scales list regardless of availability to avoid scope issues
+    guidance_scales = eval_args.guidance_scales if mlff_predictor is not None else []
+
     # Sample with MLFF guidance (if predictor available)
     if mlff_predictor is not None:
         # Sample with different guidance scales
@@ -817,6 +827,8 @@ def main():
                         help='Skip chain visualization')
     parser.add_argument('--skip_visualization', action='store_true',
                         help='Skip 3D visualization')
+    parser.add_argument('--debug_baseline', action='store_true',
+                        help='Debug baseline only: run baseline sampling, print stability metrics, skip MLFF guidance and chain/visualization')
     
     # Distributed training arguments
     parser.add_argument('--use_distributed', action='store_true',
@@ -968,7 +980,8 @@ def main():
         flow.dpm_solver_steps = eval_args.dpm_solver_steps
         
         # Initialize DPM-Solver++ if needed
-        if eval_args.sampling_method == 'dpm_solver++':
+        if eval_args.sampling_method == 'dpm_solver++' and getattr(flow, 'dpm_solver', None) is None:
+            # Initialize default unguided solver only if not already provided.
             from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus
             flow.dpm_solver = DPMSolverPlusPlus(
                 model_fn=flow.phi,
@@ -1042,6 +1055,18 @@ def main():
     elif eval_args.use_wandb and not WANDB_AVAILABLE and is_main_process():
         print("Warning: Wandb requested but not available. Install with 'pip install wandb'.")
     
+    # Handle baseline debug mode: force baseline-only run and extra logging
+    if eval_args.debug_baseline:
+        # Disable MLFF guidance and visualizations/chain
+        mlff_predictor = None
+        eval_args.guidance_scales = []
+        eval_args.skip_baseline = False
+        eval_args.skip_comparison = False
+        eval_args.skip_chain = True
+        eval_args.skip_visualization = True
+        if is_main_process():
+            logger.info("Debug baseline mode enabled: running baseline sampling only.")
+
     # Run comparison sampling
     if not eval_args.skip_comparison:
         if is_main_process():
@@ -1070,6 +1095,19 @@ def main():
         
         # Save and analyze results (only from main process)
         summary_stats = save_comparison_results(results, eval_args, dataset_info)
+
+        # In baseline debug mode, print baseline stability and exit early
+        if eval_args.debug_baseline:
+            if results['baseline'] is not None and is_main_process():
+                print("\nBaseline debug summary:")
+                print(f"  Stability: {summary_stats.get('baseline_stability', 'N/A'):.2f}%")
+                pos = results['baseline']['positions']
+                node_mask = results['baseline']['node_mask']
+                pos_mag = torch.norm(pos, dim=-1)
+                com = (pos * node_mask).sum(dim=1) / node_mask.sum(dim=1).clamp(min=1.0)
+                print(f"  Position magnitudes: mean={pos_mag.mean().item():.4f}, max={pos_mag.max().item():.4f}")
+                print(f"  COM norm (avg): {com.norm(dim=-1).mean().item():.4e}")
+            return
         
         # Visualize results (only from main process)
         if not eval_args.skip_visualization and is_main_process():

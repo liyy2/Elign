@@ -30,6 +30,7 @@ class MLFFGuidedDiffusion:
         guidance_iterations=1,
         noise_threshold=0.8,
         force_clip_threshold=None,
+        displacement_clip=None,
         position_scale=None,
         use_wandb=False,
         device='cuda'
@@ -53,6 +54,7 @@ class MLFFGuidedDiffusion:
         self.guidance_iterations = guidance_iterations
         self.noise_threshold = noise_threshold
         self.force_clip_threshold = force_clip_threshold
+        self.displacement_clip = displacement_clip
         
         # Extract position scale from model's normalize_factors if not provided
         if position_scale is None:
@@ -137,6 +139,14 @@ class MLFFGuidedDiffusion:
             
             # Apply guidance to positions
             position_guidance = forces * force_scale
+
+            # Optional clamp on displacement magnitude per atom to avoid large jumps
+            if self.displacement_clip is not None and self.displacement_clip > 0:
+                disp_mag = torch.norm(position_guidance, dim=-1, keepdim=True)  # [B, N, 1]
+                exceed = disp_mag > self.displacement_clip
+                safe_den = torch.where(disp_mag > 0, disp_mag, torch.ones_like(disp_mag))
+                scale = torch.where(exceed, (self.displacement_clip / safe_den), torch.ones_like(disp_mag))
+                position_guidance = position_guidance * scale
             z[:, :, :3] = z[:, :, :3] + position_guidance  # Move in direction of forces
             
             # Maintain center of mass constraint

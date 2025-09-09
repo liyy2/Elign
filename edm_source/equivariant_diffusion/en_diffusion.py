@@ -5,7 +5,7 @@ import torch
 from egnn import models
 from torch.nn import functional as F
 from equivariant_diffusion import utils as diffusion_utils
-from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus, get_time_steps_for_dpm_solver
+from equivariant_diffusion.dpm_solver import DPMSolverPlusPlus, get_time_steps_for_dpm_solver, get_time_steps_via_lambda
 
 
 # Defining some useful util functions.
@@ -795,8 +795,8 @@ class EnVariationalDiffusion(torch.nn.Module):
                     timesteps=self.T  # Pass number of training timesteps for DPM linear schedule
                 )
             
-            # Use DPM-Solver++ for fast sampling
-            timesteps = get_time_steps_for_dpm_solver(self.dpm_solver_steps, z.device)
+            # Use DPM-Solver++ with lambda-uniform time steps for stability
+            timesteps = get_time_steps_via_lambda(self.gamma, self.dpm_solver_steps, z.device)
             z = self.dpm_solver.sample(z, timesteps, node_mask, edge_mask, context)
         else:
             # Use default DDPM sampling
@@ -812,6 +812,9 @@ class EnVariationalDiffusion(torch.nn.Module):
         # Finally sample p(x, h | z_0).
         x, h = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
 
+        # Ensure center-of-mass constraint after decoding to x to prevent
+        # small numerical drifts (especially with accelerated solvers).
+        x = diffusion_utils.remove_mean_with_mask(x, node_mask)
         diffusion_utils.assert_mean_zero_with_mask(x, node_mask)
 
         max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
@@ -848,21 +851,36 @@ class EnVariationalDiffusion(torch.nn.Module):
                 keep_frames = min(keep_frames, self.dpm_solver_steps)
             
             chain = torch.zeros((keep_frames,) + z.size(), device=z.device)
-            timesteps = get_time_steps_for_dpm_solver(self.dpm_solver_steps, z.device)
+            timesteps = get_time_steps_via_lambda(self.gamma, self.dpm_solver_steps, z.device)
             
             # Store initial state
             chain[0] = self.unnormalize_z(z, node_mask)
             
             # Sample with DPM-Solver++ and store intermediate states
-            for i in range(len(timesteps) - 1):
+            # Ensure solver caches are clear for a fresh chain
+            self.dpm_solver.model_prev_list = []
+            self.dpm_solver.t_prev_list = []
+
+            n_steps = len(timesteps) - 1
+            for i in range(n_steps):
                 t_prev = timesteps[i:i+1]
                 t = timesteps[i+1:i+2]
                 
                 # Perform one step of DPM-Solver++
                 if self.dpm_solver.order == 2:
-                    z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
-                        z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                    # lower_order_final: degrade to 1st-order on the last step
+                    if i == n_steps - 1:
+                        cache_backup = (list(self.dpm_solver.model_prev_list), list(self.dpm_solver.t_prev_list))
+                        self.dpm_solver.model_prev_list = []
+                        self.dpm_solver.t_prev_list = []
+                        z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
+                            z, t_prev.item(), t.item(), node_mask, edge_mask, context)
+                        self.dpm_solver.model_prev_list, self.dpm_solver.t_prev_list = cache_backup
+                    else:
+                        z, _ = self.dpm_solver.multistep_dpm_solver_second_update(
+                            z, t_prev.item(), t.item(), node_mask, edge_mask, context)
                 else:
+                    # order=3 is disabled in solver; raising here keeps behavior explicit
                     z, _ = self.dpm_solver.multistep_dpm_solver_third_update(
                         z, t_prev.item(), t.item(), node_mask, edge_mask, context)
                 

@@ -53,8 +53,10 @@ class MLFFForceComputer:
         # Scale positions to physical units (Angstroms)
         positions_scaled = positions * self.position_scale
         
-        # Get atom types from features
-        atom_types = z[:, :, 3:]  # [batch_size, max_n_nodes, n_features]
+        # Get per-node features (categorical one-hot [+ optional charge])
+        features = z[:, :, 3:]  # [batch_size, max_n_nodes, n_features]
+        # Determine number of categorical channels from dataset info
+        num_classes = len(dataset_info['atom_decoder'])
         
         # Convert one-hot encoded features to atomic numbers
         atom_decoder = dataset_info['atom_decoder']
@@ -70,13 +72,19 @@ class MLFFForceComputer:
             # Get valid atoms for this molecule
             mask = node_mask[batch_idx, :, 0].bool()
             valid_positions = positions_scaled[batch_idx, mask]  # [n_valid_nodes, 3]
-            valid_features = atom_types[batch_idx, mask]  # [n_valid_nodes, n_features]
+            valid_features = features[batch_idx, mask]  # [n_valid_nodes, n_features]
             
             if valid_positions.shape[0] == 0:
                 continue
             
             # Convert categorical features to atom types
-            atom_type_indices = torch.argmax(valid_features, dim=1)  # [n_valid_nodes]
+            # Only use the first num_classes channels for argmax (exclude charge channel if present)
+            if valid_features.shape[1] >= num_classes:
+                valid_categorical = valid_features[:, :num_classes]
+            else:
+                # Fallback: if features are shorter than expected, use all
+                valid_categorical = valid_features
+            atom_type_indices = torch.argmax(valid_categorical, dim=1)  # [n_valid_nodes]
             
             # Map atom types to atomic numbers
             atom_type_indices_cpu = atom_type_indices.cpu()
@@ -180,8 +188,9 @@ class MLFFForceComputer:
                     
                 atom_idx += n_atoms
             
-            # Scale forces back to normalized space (divide by position scale)
-            forces = forces / self.position_scale
+            # Scale forces back to normalized space
+            # If x_phys = x_norm * position_scale, then F_norm = dE/dx_norm = (dE/dx_phys) * position_scale
+            forces = forces * self.position_scale
             
             return forces
             
