@@ -181,6 +181,77 @@ class MLFFGuidedDiffusion:
         self.logger.log_guidance_summary(z_original, z, self.guidance_iterations, noise_level)
         
         return z
+
+    def build_dpm_guided_model_fn(self, dataset_info: Optional[Dict] = None):
+        """
+        Build a guided denoiser function for DPM-Solver++ that applies MLFF
+        guidance directly in x0 space, then converts back to epsilon.
+
+        Returns:
+            Callable(x, t, node_mask, edge_mask, context) -> eps_guided
+        """
+        if dataset_info is None:
+            dataset_info = getattr(self, 'dataset_info', None)
+
+        base = self.base_diffusion
+
+        def guided_model_fn(x, t, node_mask, edge_mask, context):
+            # Base epsilon prediction
+            eps_pred = base.phi(x, t, node_mask, edge_mask, context)
+
+            # Apply MLFF guidance only when predictor is available
+            if (self.force_computer is None or self.guidance_scale == 0 or dataset_info is None):
+                return eps_pred
+
+            # Compute schedule terms
+            gamma_t = base.gamma(t)
+            sigma_t = torch.sqrt(torch.sigmoid(gamma_t))
+            alpha_t = torch.sqrt(torch.sigmoid(-gamma_t))
+
+            # Gate guidance by noise threshold (apply late in sampling)
+            noise_level = sigma_t.mean().item() if sigma_t.numel() > 1 else sigma_t.item()
+            if noise_level > self.noise_threshold:
+                return eps_pred
+
+            # Compute MLFF forces in normalized space
+            forces = self.force_computer.compute_mlff_forces(x, node_mask, dataset_info)
+
+            # Optional force clipping (normalized units)
+            if self.force_clip_threshold is not None:
+                forces, _ = apply_force_clipping(forces, self.force_clip_threshold, node_mask)
+
+            # Convert base eps -> x0
+            alpha_b = alpha_t
+            sigma_b = sigma_t
+            while alpha_b.dim() < x.dim():
+                alpha_b = alpha_b.unsqueeze(-1)
+                sigma_b = sigma_b.unsqueeze(-1)
+
+            x0_pred = (x - sigma_b * eps_pred) / alpha_b
+
+            # Define Δx0 in clean data space (positions only)
+            base_scale = self.guidance_scale / max(1, self.guidance_iterations)
+            # Broadcast sigma to [B, 1, 1] for a simple clarity gate (optional)
+            if sigma_t.dim() == 0:
+                sigma_gate = sigma_t.view(1, 1, 1)
+            elif sigma_t.dim() == 1:
+                sigma_gate = sigma_t.view(-1, 1, 1)
+            else:
+                sigma_gate = sigma_t.mean(dim=list(range(1, sigma_t.dim()))).view(-1, 1, 1)
+            clarity = (1.0 - sigma_gate).clamp(0.0, 1.0)
+
+            delta_x0 = base_scale * clarity * forces
+
+            # Apply Δx0 to x0 prediction (positions only)
+            x0_pred = x0_pred.clone()
+            x0_pred[:, :, :3] = x0_pred[:, :, :3] + delta_x0
+
+            # Convert x0 back to epsilon for the solver
+            eps_guided = (x - alpha_b * x0_pred) / (sigma_b + 1e-12)
+
+            return eps_guided
+
+        return guided_model_fn
     
     def sample(self, *args, **kwargs):
         """

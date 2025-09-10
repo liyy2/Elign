@@ -142,51 +142,8 @@ def enhanced_sampling_with_mlff(
 
             base = guided_model.base_diffusion
 
-            def guided_model_fn(x, t, node_mask_, edge_mask_, context_):
-                # Base epsilon prediction
-                eps_pred = base.phi(x, t, node_mask_, edge_mask_, context_)
-
-                # Apply MLFF guidance only when predictor is available
-                if (guided_model.force_computer is None or
-                        guided_model.guidance_scale == 0 or
-                        dataset_info is None):
-                    return eps_pred
-
-                # Compute current noise level using the model's schedule
-                gamma_t = base.gamma(t)
-                sigma_t_scalar = torch.sqrt(torch.sigmoid(gamma_t))
-                # Scalar gating value
-                noise_level = sigma_t_scalar.mean().item() if sigma_t_scalar.numel() > 1 else sigma_t_scalar.item()
-
-                # Gate guidance by noise threshold (apply late in sampling)
-                if noise_level > guided_model.noise_threshold:
-                    return eps_pred
-
-                # Compute MLFF forces in normalized space
-                forces = guided_model.force_computer.compute_mlff_forces(x, node_mask_, dataset_info)
-
-                # Optional force clipping (normalized units)
-                if guided_model.force_clip_threshold is not None:
-                    from mlff_modules import apply_force_clipping
-                    forces, _ = apply_force_clipping(forces, guided_model.force_clip_threshold, node_mask_)
-
-                # Scale guidance: smaller earlier, stronger later
-                base_scale = guided_model.guidance_scale / max(1, guided_model.guidance_iterations)
-                # Broadcast sigma to [B, 1, 1]
-                if sigma_t_scalar.dim() == 0:
-                    sigma_b = sigma_t_scalar.view(1, 1, 1)
-                elif sigma_t_scalar.dim() == 1:
-                    sigma_b = sigma_t_scalar.view(-1, 1, 1)
-                else:
-                    # Fallback: reduce to batch-wise scalar
-                    sigma_b = sigma_t_scalar.mean(dim=list(range(1, sigma_t_scalar.dim()))).view(-1, 1, 1)
-                clarity = (1.0 - sigma_b).clamp(0.0, 1.0)
-
-                # Apply to position dimensions of epsilon
-                scale = base_scale * sigma_b * clarity
-                eps_pred[:, :, :3] = eps_pred[:, :, :3] - scale * forces
-
-                return eps_pred
+            # Build guided model function from the class for reuse and clarity
+            guided_model_fn = guided_model.build_dpm_guided_model_fn(dataset_info)
 
             # Install guided solver on the base diffusion model and sample
             base.dpm_solver = DPMSolverPlusPlus(
