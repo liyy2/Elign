@@ -50,7 +50,8 @@ import matplotlib
 matplotlib.use('Agg')
 from qm9 import dataset
 from qm9.models import get_model
-from fairchem.core import pretrained_mlip, FAIRChemCalculator
+from fairchem.core import pretrained_mlip
+from energy_eval import compare_energy_distributions
 
 from equivariant_diffusion.utils import assert_correctly_masked
 import pickle
@@ -783,6 +784,9 @@ def sample_chain_with_guidance(args, eval_args, device, flow, mlff_predictor,
         logger.info("2. Skipping guided chain (predictor not available)")
 
 
+# removed local energy-eval helpers; now imported from energy_eval.py
+
+
 def main():
     parser = argparse.ArgumentParser(description='Evaluate diffusion model with MLFF guidance')
     
@@ -835,6 +839,10 @@ def main():
                         help='Skip 3D visualization')
     parser.add_argument('--debug_baseline', action='store_true',
                         help='Debug baseline only: run baseline sampling, print stability metrics, skip MLFF guidance and chain/visualization')
+
+    # Energy comparison option
+    parser.add_argument('--compare_energy_at_end', action='store_true',
+                        help='Evaluate UMA energy of sampled systems at the end and compare across guidance scales')
     
     # Distributed training arguments
     parser.add_argument('--use_distributed', action='store_true',
@@ -1101,6 +1109,16 @@ def main():
         
         # Save and analyze results (only from main process)
         summary_stats = save_comparison_results(results, eval_args, dataset_info)
+
+        # Optional energy comparison at the end (main process only)
+        if eval_args.compare_energy_at_end:
+            try:
+                compare_energy_distributions(
+                    results, eval_args, dataset_info, mlff_predictor, device
+                )
+            except Exception as e:
+                if is_main_process():
+                    print(f"Energy comparison failed: {e}")
 
         # In baseline debug mode, print baseline stability and exit early
         if eval_args.debug_baseline:
