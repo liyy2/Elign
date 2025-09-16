@@ -12,10 +12,13 @@ import torch
 import ray
 from tqdm import tqdm as tq
 
-from xtb.ase.calculator import XTB
+try:
+    from xtb.ase.calculator import XTB
+except ModuleNotFoundError:
+    print('Not importing xtb.')
 from ase import Atoms
 from verl_diffusion.utils.math import kl_divergence_normal, rmsd
-from Model.EDM.qm9.analyze import check_stability
+from edm_source.qm9.analyze import check_stability
 
 from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
 from edm_source.mlff_modules.mlff_utils import (
@@ -297,15 +300,13 @@ class UMAForceReward(BaseReward):
     def process_data(self, samples: DataProto) -> dict:
         positions = samples.batch["x"].detach()
         categorical = samples.batch["categorical"].detach()
-        nodesxsample = samples.batch["nodesxsample"].long().cpu()
+        nodesxsample = samples.batch["nodesxsample"].long().to(positions.device)
         batch_size, max_n_nodes, _ = positions.shape
 
-        node_mask = torch.zeros(batch_size, max_n_nodes, 1, device=positions.device)
-        for idx, n_nodes in enumerate(nodesxsample.tolist()):
-            node_mask[idx, :n_nodes] = 1
+        node_indices = torch.arange(max_n_nodes, device=positions.device).unsqueeze(0)
+        node_mask = (node_indices < nodesxsample.unsqueeze(1)).unsqueeze(-1).float()
 
-        features = categorical
-        z = torch.cat([positions, features], dim=-1)
+        z = torch.cat([positions, categorical], dim=-1)
 
         processed = {
             "z": z,
@@ -322,55 +323,55 @@ class UMAForceReward(BaseReward):
         return processed
 
     def calculate_rewards(self, data: DataProto) -> DataProto:
+        print("Calculating rewards via UMAForceReward")
         processed = self.process_data(data)
 
         z = processed["z"].to(self.device)
         node_mask = processed["node_mask"].to(self.device)
+        positions = processed["positions"].to(self.device)
+        categorical = processed["categorical"].to(self.device)
 
         if self.force_computer is not None:
+            print("Computing forces via UMAForceReward, force_computer is not None")
             forces = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-            if self.force_clip_threshold is not None:
-                forces, _ = apply_force_clipping(forces, self.force_clip_threshold, node_mask)
+            print(forces)
         else:
             forces = torch.zeros_like(z[:, :, :3], device=self.device)
 
-        rewards = []
-        stability_flags = []
+        batch_size = processed["batch_size"]
+        rewards = torch.zeros(batch_size, device=self.device)
+        stability_flags = torch.zeros(batch_size, device=self.device)
 
-        forces_cpu = forces.detach().cpu()
-        node_mask_cpu = processed["node_mask"].cpu()
-        positions_cpu = processed["positions"].detach().cpu()
-        categorical_cpu = processed["categorical"].detach().cpu()
+        for batch_idx in range(batch_size):
+            valid_mask = node_mask[batch_idx, :, 0] > 0
 
-        for batch_idx in range(processed["batch_size"]):
-            mask = node_mask_cpu[batch_idx, :, 0].bool()
-
-            if mask.sum() == 0:
-                rewards.append(0.0)
-                stability_flags.append(0.0)
+            if not torch.any(valid_mask):
                 continue
 
-            sample_forces = forces_cpu[batch_idx][mask]
+            sample_forces = forces[batch_idx][valid_mask]
             if sample_forces.numel() == 0:
-                rms_force = 0.0
+                rms_force = torch.tensor(0.0, device=self.device)
             else:
-                rms_force = torch.sqrt(torch.mean(sample_forces.pow(2))).item()
+                rms_force = torch.sqrt(torch.mean(sample_forces.pow(2)))
 
-            rewards.append(-rms_force)
+            rewards[batch_idx] = -rms_force
 
-            atom_type_indices = categorical_cpu[batch_idx].argmax(dim=1)
-            atom_types = atom_type_indices[mask].tolist()
-            positions = positions_cpu[batch_idx][mask].numpy()
+            atom_type_indices = categorical[batch_idx].argmax(dim=1)[valid_mask]
+            positions_valid = positions[batch_idx][valid_mask]
 
             try:
-                validity_results = check_stability(np.array(positions), atom_types, self.dataset_info)
-                stability_flags.append(float(validity_results[0]))
+                validity_results = check_stability(
+                    positions_valid.detach().cpu().numpy(),
+                    atom_type_indices.detach().cpu().tolist(),
+                    self.dataset_info,
+                )
+                stability_flags[batch_idx] = float(validity_results[0])
             except Exception:
-                stability_flags.append(0.0)
+                stability_flags[batch_idx] = 0.0
 
         result = {
-            "rewards": torch.tensor(rewards, dtype=torch.float32),
-            "stability": torch.tensor(stability_flags, dtype=torch.float32),
+            "rewards": rewards.cpu(),
+            "stability": stability_flags.cpu(),
         }
-
-        return DataProto(batch=TensorDict(result, batch_size=[len(rewards)]), meta_info=data.meta_info.copy())
+        print("Rewards calculated via UMAForceReward")
+        return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())

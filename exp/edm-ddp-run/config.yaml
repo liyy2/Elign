@@ -1,0 +1,24 @@
+dataloader:
+  each_prompt_sample: 32
+  epoches: 100
+  micro_batch_size: 32
+  sample_group_size: 4
+  smiles_path: qm9/temp/qm9_smiles.pickle
+model:
+  config: ./pretrained/edm/edm_qm9/args.pickle
+  model_path: ./pretrained/edm/edm_qm9/generative_model_ema.npy
+  time_step: 100
+name: edm
+train:
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-08
+  adam_weight_decay: 0.0001
+  adv_clip_max: 5
+  clip_range: 0.2
+  learning_rate: 1.0e-05
+  max_grad_norm: 1
+  train_micro_batch_size: 512
+wandb:
+  wandb_name: edm-ddp-run
+  wandb_project: ddpo

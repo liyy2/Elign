@@ -1,8 +1,8 @@
 import torch
 from tqdm import tqdm as tq
 from .base import BaseModel
-from Model.EDM.qm9.models import get_model
-from Model.EDM.equivariant_diffusion.en_diffusion import EnVariationalDiffusion
+from edm_source.qm9.models import get_model
+from edm_source.equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 from torch.nn import functional as F
 
 class EDMModel(BaseModel, EnVariationalDiffusion):

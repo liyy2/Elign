@@ -22,7 +22,7 @@
                 "--nproc_per_node=1",
                 "eval_mlff_guided.py",
                 "--model_path",
-                "outputs/exp_cond_alpha",
+                "../pretrained/edm/edm_qm9",
                 "--use_distributed",
                 "--n_samples",
                 "200",

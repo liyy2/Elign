@@ -51,9 +51,9 @@ class EGNN_dynamics_QM9(nn.Module):
         h_dims = dims - self.n_dims
         edges = self.get_adj_matrix(n_nodes, bs, self.device)
         edges = [x.to(self.device) for x in edges]
-        node_mask = node_mask.view(bs*n_nodes, 1)
-        edge_mask = edge_mask.view(bs*n_nodes*n_nodes, 1)
-        xh = xh.view(bs*n_nodes, -1).clone() * node_mask
+        node_mask = node_mask.reshape(bs * n_nodes, 1)
+        edge_mask = edge_mask.reshape(bs * n_nodes * n_nodes, 1)
+        xh = xh.reshape(bs * n_nodes, -1).clone() * node_mask
         x = xh[:, 0:self.n_dims].clone()
         if h_dims == 0:
             h = torch.ones(bs*n_nodes, 1).to(self.device)
@@ -67,12 +67,12 @@ class EGNN_dynamics_QM9(nn.Module):
             else:
                 # t is different over the batch dimension.
                 h_time = t.view(bs, 1).repeat(1, n_nodes)
-                h_time = h_time.view(bs * n_nodes, 1)
+                h_time = h_time.reshape(bs * n_nodes, 1)
             h = torch.cat([h, h_time], dim=1)
 
         if context is not None:
             # We're conditioning, awesome!
-            context = context.view(bs*n_nodes, self.context_node_nf)
+            context = context.reshape(bs * n_nodes, self.context_node_nf)
             h = torch.cat([h, context], dim=1)
 
         if self.mode == 'egnn_dynamics':
@@ -95,7 +95,7 @@ class EGNN_dynamics_QM9(nn.Module):
             # Slice off last dimension which represented time.
             h_final = h_final[:, :-1]
 
-        vel = vel.view(bs, n_nodes, -1)
+        vel = vel.reshape(bs, n_nodes, -1)
 
         if torch.any(torch.isnan(vel)):
             print('Warning: detected nan, resetting EGNN output to zero.')
@@ -109,7 +109,7 @@ class EGNN_dynamics_QM9(nn.Module):
         if h_dims == 0:
             return vel
         else:
-            h_final = h_final.view(bs, n_nodes, -1)
+            h_final = h_final.reshape(bs, n_nodes, -1)
             return torch.cat([vel, h_final], dim=2)
 
     def get_adj_matrix(self, n_nodes, batch_size, device):

@@ -1,5 +1,5 @@
 from verl_diffusion.protocol import DataProto
-from Model.EDM.qm9.rdkit_functions import build_molecule, mol2smiles
+from edm_source.qm9.rdkit_functions import build_molecule, mol2smiles
 import torch
 import pickle
 import random

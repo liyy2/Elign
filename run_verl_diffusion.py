@@ -3,20 +3,24 @@ import pickle
 import os
 import torch
 import ray
-os.environ["WANDB_MODE"] = "offline"
-os.environ["WANDB_API_KEY"] = "*****"
+os.environ["WANDB_MODE"] = "online"
+os.environ["WANDB_API_KEY"] = "6f1080f993d5d7ad6103e69ef57dd9291f1bf366"
 from verl_diffusion.trainer.config.base import BaseConfig
 from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
-
+import sys
+sys.path.append("/nfs/roberts/project/pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
 from edm_source.configs.datasets_config import get_dataset_info
-from edm_source.qm9 import dataset
+from edm_source.qm9.dataset import retrieve_dataloaders
 from edm_source.qm9.models import get_model
 from verl_diffusion.model.edm_model import EDMModel
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
-from verl_diffusion.worker.reward.force import ForceReward
+from verl_diffusion.worker.reward.force import UMAForceReward
 from verl_diffusion.worker.filter.filter import Filter
 from verl_diffusion.worker.actor.edm_actor import EDMActor
+from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
+import sys
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DDPO Training for EDM")
@@ -54,7 +58,8 @@ def main():
     edm_config_path = config["model"]["config"]
     with open(edm_config_path, 'rb') as f:
         edm_config = pickle.load(f)
-    edm_config.datadir = "./Model/EDM/qm9/temp"
+    # Use the same processed data directory convention as eval_mlff_guided.py
+    edm_config.datadir = "qm9/temp"
     print(edm_config)
     # Set default values if not present
     if not hasattr(edm_config, 'normalization_factor'):
@@ -69,7 +74,8 @@ def main():
     
     # Load dataset info and model
     dataset_info = get_dataset_info(edm_config.dataset, edm_config.remove_h)
-    dataloaders, charge_scale = dataset.retrieve_dataloaders(edm_config)
+    retrieve_qm9_smiles(dataset_info)
+    dataloaders, charge_scale = retrieve_dataloaders(edm_config)
     flow, nodes_dist, prop_dist = get_model(edm_config, edm_config.device, dataset_info, dataloaders['train'])
     flow.to(device)
     
@@ -89,13 +95,13 @@ def main():
     # Initialize rollout and rewarder in main function
     rollout = EDMRollout(model, config)
     rollout.model.to(device)
-    rewarder = ForceReward(dataset_info)
+    rewarder = UMAForceReward(dataset_info)
     filters = Filter(dataset_info,config["dataloader"]["smiles_path"],False,False,False)
     actor = EDMActor(model, config)
     # Initialize Ray for parallel processing
     if not ray.is_initialized():
         ray.init()
-    
+    print("Ray initialized")
     # Initialize DDPO Trainer with rollout and rewarder
     trainer = DDPOTrainer(
         config=config,
@@ -108,8 +114,9 @@ def main():
         filters=filters,
         actor = actor
     )
-    
+    print("DDPO Trainer initialized")
     try:
+        print("Training started")
         trainer.fit()
     except KeyboardInterrupt:
         print("Training interrupted by user")
