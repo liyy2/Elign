@@ -843,6 +843,8 @@ def main():
     # Energy comparison option
     parser.add_argument('--compare_energy_at_end', action='store_true',
                         help='Evaluate UMA energy of sampled systems at the end and compare across guidance scales')
+    parser.add_argument('--energy_batch_size', type=int, default=256,
+                        help='Batch size (number of molecules) per UMA forward during end-of-run energy evaluation')
     
     # Distributed training arguments
     parser.add_argument('--use_distributed', action='store_true',

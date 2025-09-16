@@ -128,6 +128,7 @@ def evaluate_energy_stats(
     mlff_predictor,
     device: torch.device,
     task_name: str,
+    energy_batch_size: int = 256,
 ):
     """Compute energy stats for a block of samples; returns dict or None."""
     ad_list = molecules_to_atomicdata_list(
@@ -135,35 +136,47 @@ def evaluate_energy_stats(
     )
     if not ad_list:
         return None
-    try:
-        batch = data_list_collater(ad_list, otf_graph=True)
-        batch = batch.to(device)
-    except Exception as e:
-        if is_main_process():
-            print(f"Energy eval: collate failed for {name}: {e}")
-        return None
+    # Chunked prediction to control memory
+    all_e_list = []
+    start = 0
+    total = len(ad_list)
+    while start < total:
+        end = min(start + energy_batch_size, total)
+        chunk = ad_list[start:end]
+        try:
+            batch = data_list_collater(chunk, otf_graph=True)
+            batch = batch.to(device)
+        except Exception as e:
+            if is_main_process():
+                print(f"Energy eval: collate failed for {name} [{start}:{end}]: {e}")
+            # Skip this chunk
+            start = end
+            continue
 
-    try:
-        with torch.no_grad():
-            preds = mlff_predictor.predict(batch)
-    except Exception as e:
-        if is_main_process():
-            print(f"Energy eval: UMA prediction failed for {name}: {e}")
-        return None
+        try:
+            with torch.no_grad():
+                preds = mlff_predictor.predict(batch)
+        except Exception as e:
+            if is_main_process():
+                print(f"Energy eval: UMA prediction failed for {name} [{start}:{end}]: {e}")
+            start = end
+            continue
 
-    energies = None
-    for key in ["energy", "energies", "total_energy"]:
-        if key in preds:
-            energies = preds[key]
-            break
-    if energies is None:
-        if is_main_process():
-            print(f"Energy eval: no energy key in UMA outputs for {name} (keys={list(preds.keys())})")
-        return None
+        energies = None
+        for key in ["energy", "energies", "total_energy"]:
+            if key in preds:
+                energies = preds[key]
+                break
+        if energies is not None:
+            e = energies.detach().cpu().view(-1).numpy()
+            if e.size > 0:
+                all_e_list.append(e)
 
-    e = energies.detach().cpu().view(-1).numpy()
-    if e.size == 0:
+        start = end
+
+    if not all_e_list:
         return None
+    e = np.concatenate(all_e_list, axis=0)
     stats = {
         'count': int(e.size),
         'mean': float(np.mean(e)),
@@ -204,7 +217,8 @@ def compare_energy_distributions(
         baseline_stats = evaluate_energy_stats(
             'baseline', b['positions'], b['one_hot'], b['node_mask'],
             dataset_info, mlff_predictor, device,
-            task_name=getattr(eval_args, 'task_name', 'omol')
+            task_name=getattr(eval_args, 'task_name', 'omol'),
+            energy_batch_size=getattr(eval_args, 'energy_batch_size', 256),
         )
         if baseline_stats is not None:
             print(f"Baseline energy (eV): mean={baseline_stats['mean']:.4f}, "
@@ -226,7 +240,8 @@ def compare_energy_distributions(
         stats = evaluate_energy_stats(
             f'guided_scale_{scale}', pos, oh, nm,
             dataset_info, mlff_predictor, device,
-            task_name=getattr(eval_args, 'task_name', 'omol')
+            task_name=getattr(eval_args, 'task_name', 'omol'),
+            energy_batch_size=getattr(eval_args, 'energy_batch_size', 256),
         )
         guided_stats[scale] = stats
         if stats is not None:

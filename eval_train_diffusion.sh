@@ -4,7 +4,7 @@
 #SBATCH --error=exp_cond_alpha_%j.err
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:1
 #SBATCH --partition=gpu_h200
@@ -18,8 +18,8 @@ huggingface-cli login --token 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
 nvidia-smi
 python -m torch.distributed.launch --nproc_per_node=1 eval_mlff_guided.py \
     --model_path outputs/exp_cond_alpha --use_distributed \
-    --n_samples 1000 --guidance_iterations 1 \
-    --use_wandb --guidance_scales 0.002 0.004 \
+    --n_samples 10000 --guidance_iterations 10 \
+    --use_wandb --guidance_scales 0.2 0.25 0.28 \
     --skip_visualization --skip_analysis --skip_chain \
-    --noise_threshold 0.3 \
-    --force_clip_threshold 10 --sampling_method ddpm --dpm_solver_order 2 --dpm_solver_steps 20 --batch_size 25
+    --noise_threshold 0.5 \
+    --force_clip_threshold 10 --sampling_method dpm_solver++ --dpm_solver_order 3 --dpm_solver_steps 100 --batch_size 300 --compare_energy_at_end
