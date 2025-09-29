@@ -19,16 +19,16 @@ from verl_diffusion.worker.reward.force import UMAForceReward
 from verl_diffusion.worker.filter.filter import Filter
 from verl_diffusion.worker.actor.edm_actor import EDMActor
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
-import sys
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="DDPO Training for EDM")
     parser.add_argument('--config_path', type=str, default="./verl_diffusion/trainer/config/ddpo_config.yaml", help="Path to the configuration file")
-    parser.add_argument('--save_path', type=str, default="./saved_models/edm_ddpo", help="Path to save the model")
+    parser.add_argument('--save_path', type=str, default=None, help="Override path to save checkpoints")
+    parser.add_argument('--model_path', type=str, default=None, help="Override pretrained EDM checkpoint path")
     parser.add_argument('--wandb', action='store_true', help="Enable wandb logging")
-    parser.add_argument('--wandb_project', type=str, default="edm-ddp", help="Wandb project name")
-    parser.add_argument('--wandb_name', type=str, default="edm-ddp-run", help="Wandb run name")
+    parser.add_argument('--wandb_project', type=str, default=None, help="Wandb project name override")
+    parser.add_argument('--wandb_name', type=str, default=None, help="Wandb run name override")
     parser.add_argument('--seed', type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument('--resume', action='store_true', help="Resume training from checkpoint")
     parser.add_argument('--checkpoint_path', type=str, default=None, help="Path to checkpoint to resume from")
@@ -52,6 +52,20 @@ def main():
     config = BaseConfig()
     config = config.from_yaml(args.config_path)
     config = config.to_dict()
+
+    # CLI overrides take precedence over config defaults
+    if args.save_path:
+        config["save_path"] = args.save_path
+    if args.model_path:
+        config.setdefault("model", {})["model_path"] = args.model_path
+    if args.wandb_project:
+        config.setdefault("wandb", {})["wandb_project"] = args.wandb_project
+    if args.wandb_name:
+        config.setdefault("wandb", {})["wandb_name"] = args.wandb_name
+    if args.resume:
+        config["resume"] = True
+    if args.checkpoint_path:
+        config["checkpoint_path"] = args.checkpoint_path
     print("Config loaded")
     
     # Load EDM config

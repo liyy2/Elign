@@ -34,7 +34,10 @@ class DDPOTrainer(BaseTrainer):
         self.device = device
         self.dataloader = dataloader
         self.config = config
-        self.save_path = os.path.join("./exp",config["wandb"]["wandb_name"])
+        if "save_path" in config:
+            self.save_path = config["save_path"]
+        else:
+            self.save_path = os.path.join("./exp", config["wandb"]["wandb_name"])
         os.makedirs(self.save_path, exist_ok=True)
         self.epoches = self.config["dataloader"]["epoches"]
         # Use provided rollout and rewarder instances
