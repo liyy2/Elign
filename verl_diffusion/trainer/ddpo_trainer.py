@@ -170,29 +170,44 @@ class DDPOTrainer(BaseTrainer):
             return []
     def compute_advantage(self, samples):
         group_index = samples.batch["group_index"]
+        clip_value = self.config["train"].get("clip_advantage_value", 5.0)
+
+        # Per-timestep rewards available (reward shaping)
+        if "rewards_ts" in samples.batch.keys():
+            rewards_ts = samples.batch["rewards_ts"].to(group_index.device)  # [B, S]
+            unique_groups = torch.unique(group_index)
+            advantages_ts = torch.zeros_like(rewards_ts)
+
+            for group_id in unique_groups:
+                gmask = (group_index == group_id)
+                if gmask.any():
+                    grp = rewards_ts[gmask]  # [B_g, S]
+                    mean = grp.mean(dim=0, keepdim=True)  # [1, S]
+                    std = grp.std(dim=0, keepdim=True)
+                    advantages_ts[gmask] = (grp - mean) / (std + 1e-8)
+
+            # Clip per-step advantages
+            advantages_ts = torch.clamp(advantages_ts, -clip_value, clip_value)
+            samples.batch["advantages_ts"] = advantages_ts
+
+            # Keep scalar advantages for logging/backward compat (sum over time)
+            advantages = advantages_ts.sum(dim=1)
+            samples.batch["advantages"] = torch.clamp(advantages, -clip_value, clip_value)
+            return samples
+
+        # Fallback: scalar rewards only
         rewards = samples.batch["rewards"]
-        
-        # Get unique group indices
         unique_groups = torch.unique(group_index)
         normalized_rewards = torch.zeros_like(rewards)
-        # Normalize rewards within each group
-        
+
         for group_id in unique_groups:
             group_mask = (group_index == group_id)
             group_rewards = rewards[group_mask]
-            
-            # Calculate mean and std for this group
             group_mean = group_rewards.mean()
             group_std = group_rewards.std()
+            normalized_rewards[group_mask] = (group_rewards - group_mean) / (group_std + 1e-8)
 
-            # Normalize rewards for this group
-            normalized_rewards[group_mask] = (group_rewards - group_mean) / (group_std+1e-8)
-        
-        samples.batch["advantages"] = normalized_rewards
-        # Clip advantages to prevent extreme values
-        clip_value = self.config["train"].get("clip_advantage_value", 5.0)
-        samples.batch["advantages"] = torch.clamp(samples.batch["advantages"], -clip_value, clip_value)
-        
+        samples.batch["advantages"] = torch.clamp(normalized_rewards, -clip_value, clip_value)
         return samples
 
     def save_checkpoint(self, epoch, metrics=None):

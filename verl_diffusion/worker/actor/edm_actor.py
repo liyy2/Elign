@@ -56,12 +56,17 @@ class EDMActor(BaseActor):
                     context = sample["context"]
                 else:
                     context = None
+                # Select per-step advantage if available, otherwise scalar
+                if "advantages_ts" in sample:
+                    advantages_j = sample["advantages_ts"][:, j]
+                else:
+                    advantages_j = sample["advantages"]
                 loss, clipfrac = self.calculate_loss(
                         sample["latents"][:, j],
                         sample["timesteps"][:, j],
                         sample["next_latents"][:, j],
                         sample["logps"][:, j],
-                        sample["advantages"],
+                        advantages_j,
                         sample["nodesxsample"],
                         context = context
                     )
@@ -140,7 +145,13 @@ class EDMActor(BaseActor):
         self.max_n_nodes = data.meta_info["max_n_nodes"]
         self.batch_size = data.batch.batch_size[0]
         self.condition = data.meta_info["condition"]
-        samples["advantages"] = data.batch["advantages"]
+        # Optional per-step advantages from reward shaping
+        if "advantages_ts" in data.batch.keys():
+            samples["advantages_ts"] = data.batch["advantages_ts"]
+            # Keep scalar as well for logging/compat
+            samples["advantages"] = data.batch.get("advantages", data.batch["advantages_ts"].sum(dim=1))
+        else:
+            samples["advantages"] = data.batch["advantages"]
         
         samples["latents"] = data.batch["latents"][:,:self.num_timesteps+1].clone()
         samples["next_latents"] = data.batch["latents"][:,1:].clone()

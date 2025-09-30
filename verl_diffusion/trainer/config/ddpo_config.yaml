@@ -1,24 +1,36 @@
 name: edm
 dataloader:
   sample_group_size: 4
-  each_prompt_sample: 32
-  micro_batch_size: 32
+  each_prompt_sample: 128
+  micro_batch_size: 512
   epoches: 100
   smiles_path: "qm9/temp/qm9_smiles.pickle"
 model:
   config: "./pretrained/edm/edm_qm9/args.pickle"
   model_path: "./pretrained/edm/edm_qm9/generative_model_ema.npy"
-  time_step: 100
+  time_step: 1000
 train:
     adv_clip_max: 5
     max_grad_norm: 1
-    learning_rate: 0.00001
+    learning_rate: 0.000001
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_weight_decay: 0.0001
     adam_epsilon: 0.00000001
     clip_range: 0.2
     train_micro_batch_size: 512
+reward:
+  type: uma
+  mlff_model: uma-s-1p1
+  force_clip_threshold: null
+  shaping:
+    enabled: true
+    method: potential
+    gamma: 1.0
+    horizon: 200     # evaluate last K steps only; 0 for all
+    weight: 1.0      # weight for shaped-sum added to final reward
+    skip_prefix: 800 # also skip the very first steps entirely
+    max_atoms_per_call: 200000
 wandb:
     wandb_project: "ddpo"
     wandb_name: "edm-ddp-run"

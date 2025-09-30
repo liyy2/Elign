@@ -983,6 +983,34 @@ def main():
     # Load model weights
     fn = 'generative_model_ema.npy' if args.ema_decay > 0 else 'generative_model.npy'
     flow_state_dict = torch.load(join(eval_args.model_path, fn), map_location=device)
+
+    # Some checkpoints wrap the state dict or include DDP prefixes; normalize before loading.
+    if isinstance(flow_state_dict, dict):
+        possible_wrappers = ['state_dict', 'model_state_dict', 'model']
+        for wrapper_key in possible_wrappers:
+            candidate = flow_state_dict.get(wrapper_key)
+            if isinstance(candidate, dict):
+                flow_state_dict = candidate
+                break
+
+        cleaned_state_dict = type(flow_state_dict)()
+        stripped_any_prefix = False
+        prefix_options = ('module.', 'model.')
+        for key, value in flow_state_dict.items():
+            new_key = key
+            prefix_stripped = True
+            while prefix_stripped:
+                prefix_stripped = False
+                for prefix in prefix_options:
+                    if new_key.startswith(prefix):
+                        new_key = new_key[len(prefix):]
+                        stripped_any_prefix = True
+                        prefix_stripped = True
+                        break
+            cleaned_state_dict[new_key] = value
+        if stripped_any_prefix:
+            flow_state_dict = cleaned_state_dict
+
     flow.load_state_dict(flow_state_dict)
     
     # Override sampling method if specified

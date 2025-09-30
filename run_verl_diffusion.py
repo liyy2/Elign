@@ -109,7 +109,18 @@ def main():
     # Initialize rollout and rewarder in main function
     rollout = EDMRollout(model, config)
     rollout.model.to(device)
-    rewarder = UMAForceReward(dataset_info)
+    # Build rewarder from config (MLFF + shaping)
+    reward_cfg = config.get("reward", {})
+    rewarder = UMAForceReward(
+        dataset_info,
+        condition=False,
+        mlff_model=reward_cfg.get("mlff_model", "uma-s-1p1"),
+        mlff_predictor=None,
+        position_scale=None,
+        force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
+        device=str(device),
+        shaping=reward_cfg.get("shaping", {}),
+    )
     filters = Filter(dataset_info,config["dataloader"]["smiles_path"],False,False,False)
     actor = EDMActor(model, config)
     # Initialize Ray for parallel processing

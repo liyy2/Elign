@@ -207,7 +207,7 @@ class ForceReward(BaseReward):
 
 
 class UMAForceReward(BaseReward):
-    """Reward module that scores molecules with UMA MLFF forces without altering ForceReward."""
+    """Reward module that scores molecules with UMA MLFF forces and supports intermediate reward shaping."""
 
     def __init__(
         self,
@@ -218,6 +218,7 @@ class UMAForceReward(BaseReward):
         position_scale: Optional[float] = None,
         force_clip_threshold: Optional[float] = None,
         device: Optional[str] = None,
+        shaping: Optional[dict] = None,
     ):
         super().__init__()
         self.dataset_info = dataset_info
@@ -236,6 +237,19 @@ class UMAForceReward(BaseReward):
                 position_scale = 1.0
         self.position_scale = position_scale
         self.force_clip_threshold = force_clip_threshold
+        # Reward shaping config
+        self.shaping_cfg = shaping or {}
+        self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
+        self.shaping_method = self.shaping_cfg.get("method", "potential")
+        self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
+        # Compute MLFF only for the last K timesteps to control cost; 0 -> all steps
+        self.shaping_horizon = int(self.shaping_cfg.get("horizon", 0))
+        # Skip computing shaped rewards for the first K (noisiest) steps
+        self.shaping_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
+        # Weight for adding shaped sum to final reward
+        self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
+        # Always batch across timesteps after skip_prefix to accelerate MLFF
+        self.max_atoms_per_call = int(self.shaping_cfg.get("max_atoms_per_call", 200000))
 
         if mlff_predictor is not None:
             self.mlff_predictor = mlff_predictor
@@ -334,7 +348,6 @@ class UMAForceReward(BaseReward):
         if self.force_computer is not None:
             print("Computing forces via UMAForceReward, force_computer is not None")
             forces = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-            print(forces)
         else:
             forces = torch.zeros_like(z[:, :, :3], device=self.device)
 
@@ -369,9 +382,79 @@ class UMAForceReward(BaseReward):
             except Exception:
                 stability_flags[batch_idx] = 0.0
 
+        # Base (final-state) reward result
         result = {
             "rewards": rewards.cpu(),
             "stability": stability_flags.cpu(),
         }
+
+        # Optional: intermediate reward shaping using MLFF on intermediate latents
+        if self.shaping_enabled and ("latents" in data.batch.keys()) and (self.force_computer is not None):
+            # latents: [B, T+1 or T+2, N, D]. Use the same horizon as timesteps/logps if provided
+            latents = data.batch["latents"]
+            # Align steps with timesteps tensor when present
+            if "timesteps" in data.batch.keys():
+                T_steps = data.batch["timesteps"].shape[1]
+                latents = latents[:, :T_steps]
+            else:
+                T_steps = latents.shape[1]
+
+            B, S, N, D = latents.shape
+            # Build node_mask once per batch
+            node_mask = processed["node_mask"].to(self.device)
+            # Evaluate potential F_t = - RMS(force) at selected steps
+            F = torch.zeros((B, S), device=self.device)
+
+            # Determine which step indices to evaluate
+            if self.shaping_horizon and self.shaping_horizon > 0:
+                start_idx = max(0, S - self.shaping_horizon)
+            else:
+                start_idx = 0
+            # Always skip the first K very noisy steps if requested
+            start_idx = max(start_idx, self.shaping_skip_prefix)
+
+            if start_idx < S:
+                # Select suffix window and batch over timesteps
+                S_sel = S - start_idx
+                node_mask_b = node_mask
+                # Estimate atoms per batch to decide chunking
+                valid_per_b = node_mask_b[:, :, 0].sum(dim=1)  # [B]
+                total_atoms_est = int(valid_per_b.sum().item() * S_sel)
+                if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
+                    steps_per_chunk = max(1, int(self.max_atoms_per_call // max(valid_per_b.sum().item(), 1)))
+                else:
+                    steps_per_chunk = S_sel
+                cur = 0
+                while cur < S_sel:
+                    end = min(S_sel, cur + steps_per_chunk)
+                    # Flatten [B, T_c, N, D] -> [B*T_c, N, D]
+                    z_flat = latents[:, start_idx+cur:start_idx+end].to(self.device).reshape(-1, latents.size(2), latents.size(3))
+                    node_mask_flat = node_mask_b.repeat_interleave(end - cur, dim=0)
+                    forces_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
+                    mask_flat = node_mask_flat[:, :, 0]
+                    denom = mask_flat.sum(dim=1).clamp(min=1)
+                    sq = (forces_flat.pow(2)).sum(dim=2)
+                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
+                    rms_bt = rms_flat.view(B, -1)
+                    F[:, start_idx+cur:start_idx+end] = -rms_bt
+                    cur = end
+
+            # Potential-based shaping: r_j = gamma * F_{j+1} - F_j
+            shaped = torch.zeros_like(F)
+            if S > 1:
+                # Only apply shaping within the evaluated window; keep earlier steps zero
+                if start_idx < S - 1:
+                    shaped[:, start_idx:S-1] = self.shaping_gamma * F[:, start_idx+1:S] - F[:, start_idx:S-1]
+                if start_idx <= S - 1:
+                    shaped[:, S-1] = F[:, S-1]  # terminal potential
+
+            # Save per-step rewards for training
+            result["rewards_ts"] = shaped.detach().cpu()
+
+            # Also augment scalar reward for logging/training stability
+            # Combine final reward with weighted sum of shaped rewards
+            shaped_sum = shaped.sum(dim=1)
+            result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
+
         print("Rewards calculated via UMAForceReward")
         return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())
