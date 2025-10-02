@@ -214,3 +214,4 @@ e3_diffusion_for_molecules-main/generated_samples/
 # Job scheduler outputs
 exp_*.err
 exp_*.out
+exp/*
