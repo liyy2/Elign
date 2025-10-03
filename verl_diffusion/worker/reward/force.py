@@ -219,6 +219,11 @@ class UMAForceReward(BaseReward):
         force_clip_threshold: Optional[float] = None,
         device: Optional[str] = None,
         shaping: Optional[dict] = None,
+        use_energy: bool = False,
+        force_weight: float = 1.0,
+        energy_weight: float = 1.0,
+        energy_transform_offset: float = 10000.0,
+        energy_transform_scale: float = 1000.0,
     ):
         super().__init__()
         self.dataset_info = dataset_info
@@ -237,6 +242,14 @@ class UMAForceReward(BaseReward):
                 position_scale = 1.0
         self.position_scale = position_scale
         self.force_clip_threshold = force_clip_threshold
+        
+        # Energy reward configuration
+        self.use_energy = use_energy
+        self.force_weight = force_weight
+        self.energy_weight = energy_weight
+        self.energy_transform_offset = energy_transform_offset
+        self.energy_transform_scale = energy_transform_scale
+        
         # Reward shaping config
         self.shaping_cfg = shaping or {}
         self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
@@ -261,6 +274,7 @@ class UMAForceReward(BaseReward):
                 mlff_predictor=self.mlff_predictor,
                 position_scale=self.position_scale,
                 device=self.device,
+                compute_energy=self.use_energy,  # Enable energy computation based on config
             )
         else:
             self.force_computer = None
@@ -337,41 +351,147 @@ class UMAForceReward(BaseReward):
         return processed
 
     def calculate_rewards(self, data: DataProto) -> DataProto:
-        print("Calculating rewards via UMAForceReward")
         processed = self.process_data(data)
 
         z = processed["z"].to(self.device)
         node_mask = processed["node_mask"].to(self.device)
         positions = processed["positions"].to(self.device)
         categorical = processed["categorical"].to(self.device)
-
-        if self.force_computer is not None:
-            print("Computing forces via UMAForceReward, force_computer is not None")
-            forces = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-        else:
-            forces = torch.zeros_like(z[:, :, :3], device=self.device)
-
         batch_size = processed["batch_size"]
-        rewards = torch.zeros(batch_size, device=self.device)
-        stability_flags = torch.zeros(batch_size, device=self.device)
 
+        # Decide shaping path: if enabled, compute terminal + shaped in one MLFF pass over latents
+        shaping_active = self.shaping_enabled and ("latents" in data.batch.keys()) and (self.force_computer is not None)
+
+        force_rewards = torch.zeros(batch_size, device=self.device)
+        energy_rewards = torch.zeros(batch_size, device=self.device)
+        stability_flags = torch.zeros(batch_size, device=self.device)
+        result = {}
+
+        if shaping_active:
+            latents = data.batch["latents"]
+            if "timesteps" in data.batch.keys():
+                T_steps = data.batch["timesteps"].shape[1]
+                latents = latents[:, :T_steps]
+            else:
+                T_steps = latents.shape[1]
+
+            B, S, N, D = latents.shape
+            node_mask_b = processed["node_mask"].to(self.device)
+            F_force = torch.zeros((B, S), device=self.device)
+            F_energy = torch.zeros((B, S), device=self.device) if self.use_energy else None
+
+            if self.shaping_horizon and self.shaping_horizon > 0:
+                start_idx = max(0, S - self.shaping_horizon)
+            else:
+                start_idx = 0
+            start_idx = max(start_idx, self.shaping_skip_prefix)
+
+            if start_idx < S:
+                S_sel = S - start_idx
+                valid_per_b = node_mask_b[:, :, 0].sum(dim=1)
+                total_atoms_est = int(valid_per_b.sum().item() * S_sel)
+                if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
+                    steps_per_chunk = max(1, int(self.max_atoms_per_call // max(valid_per_b.sum().item(), 1)))
+                else:
+                    steps_per_chunk = S_sel
+                cur = 0
+                while cur < S_sel:
+                    end = min(S_sel, cur + steps_per_chunk)
+                    z_flat = latents[:, start_idx+cur:start_idx+end].to(self.device).reshape(-1, N, D)
+                    node_mask_flat = node_mask_b.repeat_interleave(end - cur, dim=0)
+
+                    if self.use_energy:
+                        forces_flat, energies_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
+                    else:
+                        forces_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
+
+                    mask_flat = node_mask_flat[:, :, 0]
+                    denom = mask_flat.sum(dim=1).clamp(min=1)
+                    sq = (forces_flat.pow(2)).sum(dim=2)
+                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
+                    rms_bt = rms_flat.view(B, -1)
+                    F_force[:, start_idx+cur:start_idx+end] = -rms_bt
+
+                    if self.use_energy:
+                        energies_bt = energies_flat.view(B, -1)
+                        transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
+                        F_energy[:, start_idx+cur:start_idx+end] = -transformed_energies
+                    cur = end
+
+            # Terminal rewards from final timestep
+            force_rewards = F_force[:, S-1]
+            if self.use_energy:
+                energy_rewards = F_energy[:, S-1]
+            else:
+                energy_rewards = torch.zeros_like(force_rewards)
+
+            # Shaping via potential differences
+            shaped_force = torch.zeros_like(F_force)
+            shaped_energy = torch.zeros_like(F_force) if self.use_energy else torch.zeros_like(F_force)
+            if S > 1:
+                if start_idx < S - 1:
+                    shaped_force[:, start_idx:S-1] = self.shaping_gamma * F_force[:, start_idx+1:S] - F_force[:, start_idx:S-1]
+                    if self.use_energy:
+                        shaped_energy[:, start_idx:S-1] = self.shaping_gamma * F_energy[:, start_idx+1:S] - F_energy[:, start_idx:S-1]
+                if start_idx <= S - 1:
+                    shaped_force[:, S-1] = F_force[:, S-1]
+                    if self.use_energy:
+                        shaped_energy[:, S-1] = F_energy[:, S-1]
+
+            weighted_force_rewards = self.force_weight * force_rewards
+            weighted_energy_rewards = self.energy_weight * energy_rewards
+            rewards = weighted_force_rewards + weighted_energy_rewards
+
+            weighted_shaped_force = self.force_weight * shaped_force
+            weighted_shaped_energy = self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
+            shaped = weighted_shaped_force + weighted_shaped_energy
+
+            result["rewards_ts"] = shaped.detach().cpu()
+            result["force_rewards_ts"] = shaped_force.detach().cpu()
+            if self.use_energy:
+                result["energy_rewards_ts"] = shaped_energy.detach().cpu()
+
+            shaped_sum = shaped.sum(dim=1)
+            result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
+        else:
+            # Final-state path only (single MLFF call)
+            if self.force_computer is not None:
+                if self.use_energy:
+                    forces, energies = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
+                else:
+                    forces = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
+                    energies = torch.zeros(z.shape[0], device=self.device)
+            else:
+                forces = torch.zeros_like(z[:, :, :3], device=self.device)
+                energies = torch.zeros(z.shape[0], device=self.device)
+
+            for batch_idx in range(batch_size):
+                valid_mask = node_mask[batch_idx, :, 0] > 0
+                if not torch.any(valid_mask):
+                    continue
+                sample_forces = forces[batch_idx][valid_mask]
+                if sample_forces.numel() == 0:
+                    rms_force = torch.tensor(0.0, device=self.device)
+                else:
+                    rms_force = torch.sqrt(torch.mean(sample_forces.pow(2)))
+                force_rewards[batch_idx] = -rms_force
+                if self.use_energy:
+                    energy = energies[batch_idx]
+                    transformed_energy = (energy + self.energy_transform_offset) / self.energy_transform_scale
+                    energy_rewards[batch_idx] = -transformed_energy
+
+            weighted_force_rewards = self.force_weight * force_rewards
+            weighted_energy_rewards = self.energy_weight * energy_rewards
+            rewards = weighted_force_rewards + weighted_energy_rewards
+            result["rewards"] = rewards.detach().cpu()
+
+        # Compute stability flags once
         for batch_idx in range(batch_size):
             valid_mask = node_mask[batch_idx, :, 0] > 0
-
             if not torch.any(valid_mask):
                 continue
-
-            sample_forces = forces[batch_idx][valid_mask]
-            if sample_forces.numel() == 0:
-                rms_force = torch.tensor(0.0, device=self.device)
-            else:
-                rms_force = torch.sqrt(torch.mean(sample_forces.pow(2)))
-
-            rewards[batch_idx] = -rms_force
-
             atom_type_indices = categorical[batch_idx].argmax(dim=1)[valid_mask]
             positions_valid = positions[batch_idx][valid_mask]
-
             try:
                 validity_results = check_stability(
                     positions_valid.detach().cpu().numpy(),
@@ -382,79 +502,13 @@ class UMAForceReward(BaseReward):
             except Exception:
                 stability_flags[batch_idx] = 0.0
 
-        # Base (final-state) reward result
-        result = {
-            "rewards": rewards.cpu(),
-            "stability": stability_flags.cpu(),
-        }
-
-        # Optional: intermediate reward shaping using MLFF on intermediate latents
-        if self.shaping_enabled and ("latents" in data.batch.keys()) and (self.force_computer is not None):
-            # latents: [B, T+1 or T+2, N, D]. Use the same horizon as timesteps/logps if provided
-            latents = data.batch["latents"]
-            # Align steps with timesteps tensor when present
-            if "timesteps" in data.batch.keys():
-                T_steps = data.batch["timesteps"].shape[1]
-                latents = latents[:, :T_steps]
-            else:
-                T_steps = latents.shape[1]
-
-            B, S, N, D = latents.shape
-            # Build node_mask once per batch
-            node_mask = processed["node_mask"].to(self.device)
-            # Evaluate potential F_t = - RMS(force) at selected steps
-            F = torch.zeros((B, S), device=self.device)
-
-            # Determine which step indices to evaluate
-            if self.shaping_horizon and self.shaping_horizon > 0:
-                start_idx = max(0, S - self.shaping_horizon)
-            else:
-                start_idx = 0
-            # Always skip the first K very noisy steps if requested
-            start_idx = max(start_idx, self.shaping_skip_prefix)
-
-            if start_idx < S:
-                # Select suffix window and batch over timesteps
-                S_sel = S - start_idx
-                node_mask_b = node_mask
-                # Estimate atoms per batch to decide chunking
-                valid_per_b = node_mask_b[:, :, 0].sum(dim=1)  # [B]
-                total_atoms_est = int(valid_per_b.sum().item() * S_sel)
-                if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
-                    steps_per_chunk = max(1, int(self.max_atoms_per_call // max(valid_per_b.sum().item(), 1)))
-                else:
-                    steps_per_chunk = S_sel
-                cur = 0
-                while cur < S_sel:
-                    end = min(S_sel, cur + steps_per_chunk)
-                    # Flatten [B, T_c, N, D] -> [B*T_c, N, D]
-                    z_flat = latents[:, start_idx+cur:start_idx+end].to(self.device).reshape(-1, latents.size(2), latents.size(3))
-                    node_mask_flat = node_mask_b.repeat_interleave(end - cur, dim=0)
-                    forces_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
-                    mask_flat = node_mask_flat[:, :, 0]
-                    denom = mask_flat.sum(dim=1).clamp(min=1)
-                    sq = (forces_flat.pow(2)).sum(dim=2)
-                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
-                    rms_bt = rms_flat.view(B, -1)
-                    F[:, start_idx+cur:start_idx+end] = -rms_bt
-                    cur = end
-
-            # Potential-based shaping: r_j = gamma * F_{j+1} - F_j
-            shaped = torch.zeros_like(F)
-            if S > 1:
-                # Only apply shaping within the evaluated window; keep earlier steps zero
-                if start_idx < S - 1:
-                    shaped[:, start_idx:S-1] = self.shaping_gamma * F[:, start_idx+1:S] - F[:, start_idx:S-1]
-                if start_idx <= S - 1:
-                    shaped[:, S-1] = F[:, S-1]  # terminal potential
-
-            # Save per-step rewards for training
-            result["rewards_ts"] = shaped.detach().cpu()
-
-            # Also augment scalar reward for logging/training stability
-            # Combine final reward with weighted sum of shaped rewards
-            shaped_sum = shaped.sum(dim=1)
-            result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
+        # Populate final fields
+        result.setdefault("rewards", rewards.detach().cpu())
+        result["force_rewards"] = force_rewards.detach().cpu()
+        result["energy_rewards"] = energy_rewards.detach().cpu()
+        result["weighted_force_rewards"] = (self.force_weight * force_rewards).detach().cpu()
+        result["weighted_energy_rewards"] = (self.energy_weight * energy_rewards).detach().cpu()
+        result["stability"] = stability_flags.cpu()
 
         print("Rewards calculated via UMAForceReward")
         return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())

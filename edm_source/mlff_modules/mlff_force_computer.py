@@ -15,7 +15,7 @@ from fairchem.core.datasets import data_list_collater
 class MLFFForceComputer:
     """Handles force computation using MLFF predictors."""
     
-    def __init__(self, mlff_predictor, position_scale=1.0, device='cuda'):
+    def __init__(self, mlff_predictor, position_scale=1.0, device='cuda', compute_energy=False):
         """
         Initialize the MLFF force computer.
         
@@ -23,10 +23,12 @@ class MLFFForceComputer:
             mlff_predictor: The MLFF predictor model (e.g., UMA)
             position_scale: Scale factor to convert from normalized to physical positions
             device: Device to run computations on
+            compute_energy: Whether to compute energy in addition to forces (default: False)
         """
         self.mlff_predictor = mlff_predictor
         self.position_scale = position_scale
         self.device = device
+        self.compute_energy = compute_energy
         
         # Default molecule cell size for molecular systems
         self.molecule_cell_size = 50.0
@@ -130,9 +132,9 @@ class MLFFForceComputer:
         return atomic_data_list
     
     def compute_mlff_forces(self, z: torch.Tensor, node_mask: torch.Tensor, 
-                           dataset_info: Dict) -> torch.Tensor:
+                           dataset_info: Dict):
         """
-        Compute forces using MLFF predictor.
+        Compute forces (and optionally energies) using MLFF predictor.
         
         Args:
             z: Current molecular configuration [batch_size, max_n_nodes, n_dims + n_features]
@@ -140,60 +142,70 @@ class MLFFForceComputer:
             dataset_info: Dataset information including atom decoder
             
         Returns:
-            Forces tensor [batch_size, max_n_nodes, 3]
+            If compute_energy=False: Forces tensor [batch_size, max_n_nodes, 3]
+            If compute_energy=True: Tuple of (forces tensor [batch_size, max_n_nodes, 3], energies tensor [batch_size])
         """
         batch_size, max_n_nodes, _ = z.shape
         
         # Initialize zero forces
         forces = torch.zeros((batch_size, max_n_nodes, 3), device=self.device)
+        if self.compute_energy:
+            energies = torch.zeros(batch_size, device=self.device)
         
         # Convert to atomic data format
         atomic_data_list = self.diffusion_to_atomic_data(z, node_mask, dataset_info, batch_size)
         
         if not atomic_data_list:
-            return forces
+            return (forces, energies) if self.compute_energy else forces
         
         # Batch the atomic data using FAIRChem's collater
         try:
             batch = data_list_collater(atomic_data_list, otf_graph=True)
             batch = batch.to(self.device)
         except Exception:
-            return forces
+            return (forces, energies) if self.compute_energy else forces
         
-        # Compute forces using MLFF
+        # Compute forces (and energy) using MLFF
         try:
             with torch.no_grad():
                 predictions = self.mlff_predictor.predict(batch)
             
             # Extract forces
-            if 'forces' not in predictions:
-                return forces
+            if 'forces' in predictions:
+                mlff_forces = predictions['forces']  # [total_atoms, 3]
                 
-            mlff_forces = predictions['forces']  # [total_atoms, 3]
-            
-            # Map forces back to original batch structure
-            atom_idx = 0
-            for batch_idx, atomic_data in enumerate(atomic_data_list):
-                n_atoms = atomic_data.natoms.item()
-                batch_forces = mlff_forces[atom_idx:atom_idx + n_atoms]  # [n_atoms, 3]
-                
-                # Get valid node indices for this batch
-                mask = node_mask[batch_idx, :, 0].bool()
-                valid_indices = torch.where(mask)[0]
-                
-                if len(valid_indices) == n_atoms:
-                    # Ensure batch_forces is on the same device as forces
-                    batch_forces = batch_forces.to(forces.device)
-                    forces[batch_idx, valid_indices] = batch_forces
+                # Map forces back to original batch structure
+                atom_idx = 0
+                for batch_idx, atomic_data in enumerate(atomic_data_list):
+                    n_atoms = atomic_data.natoms.item()
+                    batch_forces = mlff_forces[atom_idx:atom_idx + n_atoms]  # [n_atoms, 3]
                     
-                atom_idx += n_atoms
+                    # Get valid node indices for this batch
+                    mask = node_mask[batch_idx, :, 0].bool()
+                    valid_indices = torch.where(mask)[0]
+                    
+                    if len(valid_indices) == n_atoms:
+                        # Ensure batch_forces is on the same device as forces
+                        batch_forces = batch_forces.to(forces.device)
+                        forces[batch_idx, valid_indices] = batch_forces
+                        
+                    atom_idx += n_atoms
+                
+                # Scale forces back to normalized space
+                # If x_phys = x_norm * position_scale, then F_norm = dE/dx_norm = (dE/dx_phys) * position_scale
+                forces = forces * self.position_scale
             
-            # Scale forces back to normalized space
-            # If x_phys = x_norm * position_scale, then F_norm = dE/dx_norm = (dE/dx_phys) * position_scale
-            forces = forces * self.position_scale
+            # Extract energy only if requested
+            if self.compute_energy and 'energy' in predictions:
+                mlff_energy = predictions['energy']  # [num_systems] or [num_systems, 1]
+                if mlff_energy.dim() > 1:
+                    mlff_energy = mlff_energy.squeeze(-1)
+                # Map energies back to batch (accounting for skipped systems)
+                for idx, _ in enumerate(atomic_data_list):
+                    energies[idx] = mlff_energy[idx].item()
             
-            return forces
+            return (forces, energies) if self.compute_energy else forces
             
         except Exception:
-            # Return zero forces on error
-            return forces
+            # Return zero forces (and energies) on error
+            return (forces, energies) if self.compute_energy else forces

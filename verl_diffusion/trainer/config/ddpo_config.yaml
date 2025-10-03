@@ -23,6 +23,12 @@ reward:
   type: uma
   mlff_model: uma-s-1p1
   force_clip_threshold: null
+  # Energy reward configuration
+  use_energy: true           # Enable/disable energy-based rewards
+  force_weight: 1.0          # Weight for force rewards
+  energy_weight: 1.0         # Weight for energy rewards
+  energy_transform_offset: 10000.0  # Energy transformation: (E + offset) / scale
+  energy_transform_scale: 1000.0    # Energy transformation scale
   shaping:
     enabled: true
     method: potential

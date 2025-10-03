@@ -17,9 +17,9 @@ wandb login 6f1080f993d5d7ad6103e69ef57dd9291f1bf366
 huggingface-cli login --token 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
 nvidia-smi
 python -m torch.distributed.launch --nproc_per_node=1 eval_mlff_guided.py \
-    --model_path ../pretrained/edm/edm_qm9 --use_distributed \
+    --model_path ../exp/edm_ddpo_post_train_lr_0.000001 --use_distributed \
     --n_samples 10000 --guidance_iterations 10 \
-    --use_wandb --guidance_scales 0.2 0.25 0.28 \
+    --use_wandb --guidance_scales 0.2 0.15 0.1\
     --skip_visualization --skip_analysis --skip_chain \
     --noise_threshold 0.5 \
     --force_clip_threshold 10 --sampling_method dpm_solver++ --dpm_solver_order 3 --dpm_solver_steps 100 --batch_size 300 --compare_energy_at_end

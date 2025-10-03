@@ -120,6 +120,11 @@ def main():
         force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
         device=str(device),
         shaping=reward_cfg.get("shaping", {}),
+        use_energy=reward_cfg.get("use_energy", False),
+        force_weight=reward_cfg.get("force_weight", 1.0),
+        energy_weight=reward_cfg.get("energy_weight", 1.0),
+        energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
+        energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
     )
     filters = Filter(dataset_info,config["dataloader"]["smiles_path"],False,False,False)
     actor = EDMActor(model, config)

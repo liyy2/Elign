@@ -177,14 +177,46 @@ class DDPOTrainer(BaseTrainer):
             rewards_ts = samples.batch["rewards_ts"].to(group_index.device)  # [B, S]
             unique_groups = torch.unique(group_index)
             advantages_ts = torch.zeros_like(rewards_ts)
-
-            for group_id in unique_groups:
-                gmask = (group_index == group_id)
-                if gmask.any():
-                    grp = rewards_ts[gmask]  # [B_g, S]
-                    mean = grp.mean(dim=0, keepdim=True)  # [1, S]
-                    std = grp.std(dim=0, keepdim=True)
-                    advantages_ts[gmask] = (grp - mean) / (std + 1e-8)
+            
+            # Check if we have separate force and energy rewards for GRPO
+            if "force_rewards_ts" in samples.batch.keys() and "energy_rewards_ts" in samples.batch.keys():
+                force_rewards_ts = samples.batch["force_rewards_ts"].to(group_index.device)  # [B, S]
+                energy_rewards_ts = samples.batch["energy_rewards_ts"].to(group_index.device)  # [B, S]
+                
+                force_advantages_ts = torch.zeros_like(force_rewards_ts)
+                energy_advantages_ts = torch.zeros_like(energy_rewards_ts)
+                
+                # Normalize force and energy separately within each group (GRPO)
+                for group_id in unique_groups:
+                    gmask = (group_index == group_id)
+                    if gmask.any():
+                        # Normalize force rewards
+                        grp_force = force_rewards_ts[gmask]  # [B_g, S]
+                        mean_force = grp_force.mean(dim=0, keepdim=True)  # [1, S]
+                        std_force = grp_force.std(dim=0, keepdim=True)
+                        force_advantages_ts[gmask] = (grp_force - mean_force) / (std_force + 1e-8)
+                        
+                        # Normalize energy rewards
+                        grp_energy = energy_rewards_ts[gmask]  # [B_g, S]
+                        mean_energy = grp_energy.mean(dim=0, keepdim=True)  # [1, S]
+                        std_energy = grp_energy.std(dim=0, keepdim=True)
+                        energy_advantages_ts[gmask] = (grp_energy - mean_energy) / (std_energy + 1e-8)
+                
+                # Combine normalized force and energy advantages
+                advantages_ts = force_advantages_ts + energy_advantages_ts
+                
+                # Store separate advantages for logging/analysis if needed
+                samples.batch["force_advantages_ts"] = torch.clamp(force_advantages_ts, -clip_value, clip_value)
+                samples.batch["energy_advantages_ts"] = torch.clamp(energy_advantages_ts, -clip_value, clip_value)
+            else:
+                # Standard normalization for combined rewards
+                for group_id in unique_groups:
+                    gmask = (group_index == group_id)
+                    if gmask.any():
+                        grp = rewards_ts[gmask]  # [B_g, S]
+                        mean = grp.mean(dim=0, keepdim=True)  # [1, S]
+                        std = grp.std(dim=0, keepdim=True)
+                        advantages_ts[gmask] = (grp - mean) / (std + 1e-8)
 
             # Clip per-step advantages
             advantages_ts = torch.clamp(advantages_ts, -clip_value, clip_value)
@@ -199,13 +231,45 @@ class DDPOTrainer(BaseTrainer):
         rewards = samples.batch["rewards"]
         unique_groups = torch.unique(group_index)
         normalized_rewards = torch.zeros_like(rewards)
-
-        for group_id in unique_groups:
-            group_mask = (group_index == group_id)
-            group_rewards = rewards[group_mask]
-            group_mean = group_rewards.mean()
-            group_std = group_rewards.std()
-            normalized_rewards[group_mask] = (group_rewards - group_mean) / (group_std + 1e-8)
+        
+        # Check if we have separate force and energy rewards for scalar case
+        if "force_rewards" in samples.batch.keys() and "energy_rewards" in samples.batch.keys():
+            force_rewards = samples.batch["force_rewards"].to(group_index.device)
+            energy_rewards = samples.batch["energy_rewards"].to(group_index.device)
+            
+            force_advantages = torch.zeros_like(force_rewards)
+            energy_advantages = torch.zeros_like(energy_rewards)
+            
+            # Normalize force and energy separately within each group (GRPO)
+            for group_id in unique_groups:
+                group_mask = (group_index == group_id)
+                if group_mask.any():
+                    # Normalize force rewards
+                    group_force = force_rewards[group_mask]
+                    force_mean = group_force.mean()
+                    force_std = group_force.std()
+                    force_advantages[group_mask] = (group_force - force_mean) / (force_std + 1e-8)
+                    
+                    # Normalize energy rewards
+                    group_energy = energy_rewards[group_mask]
+                    energy_mean = group_energy.mean()
+                    energy_std = group_energy.std()
+                    energy_advantages[group_mask] = (group_energy - energy_mean) / (energy_std + 1e-8)
+            
+            # Combine normalized advantages
+            normalized_rewards = force_advantages + energy_advantages
+            
+            # Store separate advantages for logging/analysis
+            samples.batch["force_advantages"] = torch.clamp(force_advantages, -clip_value, clip_value)
+            samples.batch["energy_advantages"] = torch.clamp(energy_advantages, -clip_value, clip_value)
+        else:
+            # Standard normalization
+            for group_id in unique_groups:
+                group_mask = (group_index == group_id)
+                group_rewards = rewards[group_mask]
+                group_mean = group_rewards.mean()
+                group_std = group_rewards.std()
+                normalized_rewards[group_mask] = (group_rewards - group_mean) / (group_std + 1e-8)
 
         samples.batch["advantages"] = torch.clamp(normalized_rewards, -clip_value, clip_value)
         return samples
@@ -285,6 +349,38 @@ class DDPOTrainer(BaseTrainer):
                     metrics["novelty_penalty_ratio"] = novelty_penalty_ratio
                     metrics["molecule_stability"] = samples.batch['stability'].mean().item()
                     
+                    # Collect force and energy reward statistics if available
+                    if "force_rewards" in samples.batch:
+                        metrics["force_reward_mean"] = samples.batch["force_rewards"].mean().item()
+                        metrics["force_reward_std"] = samples.batch["force_rewards"].std().item()
+                        metrics["force_reward_min"] = samples.batch["force_rewards"].min().item()
+                        metrics["force_reward_max"] = samples.batch["force_rewards"].max().item()
+                    
+                    if "energy_rewards" in samples.batch:
+                        metrics["energy_reward_mean"] = samples.batch["energy_rewards"].mean().item()
+                        metrics["energy_reward_std"] = samples.batch["energy_rewards"].std().item()
+                        metrics["energy_reward_min"] = samples.batch["energy_rewards"].min().item()
+                        metrics["energy_reward_max"] = samples.batch["energy_rewards"].max().item()
+                    
+                    if "weighted_force_rewards" in samples.batch:
+                        metrics["weighted_force_reward_mean"] = samples.batch["weighted_force_rewards"].mean().item()
+                    
+                    if "weighted_energy_rewards" in samples.batch:
+                        metrics["weighted_energy_reward_mean"] = samples.batch["weighted_energy_rewards"].mean().item()
+                    
+                    # Collect advantage statistics (GRPO normalized rewards)
+                    if "force_advantages" in samples.batch:
+                        metrics["force_advantage_mean"] = samples.batch["force_advantages"].mean().item()
+                        metrics["force_advantage_std"] = samples.batch["force_advantages"].std().item()
+                    
+                    if "energy_advantages" in samples.batch:
+                        metrics["energy_advantage_mean"] = samples.batch["energy_advantages"].mean().item()
+                        metrics["energy_advantage_std"] = samples.batch["energy_advantages"].std().item()
+                    
+                    if "advantages" in samples.batch:
+                        metrics["advantage_mean"] = samples.batch["advantages"].mean().item()
+                        metrics["advantage_std"] = samples.batch["advantages"].std().item()
+                    
                     # Save checkpoint periodically
                     if (batch_idx + 1) % self.config.get('save_interval', 10) == 0:
                         self.save_checkpoint(batch_idx, metrics)
@@ -299,9 +395,50 @@ class DDPOTrainer(BaseTrainer):
                             "train/molecule_stability": metrics["molecule_stability"],
                             "train/step": global_batch_idx
                         }
+                        
+                        # Add force reward statistics
+                        if "force_reward_mean" in metrics:
+                            log_dict["train/force_reward_mean"] = metrics["force_reward_mean"]
+                            log_dict["train/force_reward_std"] = metrics["force_reward_std"]
+                            log_dict["train/force_reward_min"] = metrics["force_reward_min"]
+                            log_dict["train/force_reward_max"] = metrics["force_reward_max"]
+                        
+                        # Add energy reward statistics
+                        if "energy_reward_mean" in metrics:
+                            log_dict["train/energy_reward_mean"] = metrics["energy_reward_mean"]
+                            log_dict["train/energy_reward_std"] = metrics["energy_reward_std"]
+                            log_dict["train/energy_reward_min"] = metrics["energy_reward_min"]
+                            log_dict["train/energy_reward_max"] = metrics["energy_reward_max"]
+                        
+                        # Add weighted reward statistics
+                        if "weighted_force_reward_mean" in metrics:
+                            log_dict["train/weighted_force_reward_mean"] = metrics["weighted_force_reward_mean"]
+                        
+                        if "weighted_energy_reward_mean" in metrics:
+                            log_dict["train/weighted_energy_reward_mean"] = metrics["weighted_energy_reward_mean"]
+                        
+                        # Add advantage statistics (GRPO normalized rewards)
+                        if "force_advantage_mean" in metrics:
+                            log_dict["train/force_advantage_mean"] = metrics["force_advantage_mean"]
+                            log_dict["train/force_advantage_std"] = metrics["force_advantage_std"]
+                        
+                        if "energy_advantage_mean" in metrics:
+                            log_dict["train/energy_advantage_mean"] = metrics["energy_advantage_mean"]
+                            log_dict["train/energy_advantage_std"] = metrics["energy_advantage_std"]
+                        
+                        if "advantage_mean" in metrics:
+                            log_dict["train/advantage_mean"] = metrics["advantage_mean"]
+                            log_dict["train/advantage_std"] = metrics["advantage_std"]
+                        
                         # Add any additional metrics from actor update
                         for k, v in metrics.items():
-                            if k not in ["reward", "filter_ratio", "novelty_penalty_ratio", "molecule_stability"]:
+                            if k not in ["reward", "filter_ratio", "novelty_penalty_ratio", "molecule_stability",
+                                        "force_reward_mean", "force_reward_std", "force_reward_min", "force_reward_max",
+                                        "energy_reward_mean", "energy_reward_std", "energy_reward_min", "energy_reward_max",
+                                        "weighted_force_reward_mean", "weighted_energy_reward_mean",
+                                        "force_advantage_mean", "force_advantage_std",
+                                        "energy_advantage_mean", "energy_advantage_std",
+                                        "advantage_mean", "advantage_std"]:
                                 log_dict[f"train/{k}"] = v
                         wandb.log(log_dict)
                     
