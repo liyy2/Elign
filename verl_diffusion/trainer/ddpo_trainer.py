@@ -34,10 +34,15 @@ class DDPOTrainer(BaseTrainer):
         self.device = device
         self.dataloader = dataloader
         self.config = config
-        if "save_path" in config:
-            self.save_path = config["save_path"]
-        else:
-            self.save_path = os.path.join("./exp", config["wandb"]["wandb_name"])
+
+        save_path = config.get("save_path")
+        if not save_path:
+            wandb_cfg = config.get("wandb") or {}
+            default_name = "edm-ddp-run"
+            if isinstance(wandb_cfg, dict):
+                default_name = wandb_cfg.get("wandb_name", default_name)
+            save_path = os.path.join("./exp", default_name)
+        self.save_path = save_path
         os.makedirs(self.save_path, exist_ok=True)
         self.epoches = self.config["dataloader"]["epoches"]
         # Use provided rollout and rewarder instances
@@ -58,10 +63,22 @@ class DDPOTrainer(BaseTrainer):
             ray.init()
             
         # Initialize wandb if enabled in config
-        if config.get("wandb", False):
+        wandb_cfg = config.get("wandb")
+        project = "edm-ddp"
+        name = "edm-ddp-run"
+        wandb_enabled = False
+
+        if isinstance(wandb_cfg, dict):
+            project = wandb_cfg.get("wandb_project", project)
+            name = wandb_cfg.get("wandb_name", name)
+            wandb_enabled = wandb_cfg.get("enabled", True)
+        elif wandb_cfg:
+            wandb_enabled = True
+
+        if wandb_enabled:
             wandb.init(
-                project=config["wandb"].get("wandb_project", "edm-ddp"),
-                name=config["wandb"].get("wandb_name", "edm-ddp-run"),
+                project=project,
+                name=name,
                 config=config
             )
             self.wandb_enabled = True

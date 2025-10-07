@@ -12,4 +12,8 @@
 module load miniconda
 eval "$(conda shell.bash hook)"
 conda activate edm
-python run_verl_diffusion.py --wandb --wandb_name test_reward_shaping
+python run_verl_diffusion.py \
+  wandb.enabled=true \
+  wandb.wandb_name=test_reward_shaping_lr_0.000005_clip_range_0.15 \
+  train.learning_rate=0.000005 \
+  train.clip_range=0.15
