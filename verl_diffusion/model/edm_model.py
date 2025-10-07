@@ -92,16 +92,36 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         self.model.load_state_dict(flow_state_dict)
         
     @torch.no_grad()
-    def sample(self, n_samples, n_nodes, node_mask, edge_mask, context=None, fix_noise=False, timestep=1000):
+    def sample(
+        self,
+        n_samples,
+        n_nodes,
+        node_mask,
+        edge_mask,
+        context=None,
+        fix_noise=False,
+        timestep=1000,
+        group_index=None,
+        share_initial_noise=False,
+    ):
         """
         Draw samples from the generative model.
         """
         self.T = timestep
+        if share_initial_noise and group_index is None:
+            raise ValueError("group_index must be provided when share_initial_noise is enabled.")
+
         if fix_noise:
             # Noise is broadcasted over the batch axis, useful for visualizations.
             z = self.sample_combined_position_feature_noise(1, n_nodes, node_mask)
         else:
-            z = self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
+            z = self._sample_initial_latents(
+                n_samples=n_samples,
+                n_nodes=n_nodes,
+                node_mask=node_mask,
+                group_index=group_index,
+                share_initial_noise=share_initial_noise,
+            )
 
         self._assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
         latents = []
@@ -235,3 +255,26 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             log_p = self.compute_log_p_zs_given_zt(zs, mu, sigma,  node_mask=node_mask)
             
         return zs, log_p, mu, sigma
+
+    def _sample_initial_latents(self, n_samples, n_nodes, node_mask, group_index, share_initial_noise):
+        if share_initial_noise:
+            group_index = group_index.to(node_mask.device).view(-1)
+            if group_index.shape[0] != n_samples:
+                raise ValueError(
+                    f"group_index length {group_index.shape[0]} does not match n_samples {n_samples}."
+                )
+            noise = torch.zeros(
+                (n_samples, n_nodes, self.n_dims + self.in_node_nf),
+                device=node_mask.device,
+                dtype=node_mask.dtype,
+            )
+            unique_groups = torch.unique(group_index)
+            for group_id in unique_groups:
+                member_indices = (group_index == group_id).nonzero(as_tuple=True)[0]
+                group_node_mask = node_mask[member_indices]
+                base_noise = self.sample_combined_position_feature_noise(1, n_nodes, group_node_mask[:1])
+                noise[member_indices] = base_noise.expand(member_indices.numel(), -1, -1)
+            return noise
+
+        return self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
+

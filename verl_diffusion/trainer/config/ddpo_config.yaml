@@ -18,6 +18,7 @@ model:
   config: "./pretrained/edm/edm_qm9/args.pickle"
   model_path: "./pretrained/edm/edm_qm9/generative_model_ema.npy"
   time_step: 1000
+  share_initial_noise: false
 
 train:
   adv_clip_max: 5

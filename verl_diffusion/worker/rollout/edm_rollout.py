@@ -115,7 +115,9 @@ class EDMRollout(BaseRollout):
             n_nodes=n_nodes,
             node_mask=node_mask,
             edge_mask=edge_mask,
-            timestep=self.config["model"]["time_step"]
+            timestep=self.config["model"]["time_step"],
+            group_index=prompts.batch["group_index"],
+            share_initial_noise=self.config["model"].get("share_initial_noise", False),
         )
         device = x.device
         
@@ -157,3 +159,4 @@ class EDMRollout(BaseRollout):
     
     
     
+
