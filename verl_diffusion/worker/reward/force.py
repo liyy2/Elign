@@ -424,14 +424,23 @@ class UMAForceReward(BaseReward):
             )
             schedule_indices = schedule.indices.to(latents.device)
             interval_steps = schedule.intervals.to(latents.device)
+            alignment_active = bool(data.meta_info.get("force_alignment_enabled", False))
+            if alignment_active:
+                fine_mask_selected = schedule.fine_mask.to(latents.device)
+            else:
+                fine_mask_selected = None
             selected_count = int(schedule_indices.numel())
 
             if selected_count == 0:
                 schedule_indices = torch.tensor([S - 1], device=latents.device)
                 interval_steps = torch.ones(1, device=latents.device, dtype=torch.long)
+                if alignment_active:
+                    fine_mask_selected = torch.ones(1, device=latents.device, dtype=torch.bool)
                 selected_count = 1
                 print('Warning: Selected count Zero')
 
+            if alignment_active and fine_mask_selected is not None:
+                fine_mask_selected = fine_mask_selected.float()
             latents_selected = torch.index_select(latents, 1, schedule_indices)
             valid_per_b = node_mask_b[:, :, 0].sum(dim=1)
             total_atoms_est = int(valid_per_b.sum().item() * selected_count)
@@ -441,6 +450,12 @@ class UMAForceReward(BaseReward):
             else:
                 steps_per_chunk = selected_count
 
+            if alignment_active:
+                force_vectors_selected = torch.zeros(
+                    (B, selected_count, N, 3), device=latents.device, dtype=latents.dtype
+                )
+            else:
+                force_vectors_selected = None
             cur = 0
             while cur < selected_count:
                 end_sel = min(selected_count, cur + steps_per_chunk)
@@ -463,6 +478,9 @@ class UMAForceReward(BaseReward):
                 sq = (forces_flat.pow(2)).sum(dim=2)
                 rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
                 rms_bt = rms_flat.view(B, -1)
+                if alignment_active and force_vectors_selected is not None:
+                    forces_bt = forces_flat.view(B, chunk_len, N, 3)
+                    force_vectors_selected[:, cur:end_sel] = forces_bt
                 target_indices = schedule_indices[cur:end_sel]
                 F_force.index_copy_(1, target_indices, -rms_bt)
 
@@ -527,6 +545,17 @@ class UMAForceReward(BaseReward):
                 result["energy_rewards_ts"] = shaped_energy.detach().cpu()
             shaped_sum = shaped.sum(dim=1)
             result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
+
+            if alignment_active and force_vectors_selected is not None and fine_mask_selected is not None:
+                schedule_indices_cpu = (
+                    schedule_indices.detach().cpu().unsqueeze(0).expand(B, -1).clone()
+                )
+                fine_mask_cpu = (
+                    fine_mask_selected.detach().cpu().unsqueeze(0).expand(B, -1).clone()
+                )
+                result["force_vectors_schedule"] = force_vectors_selected.detach().cpu()
+                result["force_schedule_indices"] = schedule_indices_cpu
+                result["force_fine_mask"] = fine_mask_cpu
         else:
             # Final-state path only (single MLFF call)
             if self.force_computer is not None:

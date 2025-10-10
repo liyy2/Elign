@@ -11,6 +11,7 @@ class RewardSchedule:
     indices: torch.Tensor
     timesteps: torch.Tensor
     intervals: torch.Tensor
+    fine_mask: torch.Tensor
 
 
 class RewardScheduler:
@@ -94,10 +95,17 @@ class RewardScheduler:
         else:
             deltas = indices.new_ones(1)
 
+        threshold = self._compute_threshold(T_max)
+        if threshold is not None:
+            fine_mask = timesteps_sel <= threshold
+        else:
+            fine_mask = torch.zeros_like(timesteps_sel, dtype=torch.bool)
+
         return RewardSchedule(
             indices=indices,
             timesteps=timesteps_sel,
             intervals=deltas,
+            fine_mask=fine_mask,
         )
 
     def _stride_for_timestep(self, timestep: float, t_max: float) -> int:
@@ -115,3 +123,13 @@ class RewardScheduler:
             return self.fine_stride
 
         return self.coarse_stride if timestep > threshold else self.fine_stride
+
+    def _compute_threshold(self, t_max: float):
+        """Return the diffusion-time threshold that separates coarse and fine stages."""
+        if self.mode != "adaptive":
+            return None
+        if self.threshold_timestep is not None:
+            return float(self.threshold_timestep)
+        if t_max <= 0:
+            return None
+        return float(t_max) * self.threshold_fraction

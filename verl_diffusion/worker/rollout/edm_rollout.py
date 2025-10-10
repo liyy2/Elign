@@ -20,6 +20,14 @@ class EDMRollout(BaseRollout):
         self.output_queue = queue.Queue(maxsize=config.get("queue_size", 5))
         self.running = False
         self.thread = None
+        train_cfg = self.config.get("train", {})
+        raw_weight = float(train_cfg.get("force_alignment_weight", 0.0))
+        enabled_cfg = train_cfg.get("force_alignment_enabled")
+        if enabled_cfg is None:
+            self.force_alignment_enabled = raw_weight > 0.0
+        else:
+            self.force_alignment_enabled = bool(enabled_cfg)
+        self.force_alignment_weight = raw_weight if self.force_alignment_enabled else 0.0
         
         
     def start_async(self, prompts_queue):
@@ -137,9 +145,13 @@ class EDMRollout(BaseRollout):
             "timesteps": expanded_timesteps,
             "group_index": prompts.batch["group_index"],
         }
-        
-        
-        return DataProto(batch=TensorDict(batch_data, batch_size= batch_size), meta_info=prompts.meta_info.copy())
+        if self.force_alignment_enabled and self.force_alignment_weight > 0.0:
+            batch_data["mus"] = torch.stack(mus, dim=1)
+
+        meta_info = prompts.meta_info.copy()
+        meta_info["force_alignment_enabled"] = self.force_alignment_enabled and self.force_alignment_weight > 0.0
+
+        return DataProto(batch=TensorDict(batch_data, batch_size= batch_size), meta_info=meta_info)
     
     def get_next_sample(self, timeout=None):
         """
@@ -159,4 +171,3 @@ class EDMRollout(BaseRollout):
     
     
     
-
