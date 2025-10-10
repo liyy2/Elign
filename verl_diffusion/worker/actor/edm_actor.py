@@ -1,8 +1,13 @@
-from typing import Dict
+from typing import Dict, Optional
 from tqdm import tqdm as tq
 from collections import defaultdict
 from verl_diffusion.protocol import DataProto
 from verl_diffusion.utils.math import kl_divergence_normal
+from verl_diffusion.utils.torch_functional import (
+    get_constant_schedule_with_warmup,
+    get_cosine_schedule_with_warmup,
+    get_wsd_schedule_with_warmup,
+)
 from .base import BaseActor
 import torch
 from torch.nn.utils import clip_grad_norm_
@@ -28,10 +33,67 @@ class EDMActor(BaseActor):
             weight_decay=self.config["train"]["adam_weight_decay"],
             eps=self.config["train"]["adam_epsilon"],
         )
+        scheduler_cfg = self.config["train"].get("scheduler", {})
+        self.scheduler_config = scheduler_cfg if isinstance(scheduler_cfg, dict) else {}
+        self.lr_scheduler = None
+        self.lr_history = []
         self.train_micro_batch_size = self.config["train"]["train_micro_batch_size"]
         self.max_grad_norm = self.config["train"]["max_grad_norm"]
         self.clip_range = self.config["train"]["clip_range"]
         self.num_timesteps = self.config["model"]["time_step"]
+
+    def setup_scheduler(self, total_training_steps: Optional[int] = None) -> None:
+        """Initialize the learning rate scheduler if configured."""
+        if not self.scheduler_config:
+            return
+
+        name = str(self.scheduler_config.get("name", "")).lower()
+        if name in {"", "none"}:
+            return
+
+        # Determine schedule parameters
+        warmup_steps = int(self.scheduler_config.get("warmup_steps", 0))
+        if total_training_steps is None:
+            total_training_steps = self.scheduler_config.get("total_steps")
+            if total_training_steps is not None:
+                total_training_steps = int(total_training_steps)
+
+        if total_training_steps is None or total_training_steps <= 0:
+            raise ValueError(
+                "total_training_steps must be provided for learning rate scheduling. "
+                "Set train.scheduler.total_steps or ensure the trainer passes a valid value."
+            )
+
+        if name in {"cosine", "cosine_warmup"}:
+            min_lr_ratio = float(self.scheduler_config.get("min_lr_ratio", 0.0))
+            num_cycles = float(self.scheduler_config.get("num_cycles", 0.5))
+            self.lr_scheduler = get_cosine_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_training_steps,
+                min_lr_ratio=min_lr_ratio,
+                num_cycles=num_cycles,
+            )
+        elif name in {"constant", "constant_warmup", "linear_warmup"}:
+            self.lr_scheduler = get_constant_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+            )
+        elif name in {"wsd", "warmup_stable_decay", "warmup-stable-decay"}:
+            min_lr_ratio = float(self.scheduler_config.get("min_lr_ratio", 0.0))
+            num_cycles = float(self.scheduler_config.get("num_cycles", 0.5))
+            stable_ratio = float(self.scheduler_config.get("stable_ratio", 0.9))
+            self.lr_scheduler = get_wsd_schedule_with_warmup(
+                self.optimizer,
+                num_warmup_steps=warmup_steps,
+                num_training_steps=total_training_steps,
+                min_lr_ratio=min_lr_ratio,
+                num_cycles=num_cycles,
+                stable_ratio=stable_ratio,
+            )
+        else:
+            raise ValueError(f"Unsupported scheduler name '{name}'.")
+
     def train_batched_samples(self, batched_samples):
         """
         Train on a batch of samples. Main training segment
@@ -74,12 +136,19 @@ class EDMActor(BaseActor):
                 info["loss"].append(loss.item())
                 loss.backward()
                 clip_grad_norm_(self.model.parameters(),max_norm=1)
+
+        # Record learning rate before scheduler update for logging
+        current_lr = self.optimizer.param_groups[0]["lr"]
         self.optimizer.step()
+        if self.lr_scheduler is not None:
+            self.lr_scheduler.step()
+        self.lr_history.append(current_lr)
         self.optimizer.zero_grad()
             
         metric = {}
         metric["ClipFrac"] = np.mean(np.array(info["clipfrac"]))
         metric["Loss"] = np.mean(np.array(info["loss"]))
+        metric["lr"] = current_lr
 
         return metric
     

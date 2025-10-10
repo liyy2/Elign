@@ -6,6 +6,8 @@ seed: 42
 save_path: null
 resume: false
 checkpoint_path: null
+best_checkpoint_metric: molecule_stability
+best_checkpoint_mode: max
 
 dataloader:
   sample_group_size: 4
@@ -30,6 +32,13 @@ train:
   adam_epsilon: 0.00000001
   clip_range: 0.15
   train_micro_batch_size: 512
+  scheduler:
+    name: cosine
+    warmup_steps: 10
+    total_steps: null
+    min_lr_ratio: 0.1
+    num_cycles: 0.5
+    stable_ratio: 0.9
 
 reward:
   type: uma
@@ -46,8 +55,17 @@ reward:
     gamma: 1.0
     horizon: 200
     weight: 1.0
-    skip_prefix: 800
     max_atoms_per_call: 200000
+    terminal_weight: 5
+    scheduler:
+      mode: adaptive
+      skip_prefix: 500
+      uniform_stride: 1
+      include_terminal: true
+      adaptive:
+        coarse_stride: 10
+        fine_stride: 2
+        threshold_fraction: 0.25
 
 wandb:
   enabled: true

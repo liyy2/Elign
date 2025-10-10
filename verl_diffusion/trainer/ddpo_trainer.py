@@ -56,8 +56,22 @@ class DDPOTrainer(BaseTrainer):
         self.reward_results = []
         self.filters = filters
         self.actor = actor
-        self.best_reward = float('-inf')
-        
+        self.best_checkpoint_metric = config.get("best_checkpoint_metric", "reward")
+        self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
+        if self.best_checkpoint_mode not in {"max", "min"}:
+            raise ValueError(f"Unsupported best_checkpoint_mode '{self.best_checkpoint_mode}'. Use 'max' or 'min'.")
+        self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
+
+        # Initialize learning rate scheduler if configured
+        scheduler_cfg = (self.config.get("train") or {}).get("scheduler")
+        if isinstance(scheduler_cfg, dict) and scheduler_cfg.get("name"):
+            steps_per_epoch = getattr(self.dataloader, "num_batches", None)
+            total_training_steps = scheduler_cfg.get("total_steps")
+            if total_training_steps is None and isinstance(steps_per_epoch, int) and steps_per_epoch > 0:
+                total_training_steps = steps_per_epoch * self.epoches
+            if total_training_steps is not None:
+                self.actor.setup_scheduler(int(total_training_steps))
+
         # Initialize Ray for parallel processing
         if not ray.is_initialized():
             ray.init()
@@ -318,11 +332,20 @@ class DDPOTrainer(BaseTrainer):
         
         # Save best checkpoint if metrics are provided
         if metrics is not None:
-            if metrics['reward'] > self.best_reward:
-                self.best_reward = metrics['reward']
-                
-                torch.save(self.model.state_dict(),os.path.join(self.save_path, 'generative_model_ema.npy'))
-                torch.save(checkpoint, os.path.join(self.save_path, 'checkpoint_best.pth'))
+            metric_value = metrics.get(self.best_checkpoint_metric)
+            if metric_value is not None:
+                is_better = (
+                    metric_value > self.best_metric_value
+                    if self.best_checkpoint_mode == "max"
+                    else metric_value < self.best_metric_value
+                )
+                if is_better:
+                    self.best_metric_value = metric_value
+                    torch.save(self.model.state_dict(), os.path.join(self.save_path, 'generative_model_ema.npy'))
+                    torch.save(checkpoint, os.path.join(self.save_path, 'checkpoint_best.pth'))
+            else:
+                print(f"Warning: Metric '{self.best_checkpoint_metric}' not found in metrics. "
+                      "Skipping best-checkpoint update.")
     
     def load_checkpoint(self, checkpoint_path):
         """Load model checkpoint"""
@@ -335,7 +358,11 @@ class DDPOTrainer(BaseTrainer):
         self.actor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         if 'metrics' in checkpoint:
-            self.best_reward = checkpoint['metrics'].get('reward', float('-inf'))
+            metric_value = checkpoint['metrics'].get(self.best_checkpoint_metric)
+            if metric_value is not None:
+                self.best_metric_value = metric_value
+            else:
+                self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
         
         return checkpoint.get('epoch', 0)
 
@@ -412,6 +439,8 @@ class DDPOTrainer(BaseTrainer):
                             "train/molecule_stability": metrics["molecule_stability"],
                             "train/step": global_batch_idx
                         }
+                        if "lr" in metrics:
+                            log_dict["train/lr"] = metrics["lr"]
                         
                         # Add force reward statistics
                         if "force_reward_mean" in metrics:
@@ -457,7 +486,7 @@ class DDPOTrainer(BaseTrainer):
                                         "energy_advantage_mean", "energy_advantage_std",
                                         "advantage_mean", "advantage_std"]:
                                 log_dict[f"train/{k}"] = v
-                        wandb.log(log_dict)
+                        wandb.log(log_dict, step=global_batch_idx)
                     
                     print(metrics)
                 
@@ -473,8 +502,40 @@ class DDPOTrainer(BaseTrainer):
             # Save checkpoint on interruption
             if 'metrics' in locals():
                 self.save_checkpoint(batch_idx, metrics)
-            
+
+        self._export_lr_history()
         return self.model
+    
+    def _export_lr_history(self):
+        """Persist learning rate history and optional plot for visualization."""
+        lr_history = getattr(self.actor, "lr_history", None)
+        if not lr_history:
+            return
+
+        os.makedirs(self.save_path, exist_ok=True)
+        csv_path = os.path.join(self.save_path, "learning_rate.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("step,lr\n")
+            for idx, value in enumerate(lr_history):
+                f.write(f"{idx},{value}\n")
+
+        try:
+            import matplotlib.pyplot as plt  # type: ignore
+
+            plt.figure(figsize=(8, 4))
+            plt.plot(range(len(lr_history)), lr_history, linewidth=2.0)
+            plt.xlabel("Update step")
+            plt.ylabel("Learning rate")
+            plt.title("Learning Rate Schedule")
+            plt.grid(True, alpha=0.3)
+            plot_path = os.path.join(self.save_path, "learning_rate.png")
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=200)
+            plt.close()
+        except ImportError:
+            print("matplotlib not available; skipped saving learning rate plot.")
+        except Exception as exc:
+            print(f"Failed to save learning rate plot: {exc}")
     
     def clean_up(self):
         """Clean up resources"""
