@@ -21,12 +21,10 @@ from verl_diffusion.utils.math import kl_divergence_normal, rmsd
 from edm_source.qm9.analyze import check_stability
 
 from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
-from edm_source.mlff_modules.mlff_utils import (
-    apply_force_clipping,
-    get_mlff_predictor,
-)
+from edm_source.mlff_modules.mlff_utils import get_mlff_predictor
 
 from verl_diffusion.protocol import DataProto, TensorDict
+from .scheduler import RewardScheduler
 
 
 logger = logging.getLogger(__name__)
@@ -250,19 +248,46 @@ class UMAForceReward(BaseReward):
         self.energy_transform_offset = energy_transform_offset
         self.energy_transform_scale = energy_transform_scale
         
+
         # Reward shaping config
+        # Scheduler allows switching between uniform and adaptive sampling of diffusion steps.
         self.shaping_cfg = shaping or {}
         self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
         self.shaping_method = self.shaping_cfg.get("method", "potential")
         self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
         # Compute MLFF only for the last K timesteps to control cost; 0 -> all steps
         self.shaping_horizon = int(self.shaping_cfg.get("horizon", 0))
-        # Skip computing shaped rewards for the first K (noisiest) steps
-        self.shaping_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
+        default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Weight for adding shaped sum to final reward
         self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
         # Always batch across timesteps after skip_prefix to accelerate MLFF
         self.max_atoms_per_call = int(self.shaping_cfg.get("max_atoms_per_call", 200000))
+
+        scheduler_cfg = {}
+        if isinstance(self.shaping_cfg, dict):
+            scheduler_cfg = self.shaping_cfg.get("scheduler", {}) or {}
+        if not isinstance(scheduler_cfg, dict):
+            scheduler_cfg = {}
+
+        scheduler_mode = scheduler_cfg.get("mode", self.shaping_cfg.get("schedule_mode", "uniform"))
+        scheduler_skip = int(scheduler_cfg.get("skip_prefix", default_skip_prefix))
+        uniform_stride = scheduler_cfg.get("uniform_stride", scheduler_cfg.get("stride", self.shaping_cfg.get("stride", 1)))
+        if uniform_stride is None:
+            uniform_stride = 1
+        uniform_stride = int(max(1, uniform_stride))
+        include_terminal = bool(scheduler_cfg.get("include_terminal", True))
+        adaptive_cfg = scheduler_cfg.get("adaptive", self.shaping_cfg.get("adaptive", {})) or {}
+
+        self.reward_scheduler = RewardScheduler(
+            mode=scheduler_mode,
+            skip_prefix=scheduler_skip,
+            uniform_stride=uniform_stride,
+            adaptive_config=adaptive_cfg,
+            include_terminal=include_terminal,
+        )
+        self.shaping_skip_prefix = self.reward_scheduler.skip_prefix
+        self.terminal_reward_weight = max(0.0, float(self.shaping_cfg.get("terminal_weight", 1.5)))
+
 
         if mlff_predictor is not None:
             self.mlff_predictor = mlff_predictor
@@ -367,6 +392,7 @@ class UMAForceReward(BaseReward):
         stability_flags = torch.zeros(batch_size, device=self.device)
         result = {}
 
+
         if shaping_active:
             latents = data.batch["latents"]
             if "timesteps" in data.batch.keys():
@@ -381,65 +407,114 @@ class UMAForceReward(BaseReward):
             F_energy = torch.zeros((B, S), device=self.device) if self.use_energy else None
 
             if self.shaping_horizon and self.shaping_horizon > 0:
-                start_idx = max(0, S - self.shaping_horizon)
+                horizon_start = max(0, S - self.shaping_horizon)
             else:
-                start_idx = 0
-            start_idx = max(start_idx, self.shaping_skip_prefix)
+                horizon_start = 0
 
-            if start_idx < S:
-                S_sel = S - start_idx
-                valid_per_b = node_mask_b[:, :, 0].sum(dim=1)
-                total_atoms_est = int(valid_per_b.sum().item() * S_sel)
-                if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
-                    steps_per_chunk = max(1, int(self.max_atoms_per_call // max(valid_per_b.sum().item(), 1)))
+            if "timesteps" in data.batch.keys():
+                timesteps_schedule = data.batch["timesteps"][0, :S].detach().cpu()
+            else:
+                timesteps_schedule = torch.linspace(float(S - 1), 0.0, steps=S)
+
+            # Select the diffusion steps that will receive MLFF calls and potential shaping.
+            schedule = self.reward_scheduler.build(
+                timesteps=timesteps_schedule,
+                start_idx=horizon_start,
+                end_idx=S - 1,
+            )
+            schedule_indices = schedule.indices.to(latents.device)
+            interval_steps = schedule.intervals.to(latents.device)
+            selected_count = int(schedule_indices.numel())
+
+            if selected_count == 0:
+                schedule_indices = torch.tensor([S - 1], device=latents.device)
+                interval_steps = torch.ones(1, device=latents.device, dtype=torch.long)
+                selected_count = 1
+                print('Warning: Selected count Zero')
+
+            latents_selected = torch.index_select(latents, 1, schedule_indices)
+            valid_per_b = node_mask_b[:, :, 0].sum(dim=1)
+            total_atoms_est = int(valid_per_b.sum().item() * selected_count)
+            if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
+                denom_atoms = max(valid_per_b.sum().item(), 1)
+                steps_per_chunk = max(1, int(self.max_atoms_per_call // denom_atoms))
+            else:
+                steps_per_chunk = selected_count
+
+            cur = 0
+            while cur < selected_count:
+                end_sel = min(selected_count, cur + steps_per_chunk)
+                chunk_len = end_sel - cur
+                chunk_latents = latents_selected[:, cur:end_sel]
+                z_flat = chunk_latents.reshape(-1, N, D)
+                node_mask_flat = node_mask_b.repeat_interleave(chunk_len, dim=0)
+
+                if self.use_energy:
+                    forces_flat, energies_flat = self.force_computer.compute_mlff_forces(
+                        z_flat, node_mask_flat, self.dataset_info
+                    )
                 else:
-                    steps_per_chunk = S_sel
-                cur = 0
-                while cur < S_sel:
-                    end = min(S_sel, cur + steps_per_chunk)
-                    z_flat = latents[:, start_idx+cur:start_idx+end].to(self.device).reshape(-1, N, D)
-                    node_mask_flat = node_mask_b.repeat_interleave(end - cur, dim=0)
+                    forces_flat = self.force_computer.compute_mlff_forces(
+                        z_flat, node_mask_flat, self.dataset_info
+                    )
 
-                    if self.use_energy:
-                        forces_flat, energies_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
-                    else:
-                        forces_flat = self.force_computer.compute_mlff_forces(z_flat, node_mask_flat, self.dataset_info)
+                mask_flat = node_mask_flat[:, :, 0]
+                denom = mask_flat.sum(dim=1).clamp(min=1)
+                sq = (forces_flat.pow(2)).sum(dim=2)
+                rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
+                rms_bt = rms_flat.view(B, -1)
+                target_indices = schedule_indices[cur:end_sel]
+                F_force.index_copy_(1, target_indices, -rms_bt)
 
-                    mask_flat = node_mask_flat[:, :, 0]
-                    denom = mask_flat.sum(dim=1).clamp(min=1)
-                    sq = (forces_flat.pow(2)).sum(dim=2)
-                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
-                    rms_bt = rms_flat.view(B, -1)
-                    F_force[:, start_idx+cur:start_idx+end] = -rms_bt
+                if self.use_energy:
+                    energies_bt = energies_flat.view(B, -1)
+                    transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
+                    F_energy.index_copy_(1, target_indices, -transformed_energies)
+                cur = end_sel
 
-                    if self.use_energy:
-                        energies_bt = energies_flat.view(B, -1)
-                        transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
-                        F_energy[:, start_idx+cur:start_idx+end] = -transformed_energies
-                    cur = end
-
-            # Terminal rewards from final timestep
-            force_rewards = F_force[:, S-1]
+            force_rewards = F_force[:, S - 1]
             if self.use_energy:
-                energy_rewards = F_energy[:, S-1]
+                energy_rewards = F_energy[:, S - 1]
             else:
                 energy_rewards = torch.zeros_like(force_rewards)
 
-            # Shaping via potential differences
             shaped_force = torch.zeros_like(F_force)
-            shaped_energy = torch.zeros_like(F_force) if self.use_energy else torch.zeros_like(F_force)
-            if S > 1:
-                if start_idx < S - 1:
-                    shaped_force[:, start_idx:S-1] = self.shaping_gamma * F_force[:, start_idx+1:S] - F_force[:, start_idx:S-1]
-                    if self.use_energy:
-                        shaped_energy[:, start_idx:S-1] = self.shaping_gamma * F_energy[:, start_idx+1:S] - F_energy[:, start_idx:S-1]
-                if start_idx <= S - 1:
-                    shaped_force[:, S-1] = F_force[:, S-1]
-                    if self.use_energy:
-                        shaped_energy[:, S-1] = F_energy[:, S-1]
+            shaped_energy = torch.zeros_like(F_force)
+            # Vectorized potential-shaping over the scheduled indices, accounting for stride length.
+            selected_count = int(schedule_indices.numel())
+            if selected_count > 0:
+                last_idx = schedule_indices[-1]
+                shaped_force[:, last_idx] = F_force[:, last_idx]
+                if self.use_energy and F_energy is not None:
+                    shaped_energy[:, last_idx] = F_energy[:, last_idx]
 
-            weighted_force_rewards = self.force_weight * force_rewards
-            weighted_energy_rewards = self.energy_weight * energy_rewards
+                if selected_count > 1:
+                    idx_current = schedule_indices[:-1]
+                    idx_next = schedule_indices[1:]
+                    intervals = interval_steps[:-1].clamp(min=1)
+                    intervals_f = intervals.to(F_force.dtype)
+                    gamma_factor = torch.pow(
+                        torch.full_like(intervals_f, self.shaping_gamma),
+                        intervals_f,
+                    )
+
+                    force_current = torch.index_select(F_force, 1, idx_current)
+                    force_next = torch.index_select(F_force, 1, idx_next)
+                    shaped_vals = intervals_f.unsqueeze(0) * (
+                        gamma_factor.unsqueeze(0) * force_next - force_current
+                    )
+                    shaped_force.index_copy_(1, idx_current, shaped_vals)
+
+                    if self.use_energy and F_energy is not None:
+                        energy_current = torch.index_select(F_energy, 1, idx_current)
+                        energy_next = torch.index_select(F_energy, 1, idx_next)
+                        shaped_energy_vals = intervals_f.unsqueeze(0) * (
+                            gamma_factor.unsqueeze(0) * energy_next - energy_current
+                        )
+                        shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
+
+            weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
+            weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
             rewards = weighted_force_rewards + weighted_energy_rewards
 
             weighted_shaped_force = self.force_weight * shaped_force
@@ -450,7 +525,6 @@ class UMAForceReward(BaseReward):
             result["force_rewards_ts"] = shaped_force.detach().cpu()
             if self.use_energy:
                 result["energy_rewards_ts"] = shaped_energy.detach().cpu()
-
             shaped_sum = shaped.sum(dim=1)
             result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
         else:
@@ -480,8 +554,8 @@ class UMAForceReward(BaseReward):
                     transformed_energy = (energy + self.energy_transform_offset) / self.energy_transform_scale
                     energy_rewards[batch_idx] = -transformed_energy
 
-            weighted_force_rewards = self.force_weight * force_rewards
-            weighted_energy_rewards = self.energy_weight * energy_rewards
+            weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
+            weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
             rewards = weighted_force_rewards + weighted_energy_rewards
             result["rewards"] = rewards.detach().cpu()
 
@@ -506,8 +580,8 @@ class UMAForceReward(BaseReward):
         result.setdefault("rewards", rewards.detach().cpu())
         result["force_rewards"] = force_rewards.detach().cpu()
         result["energy_rewards"] = energy_rewards.detach().cpu()
-        result["weighted_force_rewards"] = (self.force_weight * force_rewards).detach().cpu()
-        result["weighted_energy_rewards"] = (self.energy_weight * energy_rewards).detach().cpu()
+        result["weighted_force_rewards"] = weighted_force_rewards.detach().cpu()
+        result["weighted_energy_rewards"] = weighted_energy_rewards.detach().cpu()
         result["stability"] = stability_flags.cpu()
 
         print("Rewards calculated via UMAForceReward")
