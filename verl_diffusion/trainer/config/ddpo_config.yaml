@@ -32,6 +32,10 @@ train:
   adam_epsilon: 0.00000001
   clip_range: 0.15
   train_micro_batch_size: 512
+  force_alignment_enabled: true
+  force_alignment_weight: 0.5
+  force_alignment_min_force: 0.0001
+  force_alignment_min_delta: 0.0001
   scheduler:
     name: cosine
     warmup_steps: 10
