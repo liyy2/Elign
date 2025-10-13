@@ -106,9 +106,6 @@ Thumbs.db
 outputs/
 checkpoints/
 models/
-*.npy
-*.pickle
-*.pkl
 
 # Data directories
 
