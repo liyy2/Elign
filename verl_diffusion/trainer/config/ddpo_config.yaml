@@ -46,7 +46,7 @@ train:
 
 reward:
   type: uma
-  mlff_model: uma-m-1p1
+  mlff_model: uma-s-1p1
   force_clip_threshold: null
   use_energy: true
   force_weight: 1.0

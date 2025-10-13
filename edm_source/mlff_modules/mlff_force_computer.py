@@ -4,12 +4,15 @@ Handles force computation using MLFF predictors for molecular configurations.
 ONLY computes forces - no logging or statistics.
 """
 
+import logging
 import torch
 import numpy as np
 from typing import Dict, List
 from ase import Atoms
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets import data_list_collater
+
+logger = logging.getLogger(__name__)
 
 
 class MLFFForceComputer:
@@ -162,8 +165,9 @@ class MLFFForceComputer:
         try:
             batch = data_list_collater(atomic_data_list, otf_graph=True)
             batch = batch.to(self.device)
-        except Exception:
-            return (forces, energies) if self.compute_energy else forces
+        except Exception as exc:
+            logger.exception("MLFFForceComputer: failed to collate atomic data for MLFF inference: %s", exc)
+            raise
         
         # Compute forces (and energy) using MLFF
         try:
@@ -206,6 +210,6 @@ class MLFFForceComputer:
             
             return (forces, energies) if self.compute_energy else forces
             
-        except Exception:
-            # Return zero forces (and energies) on error
-            return (forces, energies) if self.compute_energy else forces
+        except Exception as exc:
+            logger.exception("MLFFForceComputer: MLFF predictor execution failed: %s", exc)
+            raise
