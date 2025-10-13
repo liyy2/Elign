@@ -260,8 +260,8 @@ class UMAForceReward(BaseReward):
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Weight for adding shaped sum to final reward
         self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
-        # Always batch across timesteps after skip_prefix to accelerate MLFF
-        self.max_atoms_per_call = int(self.shaping_cfg.get("max_atoms_per_call", 200000))
+        # Control number of diffusion steps per MLFF evaluation batch (0 => no chunking)
+        self.mlff_batch_size = int(self.shaping_cfg.get("mlff_batch_size", 0) or 32)
 
         scheduler_cfg = {}
         if isinstance(self.shaping_cfg, dict):
@@ -442,11 +442,8 @@ class UMAForceReward(BaseReward):
             if alignment_active and fine_mask_selected is not None:
                 fine_mask_selected = fine_mask_selected.float()
             latents_selected = torch.index_select(latents, 1, schedule_indices)
-            valid_per_b = node_mask_b[:, :, 0].sum(dim=1)
-            total_atoms_est = int(valid_per_b.sum().item() * selected_count)
-            if self.max_atoms_per_call > 0 and total_atoms_est > self.max_atoms_per_call:
-                denom_atoms = max(valid_per_b.sum().item(), 1)
-                steps_per_chunk = max(1, int(self.max_atoms_per_call // denom_atoms))
+            if self.mlff_batch_size > 0:
+                steps_per_chunk = max(1, min(self.mlff_batch_size, selected_count))
             else:
                 steps_per_chunk = selected_count
 
@@ -457,38 +454,53 @@ class UMAForceReward(BaseReward):
             else:
                 force_vectors_selected = None
             cur = 0
-            while cur < selected_count:
-                end_sel = min(selected_count, cur + steps_per_chunk)
-                chunk_len = end_sel - cur
-                chunk_latents = latents_selected[:, cur:end_sel]
-                z_flat = chunk_latents.reshape(-1, N, D)
-                node_mask_flat = node_mask_b.repeat_interleave(chunk_len, dim=0)
+            progress_bar = tq(
+                total=selected_count,
+                desc="UMAForce MLFF",
+                leave=False,
+                disable=selected_count <= 1,
+                dynamic_ncols=True,
+                smoothing=0,
+            )
+            try:
+                while cur < selected_count:
+                    end_sel = min(selected_count, cur + steps_per_chunk)
+                    chunk_len = end_sel - cur
+                    chunk_latents = latents_selected[:, cur:end_sel]
+                    z_flat = chunk_latents.reshape(-1, N, D)
+                    node_mask_flat = node_mask_b.repeat_interleave(chunk_len, dim=0)
 
-                if self.use_energy:
-                    forces_flat, energies_flat = self.force_computer.compute_mlff_forces(
-                        z_flat, node_mask_flat, self.dataset_info
-                    )
-                else:
-                    forces_flat = self.force_computer.compute_mlff_forces(
-                        z_flat, node_mask_flat, self.dataset_info
-                    )
+                    if self.use_energy:
+                        forces_flat, energies_flat = self.force_computer.compute_mlff_forces(
+                            z_flat, node_mask_flat, self.dataset_info
+                        )
+                    else:
+                        forces_flat = self.force_computer.compute_mlff_forces(
+                            z_flat, node_mask_flat, self.dataset_info
+                        )
 
-                mask_flat = node_mask_flat[:, :, 0]
-                denom = mask_flat.sum(dim=1).clamp(min=1)
-                sq = (forces_flat.pow(2)).sum(dim=2)
-                rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
-                rms_bt = rms_flat.view(B, -1)
-                if alignment_active and force_vectors_selected is not None:
-                    forces_bt = forces_flat.view(B, chunk_len, N, 3)
-                    force_vectors_selected[:, cur:end_sel] = forces_bt
-                target_indices = schedule_indices[cur:end_sel]
-                F_force.index_copy_(1, target_indices, -rms_bt)
+                    mask_flat = node_mask_flat[:, :, 0]
+                    denom = mask_flat.sum(dim=1).clamp(min=1)
+                    sq = (forces_flat.pow(2)).sum(dim=2)
+                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
+                    rms_bt = rms_flat.view(B, -1)
+                    if alignment_active and force_vectors_selected is not None:
+                        forces_bt = forces_flat.view(B, chunk_len, N, 3)
+                        force_vectors_selected[:, cur:end_sel] = forces_bt
+                    target_indices = schedule_indices[cur:end_sel]
+                    F_force.index_copy_(1, target_indices, -rms_bt)
 
-                if self.use_energy:
-                    energies_bt = energies_flat.view(B, -1)
-                    transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
-                    F_energy.index_copy_(1, target_indices, -transformed_energies)
-                cur = end_sel
+                    if self.use_energy:
+                        energies_bt = energies_flat.view(B, -1)
+                        transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
+                        F_energy.index_copy_(1, target_indices, -transformed_energies)
+                    cur = end_sel
+                    if progress_bar is not None:
+                        progress_bar.update(chunk_len)
+                        progress_bar.refresh()
+            finally:
+                if progress_bar is not None:
+                    progress_bar.close()
 
             force_rewards = F_force[:, S - 1]
             if self.use_energy:
@@ -568,7 +580,13 @@ class UMAForceReward(BaseReward):
                 forces = torch.zeros_like(z[:, :, :3], device=self.device)
                 energies = torch.zeros(z.shape[0], device=self.device)
 
-            for batch_idx in range(batch_size):
+            for batch_idx in tq(
+                range(batch_size),
+                desc="UMAForce terminal reward",
+                leave=False,
+                disable=batch_size <= 1,
+                dynamic_ncols=True,
+            ):
                 valid_mask = node_mask[batch_idx, :, 0] > 0
                 if not torch.any(valid_mask):
                     continue
@@ -589,7 +607,13 @@ class UMAForceReward(BaseReward):
             result["rewards"] = rewards.detach().cpu()
 
         # Compute stability flags once
-        for batch_idx in range(batch_size):
+        for batch_idx in tq(
+            range(batch_size),
+            desc="UMAForce stability",
+            leave=False,
+            disable=batch_size <= 1,
+            dynamic_ncols=True,
+        ):
             valid_mask = node_mask[batch_idx, :, 0] > 0
             if not torch.any(valid_mask):
                 continue

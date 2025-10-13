@@ -55,6 +55,36 @@
             "env": {
                 "CUDA_VISIBLE_DEVICES": "0"
             }
+        },
+        {
+            "name": "Python: run_verl_diffusion.py (debug friendly)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "run_verl_diffusion.py",
+            "args": [
+                "dataloader.sample_group_size=1",
+                "dataloader.each_prompt_sample=8",
+                "dataloader.micro_batch_size=16",
+                "dataloader.epoches=2",
+                "train.train_micro_batch_size=16",
+                "train.force_alignment_enabled=true",
+                "reward.shaping.enabled=true",
+                "reward.use_energy=true",
+                "wandb.enabled=false",
+                "model.time_step=100",
+                "wandb.wandb_name=test",
+                "reward.shaping.scheduler.skip_prefix=50"
+
+            ],
+            "console": "integratedTerminal",
+            "cwd": "/home/yl2428/scratch_pi_mg269/yl2428/e3_diffusion_for_molecules-main",
+            "env": {
+                "WANDB_MODE": "offline",
+                "CUDA_VISIBLE_DEVICES": "0",
+                "OMP_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1",
+                "RAY_NUM_CPUS": "1"
+            }
         }
     ]
 }

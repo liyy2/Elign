@@ -39,14 +39,14 @@ train:
   scheduler:
     name: cosine
     warmup_steps: 10
-    total_steps: null
+    total_steps: 500
     min_lr_ratio: 0.1
     num_cycles: 0.5
     stable_ratio: 0.9
 
 reward:
   type: uma
-  mlff_model: uma-s-1p1
+  mlff_model: uma-m-1p1
   force_clip_threshold: null
   use_energy: true
   force_weight: 1.0
@@ -59,7 +59,7 @@ reward:
     gamma: 1.0
     horizon: 200
     weight: 1.0
-    max_atoms_per_call: 200000
+    mlff_batch_size: 64
     terminal_weight: 5
     scheduler:
       mode: adaptive

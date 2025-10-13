@@ -388,6 +388,7 @@ class DDPOTrainer(BaseTrainer):
                     samples, filter_ratio, novelty_penalty_ratio = self.filters.filter(samples)
                     samples = self.compute_advantage(samples)
                     metrics = self.actor.update_policy(samples)
+                    metrics["epoch"] = epoch + 1
                     metrics["reward"] = samples.batch["rewards"].mean().item()
                     metrics["filter_ratio"] = filter_ratio
                     metrics["novelty_penalty_ratio"] = novelty_penalty_ratio
@@ -437,8 +438,13 @@ class DDPOTrainer(BaseTrainer):
                             "train/filter_ratio": metrics["filter_ratio"],
                             "train/novelty_penalty_ratio": metrics["novelty_penalty_ratio"],
                             "train/molecule_stability": metrics["molecule_stability"],
+                            "train/epoch": metrics["epoch"],
                             "train/step": global_batch_idx
                         }
+                        if "ForceAlignPenalty" in metrics:
+                            log_dict["train/force_alignment_penalty"] = metrics["ForceAlignPenalty"]
+                        if "ForceAlignCosine" in metrics:
+                            log_dict["train/force_alignment_cosine"] = metrics["ForceAlignCosine"]
                         if "lr" in metrics:
                             log_dict["train/lr"] = metrics["lr"]
                         

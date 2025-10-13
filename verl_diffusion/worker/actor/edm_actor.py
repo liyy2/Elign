@@ -166,7 +166,7 @@ class EDMActor(BaseActor):
                             if force_fine_mask is not None:
                                 fine_mask_step = (force_fine_mask * force_mask_f).sum(dim=1)
 
-                loss, clipfrac, align_penalty = self.calculate_loss(
+                loss, clipfrac, align_penalty, align_cosine = self.calculate_loss(
                         sample["latents"][:, j],
                         sample["timesteps"][:, j],
                         sample["next_latents"][:, j],
@@ -182,6 +182,8 @@ class EDMActor(BaseActor):
                 info["loss"].append(loss.item())
                 if align_penalty is not None:
                     info["force_alignment_penalty"].append(align_penalty.detach().cpu().item())
+                if align_cosine is not None:
+                    info["force_alignment_cosine"].append(align_cosine.detach().cpu().item())
                 loss.backward()
                 clip_grad_norm_(self.model.parameters(),max_norm=1)
 
@@ -199,7 +201,8 @@ class EDMActor(BaseActor):
         metric["lr"] = current_lr
         if info["force_alignment_penalty"]:
             metric["ForceAlignPenalty"] = np.mean(np.array(info["force_alignment_penalty"]))
-
+        if info["force_alignment_cosine"]:
+            metric["ForceAlignCosine"] = np.mean(np.array(info["force_alignment_cosine"]))
         return metric
     
     def calculate_loss(
@@ -268,27 +271,30 @@ class EDMActor(BaseActor):
         clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.clip_range).float())
 
         alignment_penalty = None
+        alignment_cosine = None
         if not (self.force_alignment_enabled and self.force_alignment_weight > 0):
-            return loss, clipfrac, None
+            return loss, clipfrac, None, None
         if mu_old is None or force_vectors is None or fine_stage_mask is None:
-            return loss, clipfrac, None
+            return loss, clipfrac, None, None
         if torch.is_tensor(fine_stage_mask) and torch.all(fine_stage_mask == 0):
-            return loss, clipfrac, None
+            return loss, clipfrac, None, None
 
         mu_old = mu_old.to(latents.device)
         force_vectors = force_vectors.to(latents.device)
         fine_stage_mask = fine_stage_mask.to(latents.device)
-        alignment_penalty = self._compute_force_alignment_penalty(
+        alignment_metrics = self._compute_force_alignment_penalty(
             mu_old=mu_old,
             mu_new=mu_current,
             force_vectors=force_vectors,
             node_mask=node_mask,
             fine_stage_mask=fine_stage_mask,
         )
+        if alignment_metrics is not None:
+            alignment_penalty, alignment_cosine = alignment_metrics
         if alignment_penalty is not None:
             loss = loss + alignment_penalty
 
-        return loss, clipfrac, alignment_penalty
+        return loss, clipfrac, alignment_penalty, alignment_cosine
 
     def _compute_force_alignment_penalty(self, mu_old, mu_new, force_vectors, node_mask, fine_stage_mask):
         """
@@ -328,7 +334,8 @@ class EDMActor(BaseActor):
         alignment_error = (1.0 - cosine) * weighted_area
         penalty_scalar = alignment_error.sum() / (weighted_area.sum() + self._force_alignment_eps)
         penalty = self.force_alignment_weight * penalty_scalar
-        return penalty
+        mean_cosine = (cosine * weighted_area).sum() / (weighted_area.sum() + self._force_alignment_eps)
+        return penalty, mean_cosine
     
     def loss(
         self,

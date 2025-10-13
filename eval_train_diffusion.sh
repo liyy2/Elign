@@ -22,4 +22,4 @@ python -m torch.distributed.launch --nproc_per_node=1 eval_mlff_guided.py \
     --use_wandb --guidance_scales 0.2 0.15 0.1\
     --skip_visualization --skip_analysis --skip_chain \
     --noise_threshold 0.5 \
-    --force_clip_threshold 10 --sampling_method dpm_solver++ --dpm_solver_order 3 --dpm_solver_steps 100 --batch_size 300 --compare_energy_at_end
+    --force_clip_threshold 10 --sampling_method ddpm --dpm_solver_order 3 --dpm_solver_steps 10000 --batch_size 300 --compare_energy_at_end --debug_baseline
