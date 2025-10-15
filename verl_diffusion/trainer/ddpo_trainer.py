@@ -57,10 +57,16 @@ class DDPOTrainer(BaseTrainer):
         self.filters = filters
         self.actor = actor
         self.best_checkpoint_metric = config.get("best_checkpoint_metric", "reward")
-        self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
-        if self.best_checkpoint_mode not in {"max", "min"}:
-            raise ValueError(f"Unsupported best_checkpoint_mode '{self.best_checkpoint_mode}'. Use 'max' or 'min'.")
-        self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
+       self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
+       if self.best_checkpoint_mode not in {"max", "min"}:
+           raise ValueError(f"Unsupported best_checkpoint_mode '{self.best_checkpoint_mode}'. Use 'max' or 'min'.")
+       self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
+
+        reward_cfg = self.config.get("reward", {})
+        if not isinstance(reward_cfg, dict):
+            reward_cfg = {}
+        self.force_adv_weight = float(reward_cfg.get("force_adv_weight", reward_cfg.get("force_weight", 1.0)))
+        self.energy_adv_weight = float(reward_cfg.get("energy_adv_weight", reward_cfg.get("energy_weight", 1.0)))
 
         # Initialize learning rate scheduler if configured
         scheduler_cfg = (self.config.get("train") or {}).get("scheduler")
@@ -200,11 +206,13 @@ class DDPOTrainer(BaseTrainer):
             
             return []
     def compute_advantage(self, samples):
-        group_index = samples.batch["group_index"]
-        clip_value = self.config["train"].get("clip_advantage_value", 5.0)
+       group_index = samples.batch["group_index"]
+       clip_value = self.config["train"].get("clip_advantage_value", 5.0)
+        force_adv_weight = getattr(self, "force_adv_weight", 1.0)
+        energy_adv_weight = getattr(self, "energy_adv_weight", 1.0)
 
-        # Per-timestep rewards available (reward shaping)
-        if "rewards_ts" in samples.batch.keys():
+       # Per-timestep rewards available (reward shaping)
+       if "rewards_ts" in samples.batch.keys():
             rewards_ts = samples.batch["rewards_ts"].to(group_index.device)  # [B, S]
             unique_groups = torch.unique(group_index)
             advantages_ts = torch.zeros_like(rewards_ts)
@@ -232,13 +240,15 @@ class DDPOTrainer(BaseTrainer):
                         mean_energy = grp_energy.mean(dim=0, keepdim=True)  # [1, S]
                         std_energy = grp_energy.std(dim=0, keepdim=True)
                         energy_advantages_ts[gmask] = (grp_energy - mean_energy) / (std_energy + 1e-8)
-                
+
                 # Combine normalized force and energy advantages
-                advantages_ts = force_advantages_ts + energy_advantages_ts
-                
+                weighted_force_advantages_ts = force_adv_weight * force_advantages_ts
+                weighted_energy_advantages_ts = energy_adv_weight * energy_advantages_ts
+                advantages_ts = weighted_force_advantages_ts + weighted_energy_advantages_ts
+
                 # Store separate advantages for logging/analysis if needed
-                samples.batch["force_advantages_ts"] = torch.clamp(force_advantages_ts, -clip_value, clip_value)
-                samples.batch["energy_advantages_ts"] = torch.clamp(energy_advantages_ts, -clip_value, clip_value)
+                samples.batch["force_advantages_ts"] = torch.clamp(weighted_force_advantages_ts, -clip_value, clip_value)
+                samples.batch["energy_advantages_ts"] = torch.clamp(weighted_energy_advantages_ts, -clip_value, clip_value)
             else:
                 # Standard normalization for combined rewards
                 for group_id in unique_groups:
@@ -286,13 +296,15 @@ class DDPOTrainer(BaseTrainer):
                     energy_mean = group_energy.mean()
                     energy_std = group_energy.std()
                     energy_advantages[group_mask] = (group_energy - energy_mean) / (energy_std + 1e-8)
-            
+
             # Combine normalized advantages
-            normalized_rewards = force_advantages + energy_advantages
-            
+            weighted_force_advantages = force_adv_weight * force_advantages
+            weighted_energy_advantages = energy_adv_weight * energy_advantages
+            normalized_rewards = weighted_force_advantages + weighted_energy_advantages
+
             # Store separate advantages for logging/analysis
-            samples.batch["force_advantages"] = torch.clamp(force_advantages, -clip_value, clip_value)
-            samples.batch["energy_advantages"] = torch.clamp(energy_advantages, -clip_value, clip_value)
+            samples.batch["force_advantages"] = torch.clamp(weighted_force_advantages, -clip_value, clip_value)
+            samples.batch["energy_advantages"] = torch.clamp(weighted_energy_advantages, -clip_value, clip_value)
         else:
             # Standard normalization
             for group_id in unique_groups:
