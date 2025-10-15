@@ -57,10 +57,10 @@ class DDPOTrainer(BaseTrainer):
         self.filters = filters
         self.actor = actor
         self.best_checkpoint_metric = config.get("best_checkpoint_metric", "reward")
-       self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
-       if self.best_checkpoint_mode not in {"max", "min"}:
-           raise ValueError(f"Unsupported best_checkpoint_mode '{self.best_checkpoint_mode}'. Use 'max' or 'min'.")
-       self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
+        self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
+        if self.best_checkpoint_mode not in {"max", "min"}:
+            raise ValueError(f"Unsupported best_checkpoint_mode '{self.best_checkpoint_mode}'. Use 'max' or 'min'.")
+        self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
 
         reward_cfg = self.config.get("reward", {})
         if not isinstance(reward_cfg, dict):
@@ -206,35 +206,38 @@ class DDPOTrainer(BaseTrainer):
             
             return []
     def compute_advantage(self, samples):
-       group_index = samples.batch["group_index"]
-       clip_value = self.config["train"].get("clip_advantage_value", 5.0)
+        group_index = samples.batch["group_index"]
+        clip_value = self.config["train"].get(
+            "clip_advantage_value",
+            self.config["train"].get("adv_clip_max", 5.0),
+        )
         force_adv_weight = getattr(self, "force_adv_weight", 1.0)
         energy_adv_weight = getattr(self, "energy_adv_weight", 1.0)
 
-       # Per-timestep rewards available (reward shaping)
-       if "rewards_ts" in samples.batch.keys():
+        # Per-timestep rewards available (reward shaping)
+        if "rewards_ts" in samples.batch.keys():
             rewards_ts = samples.batch["rewards_ts"].to(group_index.device)  # [B, S]
             unique_groups = torch.unique(group_index)
             advantages_ts = torch.zeros_like(rewards_ts)
-            
+
             # Check if we have separate force and energy rewards for GRPO
             if "force_rewards_ts" in samples.batch.keys() and "energy_rewards_ts" in samples.batch.keys():
                 force_rewards_ts = samples.batch["force_rewards_ts"].to(group_index.device)  # [B, S]
                 energy_rewards_ts = samples.batch["energy_rewards_ts"].to(group_index.device)  # [B, S]
-                
+
                 force_advantages_ts = torch.zeros_like(force_rewards_ts)
                 energy_advantages_ts = torch.zeros_like(energy_rewards_ts)
-                
+
                 # Normalize force and energy separately within each group (GRPO)
                 for group_id in unique_groups:
-                    gmask = (group_index == group_id)
+                    gmask = group_index == group_id
                     if gmask.any():
                         # Normalize force rewards
                         grp_force = force_rewards_ts[gmask]  # [B_g, S]
                         mean_force = grp_force.mean(dim=0, keepdim=True)  # [1, S]
                         std_force = grp_force.std(dim=0, keepdim=True)
                         force_advantages_ts[gmask] = (grp_force - mean_force) / (std_force + 1e-8)
-                        
+
                         # Normalize energy rewards
                         grp_energy = energy_rewards_ts[gmask]  # [B_g, S]
                         mean_energy = grp_energy.mean(dim=0, keepdim=True)  # [1, S]
@@ -247,12 +250,16 @@ class DDPOTrainer(BaseTrainer):
                 advantages_ts = weighted_force_advantages_ts + weighted_energy_advantages_ts
 
                 # Store separate advantages for logging/analysis if needed
-                samples.batch["force_advantages_ts"] = torch.clamp(weighted_force_advantages_ts, -clip_value, clip_value)
-                samples.batch["energy_advantages_ts"] = torch.clamp(weighted_energy_advantages_ts, -clip_value, clip_value)
+                samples.batch["force_advantages_ts"] = torch.clamp(
+                    weighted_force_advantages_ts, -clip_value, clip_value
+                )
+                samples.batch["energy_advantages_ts"] = torch.clamp(
+                    weighted_energy_advantages_ts, -clip_value, clip_value
+                )
             else:
                 # Standard normalization for combined rewards
                 for group_id in unique_groups:
-                    gmask = (group_index == group_id)
+                    gmask = group_index == group_id
                     if gmask.any():
                         grp = rewards_ts[gmask]  # [B_g, S]
                         mean = grp.mean(dim=0, keepdim=True)  # [1, S]
@@ -272,25 +279,25 @@ class DDPOTrainer(BaseTrainer):
         rewards = samples.batch["rewards"]
         unique_groups = torch.unique(group_index)
         normalized_rewards = torch.zeros_like(rewards)
-        
+
         # Check if we have separate force and energy rewards for scalar case
         if "force_rewards" in samples.batch.keys() and "energy_rewards" in samples.batch.keys():
             force_rewards = samples.batch["force_rewards"].to(group_index.device)
             energy_rewards = samples.batch["energy_rewards"].to(group_index.device)
-            
+
             force_advantages = torch.zeros_like(force_rewards)
             energy_advantages = torch.zeros_like(energy_rewards)
-            
+
             # Normalize force and energy separately within each group (GRPO)
             for group_id in unique_groups:
-                group_mask = (group_index == group_id)
+                group_mask = group_index == group_id
                 if group_mask.any():
                     # Normalize force rewards
                     group_force = force_rewards[group_mask]
                     force_mean = group_force.mean()
                     force_std = group_force.std()
                     force_advantages[group_mask] = (group_force - force_mean) / (force_std + 1e-8)
-                    
+
                     # Normalize energy rewards
                     group_energy = energy_rewards[group_mask]
                     energy_mean = group_energy.mean()
@@ -308,7 +315,7 @@ class DDPOTrainer(BaseTrainer):
         else:
             # Standard normalization
             for group_id in unique_groups:
-                group_mask = (group_index == group_id)
+                group_mask = group_index == group_id
                 group_rewards = rewards[group_mask]
                 group_mean = group_rewards.mean()
                 group_std = group_rewards.std()
