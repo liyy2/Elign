@@ -39,8 +39,8 @@ train:
   scheduler:
     name: cosine
     warmup_steps: 10
-    total_steps: 200
-    min_lr_ratio: 0.1
+    total_steps: 150
+    min_lr_ratio: 0.05
     num_cycles: 0.5
     stable_ratio: 0.9
 
@@ -61,7 +61,7 @@ reward:
     gamma: 1.0
     horizon: 200
     weight: 1.0
-    mlff_batch_size: 8
+    mlff_batch_size: 4
     terminal_weight: 5
     scheduler:
       mode: adaptive

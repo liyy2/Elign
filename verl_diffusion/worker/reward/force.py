@@ -441,34 +441,39 @@ class UMAForceReward(BaseReward):
 
             if alignment_active and fine_mask_selected is not None:
                 fine_mask_selected = fine_mask_selected.float()
-            latents_selected = torch.index_select(latents, 1, schedule_indices)
+            latents_selected = torch.index_select(latents, 1, schedule_indices).contiguous()
+            flat_total = B * selected_count
             if self.mlff_batch_size > 0:
-                steps_per_chunk = max(1, min(self.mlff_batch_size, selected_count))
+                chunk_size = max(1, min(self.mlff_batch_size, flat_total))
             else:
-                steps_per_chunk = selected_count
+                chunk_size = flat_total
 
+            latents_flat = latents_selected.view(flat_total, N, D)
+            node_mask_flat_all = node_mask_b.repeat_interleave(selected_count, dim=0)
+
+            flat_rms = torch.zeros(flat_total, device=latents.device)
+            flat_energy = torch.zeros(flat_total, device=latents.device) if self.use_energy else None
             if alignment_active:
-                force_vectors_selected = torch.zeros(
-                    (B, selected_count, N, 3), device=latents.device, dtype=latents.dtype
+                force_vectors_flat = torch.zeros(
+                    (flat_total, N, 3), device=latents.device, dtype=latents.dtype
                 )
             else:
-                force_vectors_selected = None
+                force_vectors_flat = None
+
             cur = 0
             progress_bar = tq(
-                total=selected_count,
+                total=flat_total,
                 desc="UMAForce MLFF",
                 leave=False,
-                disable=selected_count <= 1,
+                disable=flat_total <= 1,
                 dynamic_ncols=True,
                 smoothing=0,
             )
             try:
-                while cur < selected_count:
-                    end_sel = min(selected_count, cur + steps_per_chunk)
-                    chunk_len = end_sel - cur
-                    chunk_latents = latents_selected[:, cur:end_sel]
-                    z_flat = chunk_latents.reshape(-1, N, D)
-                    node_mask_flat = node_mask_b.repeat_interleave(chunk_len, dim=0)
+                while cur < flat_total:
+                    end_flat = min(flat_total, cur + chunk_size)
+                    z_flat = latents_flat[cur:end_flat]
+                    node_mask_flat = node_mask_flat_all[cur:end_flat]
 
                     if self.use_energy:
                         forces_flat, energies_flat = self.force_computer.compute_mlff_forces(
@@ -483,24 +488,35 @@ class UMAForceReward(BaseReward):
                     denom = mask_flat.sum(dim=1).clamp(min=1)
                     sq = (forces_flat.pow(2)).sum(dim=2)
                     rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
-                    rms_bt = rms_flat.view(B, -1)
-                    if alignment_active and force_vectors_selected is not None:
-                        forces_bt = forces_flat.view(B, chunk_len, N, 3)
-                        force_vectors_selected[:, cur:end_sel] = forces_bt
-                    target_indices = schedule_indices[cur:end_sel]
-                    F_force.index_copy_(1, target_indices, -rms_bt)
+                    flat_rms[cur:end_flat] = rms_flat
 
-                    if self.use_energy:
-                        energies_bt = energies_flat.view(B, -1)
-                        transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
-                        F_energy.index_copy_(1, target_indices, -transformed_energies)
-                    cur = end_sel
+                    if alignment_active and force_vectors_flat is not None:
+                        force_vectors_flat[cur:end_flat] = forces_flat
+
+                    if self.use_energy and flat_energy is not None:
+                        flat_energy[cur:end_flat] = energies_flat.view(-1)
+
+                    processed_count = end_flat - cur
+                    cur = end_flat
                     if progress_bar is not None:
-                        progress_bar.update(chunk_len)
+                        progress_bar.update(processed_count)
                         progress_bar.refresh()
             finally:
                 if progress_bar is not None:
                     progress_bar.close()
+
+            rms_bt = flat_rms.view(B, selected_count)
+            F_force.index_copy_(1, schedule_indices, -rms_bt)
+
+            if self.use_energy and flat_energy is not None:
+                energies_bt = flat_energy.view(B, selected_count)
+                transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
+                F_energy.index_copy_(1, schedule_indices, -transformed_energies)
+
+            if alignment_active and force_vectors_flat is not None:
+                force_vectors_selected = force_vectors_flat.view(B, selected_count, N, 3)
+            else:
+                force_vectors_selected = None
 
             force_rewards = F_force[:, S - 1]
             if self.use_energy:
