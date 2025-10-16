@@ -220,6 +220,7 @@ class UMAForceReward(BaseReward):
         use_energy: bool = False,
         force_weight: float = 1.0,
         energy_weight: float = 1.0,
+        force_aggregation: str = "rms",
         energy_transform_offset: float = 10000.0,
         energy_transform_scale: float = 1000.0,
     ):
@@ -245,6 +246,10 @@ class UMAForceReward(BaseReward):
         self.use_energy = use_energy
         self.force_weight = force_weight
         self.energy_weight = energy_weight
+        force_aggregation = (force_aggregation or "rms").lower()
+        if force_aggregation not in {"rms", "max"}:
+            raise ValueError(f"Unsupported force aggregation '{force_aggregation}'. Use 'rms' or 'max'.")
+        self.force_aggregation = force_aggregation
         self.energy_transform_offset = energy_transform_offset
         self.energy_transform_scale = energy_transform_scale
         
@@ -375,6 +380,34 @@ class UMAForceReward(BaseReward):
 
         return processed
 
+    def _aggregate_force_metric(self, forces: torch.Tensor, node_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Reduce per-atom force vectors to a single scalar per sample according to the configured aggregation.
+        """
+        if forces.dim() == 2:
+            forces = forces.unsqueeze(0)
+        if node_mask.dim() == 1:
+            node_mask = node_mask.unsqueeze(0)
+        if node_mask.dim() == 3:
+            mask = node_mask[..., 0] > 0.5
+        else:
+            mask = node_mask > 0.5
+
+        force_norms = torch.norm(forces, dim=-1)
+        mask_float = mask.float()
+        valid_counts = mask_float.sum(dim=-1)
+
+        if self.force_aggregation == "rms":
+            denom = valid_counts.clamp(min=1.0)
+            squared = (force_norms.pow(2) * mask_float)
+            aggregated = torch.sqrt(squared.sum(dim=-1) / denom)
+        else:  # self.force_aggregation == "max"
+            masked_norms = force_norms * mask_float
+            aggregated = masked_norms.max(dim=-1).values
+
+        aggregated = torch.where(valid_counts > 0, aggregated, torch.zeros_like(aggregated))
+        return aggregated.view(forces.shape[0])
+
     def calculate_rewards(self, data: DataProto) -> DataProto:
         processed = self.process_data(data)
 
@@ -451,7 +484,7 @@ class UMAForceReward(BaseReward):
             latents_flat = latents_selected.view(flat_total, N, D)
             node_mask_flat_all = node_mask_b.repeat_interleave(selected_count, dim=0)
 
-            flat_rms = torch.zeros(flat_total, device=latents.device)
+            flat_force_metric = torch.zeros(flat_total, device=latents.device)
             flat_energy = torch.zeros(flat_total, device=latents.device) if self.use_energy else None
             if alignment_active:
                 force_vectors_flat = torch.zeros(
@@ -484,11 +517,8 @@ class UMAForceReward(BaseReward):
                             z_flat, node_mask_flat, self.dataset_info
                         )
 
-                    mask_flat = node_mask_flat[:, :, 0]
-                    denom = mask_flat.sum(dim=1).clamp(min=1)
-                    sq = (forces_flat.pow(2)).sum(dim=2)
-                    rms_flat = torch.sqrt((sq * mask_flat).sum(dim=1) / denom)
-                    flat_rms[cur:end_flat] = rms_flat
+                    metrics_flat = self._aggregate_force_metric(forces_flat, node_mask_flat)
+                    flat_force_metric[cur:end_flat] = metrics_flat
 
                     if alignment_active and force_vectors_flat is not None:
                         force_vectors_flat[cur:end_flat] = forces_flat
@@ -505,8 +535,8 @@ class UMAForceReward(BaseReward):
                 if progress_bar is not None:
                     progress_bar.close()
 
-            rms_bt = flat_rms.view(B, selected_count)
-            F_force.index_copy_(1, schedule_indices, -rms_bt)
+            force_metric_bt = flat_force_metric.view(B, selected_count)
+            F_force.index_copy_(1, schedule_indices, -force_metric_bt)
 
             if self.use_energy and flat_energy is not None:
                 energies_bt = flat_energy.view(B, selected_count)
@@ -606,12 +636,11 @@ class UMAForceReward(BaseReward):
                 valid_mask = node_mask[batch_idx, :, 0] > 0
                 if not torch.any(valid_mask):
                     continue
-                sample_forces = forces[batch_idx][valid_mask]
-                if sample_forces.numel() == 0:
-                    rms_force = torch.tensor(0.0, device=self.device)
-                else:
-                    rms_force = torch.sqrt(torch.mean(sample_forces.pow(2)))
-                force_rewards[batch_idx] = -rms_force
+                aggregated_force = self._aggregate_force_metric(
+                    forces[batch_idx : batch_idx + 1],
+                    node_mask[batch_idx : batch_idx + 1],
+                ).squeeze(0)
+                force_rewards[batch_idx] = -aggregated_force
                 if self.use_energy:
                     energy = energies[batch_idx]
                     transformed_energy = (energy + self.energy_transform_offset) / self.energy_transform_scale

@@ -13,7 +13,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
 
-sys.path.append("/nfs/roberts/project/pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
+sys.path.append("/home/yl2428/scratch_pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
 
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
@@ -26,8 +26,7 @@ from verl_diffusion.worker.filter.filter import Filter
 from verl_diffusion.worker.reward.force import UMAForceReward
 from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
 
-os.environ["WANDB_MODE"] = "online"
-os.environ["WANDB_API_KEY"] = "6f1080f993d5d7ad6103e69ef57dd9291f1bf366"
+os.environ.setdefault("WANDB_MODE", "online")
 
 
 def _make_absolute(path_value: Optional[str]) -> Optional[str]:
@@ -119,6 +118,7 @@ def main(cfg: DictConfig) -> None:
         use_energy=reward_cfg.get("use_energy", False),
         force_weight=reward_cfg.get("force_weight", 1.0),
         energy_weight=reward_cfg.get("energy_weight", 1.0),
+        force_aggregation=reward_cfg.get("force_aggregation", "rms"),
         energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
         energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
     )
