@@ -1,4 +1,5 @@
 import torch
+import torch.distributed as dist
 import queue
 import time
 import threading
@@ -7,6 +8,7 @@ from tqdm import tqdm
 import wandb
 import os
 import yaml
+import numpy as np
 from verl_diffusion.trainer.base import BaseTrainer
 from verl_diffusion.protocol import DataProto
 
@@ -34,6 +36,11 @@ class DDPOTrainer(BaseTrainer):
         self.device = device
         self.dataloader = dataloader
         self.config = config
+        dist_cfg = self.config.get("distributed") or {}
+        self.rank = int(dist_cfg.get("rank", 0))
+        self.world_size = int(dist_cfg.get("world_size", 1))
+        self.is_main_process = bool(dist_cfg.get("is_main_process", self.rank == 0))
+        self.distributed = dist.is_initialized() and self.world_size > 1
 
         save_path = config.get("save_path")
         if not save_path:
@@ -79,9 +86,9 @@ class DDPOTrainer(BaseTrainer):
                 self.actor.setup_scheduler(int(total_training_steps))
 
         # Initialize Ray for parallel processing
-        if not ray.is_initialized():
+        if self.is_main_process and not ray.is_initialized():
             ray.init()
-            
+
         # Initialize wandb if enabled in config
         wandb_cfg = config.get("wandb")
         project = "edm-ddp"
@@ -95,7 +102,7 @@ class DDPOTrainer(BaseTrainer):
         elif wandb_cfg:
             wandb_enabled = True
 
-        if wandb_enabled:
+        if wandb_enabled and self.is_main_process:
             wandb.init(
                 project=project,
                 name=name,
@@ -133,8 +140,31 @@ class DDPOTrainer(BaseTrainer):
                 # Queue is empty, continue waiting
                 continue
             except Exception as e:
-                print(f"Error in reward calculation: {e}")
+                if self.is_main_process:
+                    print(f"Error in reward calculation: {e}")
                 self.samples_queue.task_done()
+
+    def _sync_metrics(self, metrics):
+        if not self.distributed:
+            return metrics
+
+        synced = {}
+        for key, value in metrics.items():
+            if isinstance(value, (int, float, np.floating)):
+                tensor = torch.tensor(float(value), device=self.device, dtype=torch.float32)
+                dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+                reduced = tensor.item()
+                if isinstance(value, int):
+                    synced[key] = int(round(reduced))
+                else:
+                    synced[key] = reduced
+            elif isinstance(value, torch.Tensor) and value.numel() == 1:
+                tensor = value.to(self.device, dtype=torch.float32)
+                dist.all_reduce(tensor, op=dist.ReduceOp.AVG)
+                synced[key] = tensor.item()
+            else:
+                synced[key] = value
+        return synced
     
     def process_batch(self, batch_idx, prompts):
         """
@@ -193,7 +223,8 @@ class DDPOTrainer(BaseTrainer):
             return sample_results.union(reward_results)
             
         except Exception as e:
-            print(f"Error processing batch: {e}")
+            if self.is_main_process:
+                print(f"Error processing batch: {e}")
             # Send termination signal (if not already sent)
             try:
                 self.samples_queue.put_nowait(None)
@@ -326,6 +357,8 @@ class DDPOTrainer(BaseTrainer):
 
     def save_checkpoint(self, epoch, metrics=None):
         """Save model checkpoint and config"""
+        if not self.is_main_process:
+            return
         # Save config
         config_path = os.path.join(self.save_path, 'config.yaml')
         if isinstance(self.config, dict):
@@ -398,7 +431,8 @@ class DDPOTrainer(BaseTrainer):
             # Load checkpoint if resuming
             if self.config.get('resume', False) and self.config.get('checkpoint_path'):
                 start_epoch = self.load_checkpoint(self.config['checkpoint_path'])
-                print(f"Resuming training from epoch {start_epoch}")
+                if self.is_main_process:
+                    print(f"Resuming training from epoch {start_epoch}")
             for epoch in range(start_epoch, self.epoches):
                 # Process each batch from the dataloader and update model after each batch
                 for batch_idx, prompts in enumerate(self.dataloader):
@@ -444,7 +478,9 @@ class DDPOTrainer(BaseTrainer):
                     if "advantages" in samples.batch:
                         metrics["advantage_mean"] = samples.batch["advantages"].mean().item()
                         metrics["advantage_std"] = samples.batch["advantages"].std().item()
-                    
+
+                    metrics = self._sync_metrics(metrics)
+
                     # Save checkpoint periodically
                     if (batch_idx + 1) % self.config.get('save_interval', 10) == 0:
                         self.save_checkpoint(batch_idx, metrics)
@@ -513,17 +549,20 @@ class DDPOTrainer(BaseTrainer):
                                 log_dict[f"train/{k}"] = v
                         wandb.log(log_dict, step=global_batch_idx)
                     
-                    print(metrics)
+                    if self.is_main_process:
+                        print(metrics)
                 
                 # Save checkpoint at the end of each epoch
                 self.save_checkpoint(epoch, metrics)
-                print(f"Saved checkpoint at epoch {epoch}")
+                if self.is_main_process:
+                    print(f"Saved checkpoint at epoch {epoch}")
                 
                 # Save final checkpoint
                 self.save_checkpoint(len(self.dataloader), metrics)
             
         except KeyboardInterrupt:
-            print("Training interrupted by user")
+            if self.is_main_process:
+                print("Training interrupted by user")
             # Save checkpoint on interruption
             if 'metrics' in locals():
                 self.save_checkpoint(batch_idx, metrics)
@@ -558,9 +597,11 @@ class DDPOTrainer(BaseTrainer):
             plt.savefig(plot_path, dpi=200)
             plt.close()
         except ImportError:
-            print("matplotlib not available; skipped saving learning rate plot.")
+            if self.is_main_process:
+                print("matplotlib not available; skipped saving learning rate plot.")
         except Exception as exc:
-            print(f"Failed to save learning rate plot: {exc}")
+            if self.is_main_process:
+                print(f"Failed to save learning rate plot: {exc}")
     
     def clean_up(self):
         """Clean up resources"""

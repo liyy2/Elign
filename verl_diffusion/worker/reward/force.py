@@ -3,7 +3,7 @@ import os
 import queue
 import threading
 import time
-from typing import Optional
+from typing import Optional, Union
 
 from .base import BaseReward
 os.environ["OMP_NUM_THREADS"] = "18"
@@ -12,10 +12,23 @@ import torch
 import ray
 from tqdm import tqdm as tq
 
+
+def _is_main_process() -> bool:
+    """Return True if current worker is considered global rank zero."""
+    for key in ("RANK", "WORLD_RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None:
+            try:
+                return int(value) == 0
+            except ValueError:
+                return value == "0"
+    return True
+
 try:
     from xtb.ase.calculator import XTB
 except ModuleNotFoundError:
-    print('Not importing xtb.')
+    if _is_main_process():
+        print('Not importing xtb.')
 from ase import Atoms
 from verl_diffusion.utils.math import kl_divergence_normal, rmsd
 from edm_source.qm9.analyze import check_stability
@@ -49,6 +62,7 @@ def calcuate_xtb_force(mol, calc, dataset_info, atom_encoder):
 class ForceReward(BaseReward):
     def __init__(self, dataset_info:dict, condition:bool=False):
         super().__init__()
+        self.is_main_process = _is_main_process()
         self.calc = XTB(method="GFN2-xTB")
         self.dataset_info = dataset_info
         self.atom_encoder = self.dataset_info['atom_decoder']
@@ -97,7 +111,8 @@ class ForceReward(BaseReward):
                 time.sleep(0.01)
             except Exception as e:
                 # Log any other exceptions
-                print(f"Error in async reward calculation: {e}")
+                if self.is_main_process:
+                    print(f"Error in async reward calculation: {e}")
                 
     def submit_batch(self, samples):
         """
@@ -215,7 +230,8 @@ class UMAForceReward(BaseReward):
         mlff_predictor: Optional[object] = None,
         position_scale: Optional[float] = None,
         force_clip_threshold: Optional[float] = None,
-        device: Optional[str] = None,
+        device: Optional[Union[str, torch.device]] = None,
+        mlff_device: Optional[str] = None,
         shaping: Optional[dict] = None,
         use_energy: bool = False,
         force_weight: float = 1.0,
@@ -225,6 +241,7 @@ class UMAForceReward(BaseReward):
         energy_transform_scale: float = 1000.0,
     ):
         super().__init__()
+        self.is_main_process = _is_main_process()
         self.dataset_info = dataset_info
         self.condition = condition
         self.input_queue = queue.Queue(maxsize=512)
@@ -232,7 +249,13 @@ class UMAForceReward(BaseReward):
         self.running = False
         self.thread = None
 
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        if device is None:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, torch.device):
+            self.device = device
+        else:
+            self.device = torch.device(device)
+        self.mlff_device = mlff_device or ("cuda" if self.device.type == "cuda" else "cpu")
         if position_scale is None:
             norm_values = self.dataset_info.get("normalize_factors")
             if isinstance(norm_values, (list, tuple)) and len(norm_values) > 0:
@@ -297,7 +320,7 @@ class UMAForceReward(BaseReward):
         if mlff_predictor is not None:
             self.mlff_predictor = mlff_predictor
         else:
-            self.mlff_predictor = get_mlff_predictor(mlff_model, self.device)
+            self.mlff_predictor = get_mlff_predictor(mlff_model, self.mlff_device)
 
         if self.mlff_predictor is not None:
             self.force_computer = MLFFForceComputer(
@@ -409,6 +432,8 @@ class UMAForceReward(BaseReward):
         return aggregated.view(forces.shape[0])
 
     def calculate_rewards(self, data: DataProto) -> DataProto:
+        if self.device.type == "cuda":
+            torch.cuda.set_device(self.device)
         processed = self.process_data(data)
 
         z = processed["z"].to(self.device)
@@ -470,7 +495,8 @@ class UMAForceReward(BaseReward):
                 if alignment_active:
                     fine_mask_selected = torch.ones(1, device=latents.device, dtype=torch.bool)
                 selected_count = 1
-                print('Warning: Selected count Zero')
+                if self.is_main_process:
+                    print('Warning: Selected count Zero')
 
             if alignment_active and fine_mask_selected is not None:
                 fine_mask_selected = fine_mask_selected.float()
@@ -682,5 +708,6 @@ class UMAForceReward(BaseReward):
         result["weighted_energy_rewards"] = weighted_energy_rewards.detach().cpu()
         result["stability"] = stability_flags.cpu()
 
-        print("Rewards calculated via UMAForceReward")
+        if self.is_main_process:
+            print("Rewards calculated via UMAForceReward")
         return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())

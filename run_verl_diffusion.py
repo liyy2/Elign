@@ -2,11 +2,13 @@ import os
 import pickle
 import random
 import sys
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
 import ray
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from hydra import main as hydra_main
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
@@ -29,6 +31,42 @@ from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
 os.environ.setdefault("WANDB_MODE", "online")
 
 
+def _setup_distributed() -> Dict[str, int]:
+    """Initialize torch.distributed if launched under torchrun."""
+
+    if dist.is_initialized():
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+        return {"rank": rank, "world_size": world_size, "local_rank": local_rank}
+
+    world_size_env = os.environ.get("WORLD_SIZE")
+    if world_size_env is None or int(world_size_env) <= 1:
+        return {"rank": 0, "world_size": 1, "local_rank": 0}
+
+    backend = "nccl" if torch.cuda.is_available() else "gloo"
+    dist.init_process_group(backend=backend, init_method="env://")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+    return {"rank": rank, "world_size": world_size, "local_rank": local_rank}
+
+
+def _seed_everything(base_seed: int, rank: int) -> None:
+    """Seed RNGs in a rank-aware fashion."""
+
+    seed = int(base_seed) + int(rank)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+
+
 def _make_absolute(path_value: Optional[str]) -> Optional[str]:
     """Convert relative config paths to absolute paths for Hydra runs."""
     if not path_value:
@@ -40,12 +78,11 @@ def _make_absolute(path_value: Optional[str]) -> Optional[str]:
 def main(cfg: DictConfig) -> None:
     """Entry point for DDPO training managed by Hydra."""
 
-    # Set random seed for reproducibility
-    torch.manual_seed(cfg.seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(cfg.seed)
-    random.seed(cfg.seed)
-    np.random.seed(cfg.seed)
+    dist_state = _setup_distributed()
+    is_main_process = dist_state["rank"] == 0
+
+    # Set random seed for reproducibility (rank-aware)
+    _seed_everything(cfg.seed, dist_state["rank"])
 
     # Convert relevant paths to absolute to avoid Hydra working directory changes
     cfg.model.config = _make_absolute(cfg.model.get("config"))
@@ -56,6 +93,13 @@ def main(cfg: DictConfig) -> None:
 
     # Convert OmegaConf to standard Python dict for downstream components
     config = OmegaConf.to_container(cfg, resolve=True)
+    if isinstance(config, dict):
+        config["distributed"] = {
+            "rank": dist_state["rank"],
+            "world_size": dist_state["world_size"],
+            "local_rank": dist_state["local_rank"],
+            "is_main_process": is_main_process,
+        }
 
     # Load EDM config
     edm_config_path = config["model"]["config"]
@@ -64,7 +108,8 @@ def main(cfg: DictConfig) -> None:
 
     # Use the same processed data directory convention as eval_mlff_guided.py
     edm_config.datadir = "qm9/temp"
-    print(edm_config)
+    if is_main_process:
+        print(edm_config)
 
     # Set default values if not present
     if not hasattr(edm_config, "normalization_factor"):
@@ -74,7 +119,10 @@ def main(cfg: DictConfig) -> None:
 
     # Set up device
     edm_config.cuda = not edm_config.no_cuda and torch.cuda.is_available()
-    device = torch.device("cuda" if edm_config.cuda else "cpu")
+    if edm_config.cuda:
+        device = torch.device(f"cuda:{dist_state['local_rank']}")
+    else:
+        device = torch.device("cpu")
     edm_config.device = device
 
     # Load dataset info and model
@@ -88,7 +136,16 @@ def main(cfg: DictConfig) -> None:
 
     # Initialize EDM model
     model = EDMModel(flow, edm_config)
+    model.to(device)
     model.load(model_path=config["model"]["model_path"])
+
+    if dist_state["world_size"] > 1:
+        model = DDP(
+            model,
+            device_ids=[dist_state["local_rank"]] if device.type == "cuda" else None,
+            output_device=dist_state["local_rank"] if device.type == "cuda" else None,
+            find_unused_parameters=True,
+        )
 
     # Initialize dataloader
     dataloader = EDMDataLoader(
@@ -99,13 +156,17 @@ def main(cfg: DictConfig) -> None:
         device=device,
         condition=False,
         num_batches=config["dataloader"]["epoches"],
+        rank=dist_state["rank"],
+        world_size=dist_state["world_size"],
+        base_seed=cfg.seed,
     )
 
     # Initialize rollout and rewarder in main function
     rollout = EDMRollout(model, config)
-    rollout.model.to(device)
 
     reward_cfg = config.get("reward", {})
+    reward_device = device
+    mlff_device = "cuda" if device.type == "cuda" else "cpu"
     rewarder = UMAForceReward(
         dataset_info,
         condition=False,
@@ -113,7 +174,8 @@ def main(cfg: DictConfig) -> None:
         mlff_predictor=None,
         position_scale=None,
         force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
-        device=str(device),
+        device=reward_device,
+        mlff_device=mlff_device,
         shaping=reward_cfg.get("shaping", {}),
         use_energy=reward_cfg.get("use_energy", False),
         force_weight=reward_cfg.get("force_weight", 1.0),
@@ -126,9 +188,9 @@ def main(cfg: DictConfig) -> None:
     filters = Filter(dataset_info, config["dataloader"]["smiles_path"], False, False, False)
     actor = EDMActor(model, config)
 
-    if not ray.is_initialized():
+    if is_main_process and not ray.is_initialized():
         ray.init()
-    print("Ray initialized")
+        print("Ray initialized")
 
     trainer = DDPOTrainer(
         config=config,
@@ -142,16 +204,22 @@ def main(cfg: DictConfig) -> None:
         actor=actor,
     )
 
-    print("DDPO Trainer initialized")
+    if is_main_process:
+        print("DDPO Trainer initialized")
 
     try:
-        print("Training started")
+        if is_main_process:
+            print("Training started")
         trainer.fit()
     except KeyboardInterrupt:
-        print("Training interrupted by user")
+        if is_main_process:
+            print("Training interrupted by user")
     finally:
         trainer.clean_up()
-        print("Training completed")
+        if is_main_process:
+            print("Training completed")
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

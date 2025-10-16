@@ -20,6 +20,8 @@ class EDMRollout(BaseRollout):
         self.output_queue = queue.Queue(maxsize=config.get("queue_size", 5))
         self.running = False
         self.thread = None
+        dist_cfg = self.config.get("distributed") or {}
+        self.is_main_process = bool(dist_cfg.get("is_main_process", True))
         train_cfg = self.config.get("train", {})
         raw_weight = float(train_cfg.get("force_alignment_weight", 0.0))
         enabled_cfg = train_cfg.get("force_alignment_enabled")
@@ -80,7 +82,8 @@ class EDMRollout(BaseRollout):
                 time.sleep(0.01)
             except Exception as e:
                 # Log any other exceptions
-                print(f"Error in async generation: {e}")
+                if self.is_main_process:
+                    print(f"Error in async generation: {e}")
                 
     def generate_samples(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
@@ -112,13 +115,14 @@ class EDMRollout(BaseRollout):
         max_n_nodes = prompts.meta_info["max_n_nodes"]
         # we need to extract node information from the prompts
         nodesxsample = prompts.batch['nodesxsample']
-        node_mask, edge_mask = self.model.get_mask(nodesxsample, batch_size, max_n_nodes)
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        node_mask, edge_mask = model_ref.get_mask(nodesxsample, batch_size, max_n_nodes)
         node_mask = node_mask.to(nodesxsample.device)
         edge_mask = edge_mask.to(nodesxsample.device)
         n_samples = batch_size
         n_nodes = max_n_nodes  # node_mask shape is [batch_size, n_nodes]
         # Call the model's sample method
-        x, h, latents, logps, timesteps, mus, sigmas = self.model.sample(
+        x, h, latents, logps, timesteps, mus, sigmas = model_ref.sample(
             n_samples=n_samples,
             n_nodes=n_nodes,
             node_mask=node_mask,

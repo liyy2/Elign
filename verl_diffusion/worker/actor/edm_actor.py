@@ -25,6 +25,8 @@ class EDMActor(BaseActor):
         super().__init__()  
         self.model = model
         self.config = config
+        dist_cfg = self.config.get("distributed") or {}
+        self.is_main_process = bool(dist_cfg.get("is_main_process", True))
         optimizer_cls = torch.optim.AdamW
         self.optimizer = optimizer_cls(
             self.model.parameters(),
@@ -123,7 +125,13 @@ class EDMActor(BaseActor):
         info = defaultdict(list)
         self.T = self.num_timesteps + 1
         alignment_active = self.force_alignment_enabled and self.force_alignment_weight > 0.0
-        for _i, sample in tq(enumerate(batched_samples),desc= "Training", unit="Batch",leave=False):
+        for _i, sample in tq(
+            enumerate(batched_samples),
+            desc="Training",
+            unit="Batch",
+            leave=False,
+            disable=not self.is_main_process,
+        ):
             mus = sample.get("mus") if alignment_active else None
             force_vectors = sample.get("force_vectors") if alignment_active else None
             force_indices = sample.get("force_schedule_indices") if alignment_active else None
@@ -138,7 +146,13 @@ class EDMActor(BaseActor):
                 except RuntimeError:
                     force_index_lookup = None
 
-            for j in tq(range(self.T ),desc= "Training Batch", unit="timesteps",leave=False):
+            for j in tq(
+                range(self.T),
+                desc="Training Batch",
+                unit="timesteps",
+                leave=False,
+                disable=not self.is_main_process,
+            ):
                 context = sample["context"] if self.condition else None
                 if "advantages_ts" in sample:
                     advantages_j = sample["advantages_ts"][:, j]
@@ -248,11 +262,12 @@ class EDMActor(BaseActor):
         s_array = s_array / self.num_timesteps
         t_array = t_array / self.num_timesteps
         ## need add
-        node_mask, edge_mask = self.model.get_mask(nodesxsample, latents.shape[0], self.max_n_nodes)
+        model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        node_mask, edge_mask = model_ref.get_mask(nodesxsample, latents.shape[0], self.max_n_nodes)
         node_mask = node_mask.to(latents.device)
         edge_mask = edge_mask.to(latents.device)
 
-        _, log_prob_current, mu_current, _ = self.model.sample_p_zs_given_zt(
+        _, log_prob_current, mu_current, _ = model_ref.sample_p_zs_given_zt(
             s_array,
             t_array,
             latents,

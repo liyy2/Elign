@@ -51,6 +51,7 @@ reward:
   use_energy: true
   force_weight: 1.0
   energy_weight: 1.0
+  force_aggregation: rms # rms or max
   force_adv_weight: 1.0
   energy_adv_weight: 0.1
   energy_transform_offset: 10000.0
