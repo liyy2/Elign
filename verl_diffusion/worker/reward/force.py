@@ -42,6 +42,35 @@ from .scheduler import RewardScheduler
 
 logger = logging.getLogger(__name__)
 
+
+def _resolve_mlff_device(device_like, default_device):
+    """Normalize MLFF device hints to strings understood by the loader."""
+    if device_like is None:
+        candidate = default_device
+    else:
+        candidate = device_like
+    if isinstance(candidate, torch.device):
+        if candidate.type == "cuda":
+            if candidate.index is not None:
+                return f"cuda:{candidate.index}"
+            return "cuda"
+        if candidate.type == "cpu":
+            return "cpu"
+    else:
+        candidate_str = str(candidate).lower()
+        if candidate_str == "cuda":
+            return "cuda"
+        if candidate_str.startswith("cuda:"):
+            try:
+                index = int(candidate_str.split(":", 1)[1])
+            except ValueError as exc:
+                raise ValueError(f"Invalid CUDA device string: {candidate}") from exc
+            return f"cuda:{index}"
+        if candidate_str == "cpu":
+            return "cpu"
+    raise ValueError(f"Unsupported MLFF device specification: {device_like}")
+
+
 @ray.remote(num_cpus=8)
 def calcuate_xtb_force(mol, calc, dataset_info, atom_encoder):
     pos = mol[0].tolist()
@@ -231,7 +260,7 @@ class UMAForceReward(BaseReward):
         position_scale: Optional[float] = None,
         force_clip_threshold: Optional[float] = None,
         device: Optional[Union[str, torch.device]] = None,
-        mlff_device: Optional[str] = None,
+        mlff_device: Optional[Union[str, torch.device]] = None,
         shaping: Optional[dict] = None,
         use_energy: bool = False,
         force_weight: float = 1.0,
@@ -255,7 +284,7 @@ class UMAForceReward(BaseReward):
             self.device = device
         else:
             self.device = torch.device(device)
-        self.mlff_device = mlff_device or ("cuda" if self.device.type == "cuda" else "cpu")
+        self.mlff_device = _resolve_mlff_device(mlff_device, "cuda" if self.device.type == "cuda" else "cpu")
         if position_scale is None:
             norm_values = self.dataset_info.get("normalize_factors")
             if isinstance(norm_values, (list, tuple)) and len(norm_values) > 0:
@@ -283,8 +312,6 @@ class UMAForceReward(BaseReward):
         self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
         self.shaping_method = self.shaping_cfg.get("method", "potential")
         self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
-        # Compute MLFF only for the last K timesteps to control cost; 0 -> all steps
-        self.shaping_horizon = int(self.shaping_cfg.get("horizon", 0))
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Weight for adding shaped sum to final reward
         self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
@@ -464,11 +491,6 @@ class UMAForceReward(BaseReward):
             F_force = torch.zeros((B, S), device=self.device)
             F_energy = torch.zeros((B, S), device=self.device) if self.use_energy else None
 
-            if self.shaping_horizon and self.shaping_horizon > 0:
-                horizon_start = max(0, S - self.shaping_horizon)
-            else:
-                horizon_start = 0
-
             if "timesteps" in data.batch.keys():
                 timesteps_schedule = data.batch["timesteps"][0, :S].detach().cpu()
             else:
@@ -477,7 +499,6 @@ class UMAForceReward(BaseReward):
             # Select the diffusion steps that will receive MLFF calls and potential shaping.
             schedule = self.reward_scheduler.build(
                 timesteps=timesteps_schedule,
-                start_idx=horizon_start,
                 end_idx=S - 1,
             )
             schedule_indices = schedule.indices.to(latents.device)

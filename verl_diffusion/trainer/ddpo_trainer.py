@@ -9,6 +9,7 @@ import wandb
 import os
 import yaml
 import numpy as np
+from typing import Dict
 from verl_diffusion.trainer.base import BaseTrainer
 from verl_diffusion.protocol import DataProto
 
@@ -165,7 +166,7 @@ class DDPOTrainer(BaseTrainer):
             else:
                 synced[key] = value
         return synced
-    
+
     def process_batch(self, batch_idx, prompts):
         """
         Process a single batch from the dataloader
@@ -440,7 +441,7 @@ class DDPOTrainer(BaseTrainer):
                     samples = self.process_batch(batch_idx, prompts)
                     samples, filter_ratio, novelty_penalty_ratio = self.filters.filter(samples)
                     samples = self.compute_advantage(samples)
-                    metrics = self.actor.update_policy(samples)
+                    metrics = self.actor.update_policy(samples, epoch_callback=None)
                     metrics["epoch"] = epoch + 1
                     metrics["reward"] = samples.batch["rewards"].mean().item()
                     metrics["filter_ratio"] = filter_ratio
@@ -502,7 +503,9 @@ class DDPOTrainer(BaseTrainer):
                             log_dict["train/force_alignment_cosine"] = metrics["ForceAlignCosine"]
                         if "lr" in metrics:
                             log_dict["train/lr"] = metrics["lr"]
-                        
+                        if "PolicyEpochs" in metrics:
+                            log_dict["train/policy_epochs"] = metrics["PolicyEpochs"]
+
                         # Add force reward statistics
                         if "force_reward_mean" in metrics:
                             log_dict["train/force_reward_mean"] = metrics["force_reward_mean"]

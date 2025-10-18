@@ -77,7 +77,7 @@
 
             ],
             "console": "integratedTerminal",
-            "cwd": "/home/yl2428/scratch_pi_mg269/yl2428/e3_diffusion_for_molecules-main",
+            "cwd": "/home/yl2428/project_pi_mg269/yl2428/e3_diffusion_for_molecules-main",
             "env": {
                 "WANDB_MODE": "offline",
                 "CUDA_VISIBLE_DEVICES": "0",

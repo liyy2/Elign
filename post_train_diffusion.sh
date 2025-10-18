@@ -7,7 +7,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:4
-#SBATCH --partition=gpu
+#SBATCH --partition=gpu_h200
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=yunyang.li@yale.edu
 
@@ -15,17 +15,17 @@ module load miniconda
 eval "$(conda shell.bash hook)"
 conda activate edm
 
-LEARNING_RATE="0.000005"
+LEARNING_RATE="0.000001"
 CLIP_RANGE="0.2"
 SHARE_INITIAL_NOISE=true
 EACH_PROMPT_SAMPLE=128 # Group Size in GRPO
-SKIP_PREFIX=50
+SKIP_PREFIX=700
 FORCE_ALIGNMENT_ENABLED=false
-SAMPLE_GROUP_SIZE=4 # Number of groups
-TIME_STEP=100
+SAMPLE_GROUP_SIZE=1 # Number of groups
+TIME_STEP=1000
 MLFF_BATCH_SIZE=32 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="max"
-TRAIN_MICRO_BATCH_SIZE=128 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+TRAIN_MICRO_BATCH_SIZE=512 # batch size for doing policy gradient, reduce if the training part is a bottleneck
 
 # Each dataloader batch emits SAMPLE_GROUP_SIZE * EACH_PROMPT_SAMPLE trajectories per GPU.
 # PPO consumes the same batch as TRAIN_MICRO_BATCH_SIZE-sized chunks (per GPU).
@@ -53,7 +53,7 @@ _mlff_$(sanitize_for_name "${MLFF_BATCH_SIZE}")\
 _fagg_$(sanitize_for_name "${FORCE_AGGREGATION}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
-SAVE_ROOT="/home/yl2428/scratch_pi_mg269/yl2428/logs"
+SAVE_ROOT="/home/yl2428/project_pi_mg269/yl2428/logs"
 SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
 
 mkdir -p "${SAVE_PATH}"
@@ -74,6 +74,7 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   reward.shaping.scheduler.skip_prefix="${SKIP_PREFIX}" \
   train.force_alignment_enabled="${FORCE_ALIGNMENT_ENABLED}" \
   train.train_micro_batch_size="${TRAIN_MICRO_BATCH_SIZE}" \
+  train.epoch_per_rollout=3 \
   dataloader.sample_group_size="${SAMPLE_GROUP_SIZE}" \
   model.time_step="${TIME_STEP}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \

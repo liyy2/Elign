@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 from tqdm import tqdm as tq
 from collections import defaultdict
 from verl_diffusion.protocol import DataProto
@@ -42,6 +42,7 @@ class EDMActor(BaseActor):
         self.train_micro_batch_size = self.config["train"]["train_micro_batch_size"]
         self.max_grad_norm = self.config["train"]["max_grad_norm"]
         self.clip_range = self.config["train"]["clip_range"]
+        self.epoch_per_rollout = max(int(self.config["train"].get("epoch_per_rollout", 1)), 1)
         self.num_timesteps = self.config["model"]["time_step"]
         alignment_cfg = self.config.get("train", {})
         raw_alignment_weight = float(alignment_cfg.get("force_alignment_weight", 0.0))
@@ -367,7 +368,11 @@ class EDMActor(BaseActor):
         
         return torch.mean(torch.maximum(unclipped_loss, clipped_loss))
     
-    def update_policy(self, data: DataProto) -> Dict:
+    def update_policy(
+        self,
+        data: DataProto,
+        epoch_callback: Optional[Callable[[int, Dict[str, float]], None]] = None,
+    ) -> Dict:
         samples = {}
         self.max_n_nodes = data.meta_info["max_n_nodes"]
         self.batch_size = data.batch.batch_size[0]
@@ -395,32 +400,60 @@ class EDMActor(BaseActor):
         if self.condition:
            samples["context"] = data.batch["context"]
 
-        original_keys = samples.keys()
-        original_values = samples.values()
+        original_keys = list(samples.keys())
+        original_values = list(samples.values())
         # rebatch them as user defined train_batch_size is different from sample_batch_size
         samples_batched = []
-        
+
         if self.train_micro_batch_size >= self.batch_size:
-            # If train_micro_batch_size is larger than or equal to batch_size,
-            # just use the entire batch as one micro batch
-            samples_batched.append(samples)
+            # If train_micro_batch_size is larger than or equal to batch_size, just use the entire batch
+            samples_batched.append({k: v for k, v in samples.items()})
         else:
             # Calculate number of complete batches and remaining samples
             n_complete_batches = self.batch_size // self.train_micro_batch_size
             remaining_samples = self.batch_size % self.train_micro_batch_size
-            
+
             # Process complete batches
             if n_complete_batches > 0:
                 reshaped_values = [v.reshape(-1, self.train_micro_batch_size, *v.shape[1:]) for v in original_values]
                 transposed_values = zip(*reshaped_values)
                 samples_batched.extend([dict(zip(original_keys, row_values)) for row_values in transposed_values])
-            
+
             # Process remaining samples if any
             if remaining_samples > 0:
                 remaining_values = [v[-remaining_samples:].unsqueeze(0) for v in original_values]
                 samples_batched.append(dict(zip(original_keys, remaining_values)))
-        
-        # Train each batch
-        metric = self.train_batched_samples(samples_batched)
-        
-        return metric
+
+        epochs = max(int(self.epoch_per_rollout), 1)
+        metrics = []
+        for epoch_idx in range(epochs):
+            metric = self.train_batched_samples(samples_batched)
+            metrics.append(metric)
+            if epoch_callback is not None:
+                safe_metric = {}
+                for key, value in metric.items():
+                    if isinstance(value, torch.Tensor):
+                        safe_metric[key] = value.detach().cpu().item()
+                    elif isinstance(value, np.generic):
+                        safe_metric[key] = float(value)
+                    else:
+                        safe_metric[key] = value
+                epoch_callback(epoch_idx, safe_metric)
+
+        if epochs == 1:
+            return metrics[0]
+
+        aggregated = {}
+        for metric in metrics:
+            for key, value in metric.items():
+                aggregated.setdefault(key, []).append(value)
+
+        for key, values in aggregated.items():
+            aggregated[key] = float(np.mean(values))
+
+        last_lr = metrics[-1].get('lr')
+        if last_lr is not None:
+            aggregated['lr'] = last_lr
+        aggregated['PolicyEpochs'] = epochs
+
+        return aggregated

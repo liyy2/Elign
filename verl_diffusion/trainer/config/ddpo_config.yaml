@@ -33,6 +33,7 @@ train:
   clip_range: 0.15
   train_micro_batch_size: 512
   force_alignment_enabled: true
+  epoch_per_rollout: 1
   force_alignment_weight: 0.5
   force_alignment_min_force: 0.0001
   force_alignment_min_delta: 0.0001
@@ -60,7 +61,6 @@ reward:
     enabled: true
     method: potential
     gamma: 1.0
-    horizon: 200
     weight: 1.0
     mlff_batch_size: 4
     terminal_weight: 5
