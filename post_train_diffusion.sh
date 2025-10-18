@@ -26,6 +26,10 @@ TIME_STEP=1000
 MLFF_BATCH_SIZE=32 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="max"
 TRAIN_MICRO_BATCH_SIZE=512 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+SCHEDULER_NAME="cosine"
+SCHEDULER_WARMUP_STEPS=30
+SCHEDULER_TOTAL_STEPS=450 # total scheduler steps before decay completes
+SCHEDULER_MIN_LR_RATIO="0.1" # final learning rate as a fraction of the initial LR
 
 # Each dataloader batch emits SAMPLE_GROUP_SIZE * EACH_PROMPT_SAMPLE trajectories per GPU.
 # PPO consumes the same batch as TRAIN_MICRO_BATCH_SIZE-sized chunks (per GPU).
@@ -50,7 +54,11 @@ _force_align_$(sanitize_for_name "${FORCE_ALIGNMENT_ENABLED}")\
 _tstep_$(sanitize_for_name "${TIME_STEP}")\
 _sg_$(sanitize_for_name "${SAMPLE_GROUP_SIZE}")\
 _mlff_$(sanitize_for_name "${MLFF_BATCH_SIZE}")\
-_fagg_$(sanitize_for_name "${FORCE_AGGREGATION}")"
+_fagg_$(sanitize_for_name "${FORCE_AGGREGATION}")\
+_sched_$(sanitize_for_name "${SCHEDULER_NAME}")\
+_warmup_$(sanitize_for_name "${SCHEDULER_WARMUP_STEPS}")\
+_steps_$(sanitize_for_name "${SCHEDULER_TOTAL_STEPS}")\
+_decay_$(sanitize_for_name "${SCHEDULER_MIN_LR_RATIO}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
 SAVE_ROOT="/home/yl2428/project_pi_mg269/yl2428/logs"
@@ -78,5 +86,9 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   dataloader.sample_group_size="${SAMPLE_GROUP_SIZE}" \
   model.time_step="${TIME_STEP}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \
-  reward.force_aggregation="${FORCE_AGGREGATION}"
+  reward.force_aggregation="${FORCE_AGGREGATION}" \
+  train.scheduler.name="${SCHEDULER_NAME}" \
+  train.scheduler.warmup_steps="${SCHEDULER_WARMUP_STEPS}" \
+  train.scheduler.total_steps="${SCHEDULER_TOTAL_STEPS}" \
+  train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}"
   
