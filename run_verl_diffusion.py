@@ -180,6 +180,7 @@ def main(cfg: DictConfig) -> None:
         use_energy=reward_cfg.get("use_energy", False),
         force_weight=reward_cfg.get("force_weight", 1.0),
         energy_weight=reward_cfg.get("energy_weight", 1.0),
+        stability_weight=reward_cfg.get("stability_weight", 0.0),
         force_aggregation=reward_cfg.get("force_aggregation", "rms"),
         energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
         energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),

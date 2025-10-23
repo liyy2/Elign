@@ -265,6 +265,7 @@ class UMAForceReward(BaseReward):
         use_energy: bool = False,
         force_weight: float = 1.0,
         energy_weight: float = 1.0,
+        stability_weight: float = 0.0,
         force_aggregation: str = "rms",
         energy_transform_offset: float = 10000.0,
         energy_transform_scale: float = 1000.0,
@@ -298,6 +299,7 @@ class UMAForceReward(BaseReward):
         self.use_energy = use_energy
         self.force_weight = force_weight
         self.energy_weight = energy_weight
+        self.stability_weight = stability_weight
         force_aggregation = (force_aggregation or "rms").lower()
         if force_aggregation not in {"rms", "max"}:
             raise ValueError(f"Unsupported force aggregation '{force_aggregation}'. Use 'rms' or 'max'.")
@@ -476,6 +478,7 @@ class UMAForceReward(BaseReward):
         energy_rewards = torch.zeros(batch_size, device=self.device)
         stability_flags = torch.zeros(batch_size, device=self.device)
         result = {}
+        shaped_sum_tensor = None
 
 
         if shaping_active:
@@ -636,20 +639,17 @@ class UMAForceReward(BaseReward):
                         )
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
 
-            weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
-            weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
-            rewards = weighted_force_rewards + weighted_energy_rewards
-
             weighted_shaped_force = self.force_weight * shaped_force
-            weighted_shaped_energy = self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
+            weighted_shaped_energy = (
+                self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
+            )
             shaped = weighted_shaped_force + weighted_shaped_energy
 
+            shaped_sum_tensor = shaped.sum(dim=1)
             result["rewards_ts"] = shaped.detach().cpu()
             result["force_rewards_ts"] = shaped_force.detach().cpu()
             if self.use_energy:
                 result["energy_rewards_ts"] = shaped_energy.detach().cpu()
-            shaped_sum = shaped.sum(dim=1)
-            result["rewards"] = (rewards + self.shaping_weight * shaped_sum).detach().cpu()
 
             if alignment_active and force_vectors_selected is not None and fine_mask_selected is not None:
                 schedule_indices_cpu = (
@@ -693,11 +693,6 @@ class UMAForceReward(BaseReward):
                     transformed_energy = (energy + self.energy_transform_offset) / self.energy_transform_scale
                     energy_rewards[batch_idx] = -transformed_energy
 
-            weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
-            weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
-            rewards = weighted_force_rewards + weighted_energy_rewards
-            result["rewards"] = rewards.detach().cpu()
-
         # Compute stability flags once
         for batch_idx in tq(
             range(batch_size),
@@ -721,13 +716,31 @@ class UMAForceReward(BaseReward):
             except Exception:
                 stability_flags[batch_idx] = 0.0
 
+        if self.stability_weight != 0.0:
+            stability_signal = stability_flags.mul(2.0).sub(1.0).clamp(min=-1.0, max=1.0)
+            stability_bonus = self.stability_weight * stability_signal
+        else:
+            stability_bonus = torch.zeros_like(stability_flags)
+
+        force_rewards = force_rewards + stability_bonus
+
+        weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
+        weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
+        rewards = weighted_force_rewards + weighted_energy_rewards
+
+        if shaped_sum_tensor is not None:
+            total_rewards = rewards + self.shaping_weight * shaped_sum_tensor
+        else:
+            total_rewards = rewards
+
         # Populate final fields
-        result.setdefault("rewards", rewards.detach().cpu())
+        result["rewards"] = total_rewards.detach().cpu()
         result["force_rewards"] = force_rewards.detach().cpu()
         result["energy_rewards"] = energy_rewards.detach().cpu()
         result["weighted_force_rewards"] = weighted_force_rewards.detach().cpu()
         result["weighted_energy_rewards"] = weighted_energy_rewards.detach().cpu()
         result["stability"] = stability_flags.cpu()
+        result["stability_rewards"] = stability_bonus.detach().cpu()
 
         if self.is_main_process:
             print("Rewards calculated via UMAForceReward")
