@@ -26,7 +26,7 @@ sanitize_for_name() {
 # Optimization / training loop
 LEARNING_RATE="0.000001"
 CLIP_RANGE="0.2"
-TRAIN_MICRO_BATCH_SIZE=512 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+TRAIN_MICRO_BATCH_SIZE=128 # batch size for doing policy gradient, reduce if the training part is a bottleneck
 EPOCH_PER_ROLLOUT=5
 
 # Diffusion rollout settings
@@ -46,9 +46,9 @@ SKIP_PREFIX=700
 
 # Scheduler configuration
 SCHEDULER_NAME="cosine"
-SCHEDULER_WARMUP_STEPS=30
-SCHEDULER_TOTAL_STEPS=750 # total scheduler steps before decay completes
-SCHEDULER_MIN_LR_RATIO="0.1" # final learning rate as a fraction of the initial LR
+SCHEDULER_WARMUP_STEPS=60
+SCHEDULER_TOTAL_STEPS=1500 # total scheduler steps before decay completes
+SCHEDULER_MIN_LR_RATIO="0.3" # final learning rate as a fraction of the initial LR
 
 # Each dataloader batch emits SAMPLE_GROUP_SIZE * EACH_PROMPT_SAMPLE trajectories per GPU.
 # PPO consumes the same batch as TRAIN_MICRO_BATCH_SIZE-sized chunks (per GPU).
