@@ -7,7 +7,7 @@
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
 #SBATCH --gres=gpu:4
-#SBATCH --partition=gpu_h200
+#SBATCH --partition=gpu
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=yunyang.li@yale.edu
 
@@ -24,7 +24,7 @@ sanitize_for_name() {
 }
 
 # Optimization / training loop
-LEARNING_RATE="0.000005"
+LEARNING_RATE="0.000001"
 CLIP_RANGE="0.2"
 TRAIN_MICRO_BATCH_SIZE=512 # batch size for doing policy gradient, reduce if the training part is a bottleneck
 EPOCH_PER_ROLLOUT=5
@@ -38,10 +38,10 @@ FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=false
-MLFF_MODEL="uma-m-1p1"
+MLFF_MODEL="uma-s-1p1"
 MLFF_BATCH_SIZE=32 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="rms"
-STABILITY_WEIGHT="0.5"
+STABILITY_WEIGHT="1"
 SKIP_PREFIX=700
 
 # Scheduler configuration

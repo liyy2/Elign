@@ -124,7 +124,8 @@ class EDMActor(BaseActor):
             global_step (int): The updated global step
         """
         info = defaultdict(list)
-        self.T = self.num_timesteps + 1
+        # Train only over latent transitions (exclude terminal x/h step)
+        self.T = self.num_timesteps
         alignment_active = self.force_alignment_enabled and self.force_alignment_weight > 0.0
         for _i, sample in tq(
             enumerate(batched_samples),
@@ -200,7 +201,8 @@ class EDMActor(BaseActor):
                 if align_cosine is not None:
                     info["force_alignment_cosine"].append(align_cosine.detach().cpu().item())
                 loss.backward()
-                clip_grad_norm_(self.model.parameters(),max_norm=1)
+                # Respect configured gradient clipping (train.max_grad_norm)
+                clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
 
         # Record learning rate before scheduler update for logging
         current_lr = self.optimizer.param_groups[0]["lr"]
@@ -385,13 +387,15 @@ class EDMActor(BaseActor):
         else:
             samples["advantages"] = data.batch["advantages"]
         
-        samples["latents"] = data.batch["latents"][:,:self.num_timesteps+1].clone()
-        samples["next_latents"] = data.batch["latents"][:,1:].clone()
-        samples["timesteps"] = data.batch["timesteps"]
-        samples["logps"] = data.batch["logps"]
+        # Latent sequences contain z_T..z_0 and a final decoded x/h frame; exclude terminal for training
+        samples["latents"] = data.batch["latents"][:, : self.num_timesteps + 1].clone()
+        samples["next_latents"] = data.batch["latents"][:, 1 : self.num_timesteps + 1].clone()
+        samples["timesteps"] = data.batch["timesteps"][:, : self.num_timesteps]
+        samples["logps"] = data.batch["logps"][:, : self.num_timesteps]
         samples["nodesxsample"] = data.batch["nodesxsample"]
         if self.force_alignment_enabled and "mus" in data.batch.keys():
-            samples["mus"] = data.batch["mus"][:, :self.num_timesteps + 1].clone()
+            # Keep mu per latent step; terminal x/h not used in training loop
+            samples["mus"] = data.batch["mus"][:, : self.num_timesteps + 1].clone()
         if self.force_alignment_enabled and "force_vectors_schedule" in data.batch.keys():
             samples["force_vectors"] = data.batch["force_vectors_schedule"].clone()
             samples["force_schedule_indices"] = data.batch["force_schedule_indices"].clone()
@@ -399,6 +403,9 @@ class EDMActor(BaseActor):
                 samples["force_fine_mask"] = data.batch["force_fine_mask"].clone()
         if self.condition:
            samples["context"] = data.batch["context"]
+        # Optional per-step advantages should align with latent steps only
+        if "advantages_ts" in samples:
+            samples["advantages_ts"] = samples["advantages_ts"][:, : self.num_timesteps]
 
         original_keys = list(samples.keys())
         original_values = list(samples.values())
@@ -421,7 +428,8 @@ class EDMActor(BaseActor):
 
             # Process remaining samples if any
             if remaining_samples > 0:
-                remaining_values = [v[-remaining_samples:].unsqueeze(0) for v in original_values]
+                # Keep batch dimension as [remaining, ...] without adding an extra leading axis
+                remaining_values = [v[-remaining_samples:] for v in original_values]
                 samples_batched.append(dict(zip(original_keys, remaining_values)))
 
         epochs = max(int(self.epoch_per_rollout), 1)

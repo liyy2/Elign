@@ -87,7 +87,13 @@ class EDMRollout(BaseRollout):
                 
     def generate_samples(self, prompts: DataProto) -> DataProto:
         batch_size = prompts.batch.batch_size[0]
-        num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+        # Honor nested config: dataloader.micro_batch_size
+        micro_cfg = (self.config.get("dataloader") or {}).get("micro_batch_size", self.config.get("micro_batch_size", batch_size))
+        try:
+            micro_bs = int(micro_cfg)
+        except Exception:
+            micro_bs = batch_size
+        num_chunks = max(batch_size // micro_bs, 1)
         
         # Chunk the prompts into smaller batches
         batch_prompts = prompts.chunk(chunks=num_chunks)

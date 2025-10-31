@@ -186,7 +186,13 @@ class DDPOTrainer(BaseTrainer):
         
         try:
             batch_size = prompts.batch.batch_size[0]
-            num_chunks = max(batch_size // self.config.get("micro_batch_size", batch_size), 1)
+            # Use dataloader.micro_batch_size if provided; fallback to top-level for backward compatibility
+            micro_cfg = (self.config.get("dataloader") or {}).get("micro_batch_size", self.config.get("micro_batch_size", batch_size))
+            try:
+                micro_bs = int(micro_cfg)
+            except Exception:
+                micro_bs = batch_size
+            num_chunks = max(batch_size // micro_bs, 1)
             
             # Split into mini-batches
             batch_prompts = prompts.chunk(chunks=num_chunks)
