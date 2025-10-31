@@ -626,7 +626,7 @@ class UMAForceReward(BaseReward):
 
                     force_current = torch.index_select(F_force, 1, idx_current)
                     force_next = torch.index_select(F_force, 1, idx_next)
-                    shaped_vals = intervals_f.unsqueeze(0) * (
+                    shaped_vals = (
                         gamma_factor.unsqueeze(0) * force_next - force_current
                     )
                     shaped_force.index_copy_(1, idx_current, shaped_vals)
@@ -634,7 +634,7 @@ class UMAForceReward(BaseReward):
                     if self.use_energy and F_energy is not None:
                         energy_current = torch.index_select(F_energy, 1, idx_current)
                         energy_next = torch.index_select(F_energy, 1, idx_next)
-                        shaped_energy_vals = intervals_f.unsqueeze(0) * (
+                        shaped_energy_vals = (
                             gamma_factor.unsqueeze(0) * energy_next - energy_current
                         )
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
