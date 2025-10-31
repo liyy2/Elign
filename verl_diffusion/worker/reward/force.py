@@ -606,13 +606,16 @@ class UMAForceReward(BaseReward):
 
             shaped_force = torch.zeros_like(F_force)
             shaped_energy = torch.zeros_like(F_force)
+            terminal_force_metric = None
+            terminal_energy_metric = None
+            shaped_sum_tensor = None
             # Vectorized potential-shaping over the scheduled indices, accounting for stride length.
             selected_count = int(schedule_indices.numel())
             if selected_count > 0:
                 last_idx = schedule_indices[-1]
-                shaped_force[:, last_idx] = F_force[:, last_idx]
+                terminal_force_metric = F_force[:, last_idx]
                 if self.use_energy and F_energy is not None:
-                    shaped_energy[:, last_idx] = F_energy[:, last_idx]
+                    terminal_energy_metric = F_energy[:, last_idx]
 
                 if selected_count > 1:
                     idx_current = schedule_indices[:-1]
@@ -639,17 +642,43 @@ class UMAForceReward(BaseReward):
                         )
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
 
+                    # The shaped contributions are only defined on the transition
+                    # slices (idx_current). By leaving the terminal column at zero
+                    # we ensure the shaped sum collapses to F_last - F_first without
+                    # re-injecting the terminal potential. Summing just the populated
+                    # entries keeps the computation explicit and avoids relying on
+                    # implicit zeros in the time-series tensor.
+                    shaped_force_sum = (self.force_weight * shaped_vals).sum(dim=1)
+                    shaped_sum_tensor = (
+                        shaped_force_sum
+                        if shaped_sum_tensor is None
+                        else shaped_sum_tensor + shaped_force_sum
+                    )
+
+                    if self.use_energy and F_energy is not None:
+                        shaped_energy_sum = (
+                            self.energy_weight * shaped_energy_vals
+                        ).sum(dim=1)
+                        shaped_sum_tensor = (
+                            shaped_energy_sum
+                            if shaped_sum_tensor is None
+                            else shaped_sum_tensor + shaped_energy_sum
+                        )
+
             weighted_shaped_force = self.force_weight * shaped_force
             weighted_shaped_energy = (
                 self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
             )
             shaped = weighted_shaped_force + weighted_shaped_energy
 
-            shaped_sum_tensor = shaped.sum(dim=1)
             result["rewards_ts"] = shaped.detach().cpu()
             result["force_rewards_ts"] = shaped_force.detach().cpu()
             if self.use_energy:
                 result["energy_rewards_ts"] = shaped_energy.detach().cpu()
+            if terminal_force_metric is not None:
+                result["force_terminal_metric"] = terminal_force_metric.detach().cpu()
+            if terminal_energy_metric is not None:
+                result["energy_terminal_metric"] = terminal_energy_metric.detach().cpu()
 
             if alignment_active and force_vectors_selected is not None and fine_mask_selected is not None:
                 schedule_indices_cpu = (
