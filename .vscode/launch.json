@@ -62,7 +62,7 @@
             "request": "launch",
             "program": "run_verl_diffusion.py",
             "args": [
-                "dataloader.sample_group_size=1",
+                "dataloader.sample_group_size=2",
                 "dataloader.each_prompt_sample=8",
                 "dataloader.micro_batch_size=16",
                 "dataloader.epoches=2",
@@ -73,7 +73,9 @@
                 "wandb.enabled=false",
                 "model.time_step=100",
                 "wandb.wandb_name=test",
-                "reward.shaping.scheduler.skip_prefix=50"
+                "reward.shaping.scheduler.skip_prefix=50",
+                "model.share_initial_noise=true",
+                "reward.mlff_model=uma-m-1p1"
 
             ],
             "console": "integratedTerminal",

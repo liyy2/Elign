@@ -4,6 +4,7 @@ from .base import BaseModel
 from edm_source.qm9.models import get_model
 from edm_source.equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 from torch.nn import functional as F
+from verl_diffusion.utils.math import policy_step_logprob
 
 class EDMModel(BaseModel, EnVariationalDiffusion):
     def __init__(self, model, config):
@@ -103,9 +104,14 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         timestep=1000,
         group_index=None,
         share_initial_noise=False,
+        skip_prefix=0,
     ):
-        """
-        Draw samples from the generative model.
+        """Draw samples from the generative model.
+
+        When ``share_initial_noise`` and ``skip_prefix`` are both provided, the
+        method first rolls out a shared trajectory of length ``skip_prefix`` per
+        group and only samples fresh noise beyond that boundary. This mirrors the
+        grouped-sampling strategy described in DanceGRPO.
         """
         self.T = timestep
         if share_initial_noise and group_index is None:
@@ -124,34 +130,132 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             )
 
         self._assert_mean_zero_with_mask(z[:, :, :self.n_dims], node_mask)
-        latents = []
-        logps = []
-        timesteps = []
-        mus = []
-        sigmas = []
-        latents.append(z)
-        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in tq(reversed(range(0, self.T)), desc="sampling", leave=False, unit="step"):
-            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
-            t_array = s_array + 1
-            s_array = s_array / self.T
-            t_array = t_array / self.T
-            z, logp, mu, sigma = self.sample_p_zs_given_zt(s_array, t_array, z, node_mask, edge_mask, context, fix_noise=fix_noise)
-            latents.append(z)
-            logps.append(logp)
-            timesteps.append(s)
-            mus.append(mu)
-            sigmas.append(sigma)
-        
-        # Finally sample p(x, h | z_0).
-        x, h, mu, sigma, logp, s, z = self.sample_p_xh_given_z0(z, node_mask, edge_mask, context, fix_noise=fix_noise)
 
-        latents.append(z)
-        logps.append(logp)
-        timesteps.append(0)
-        mus.append(mu)
-        sigmas.append(sigma.unsqueeze(-1))
-        
+        share_prefix = bool(share_initial_noise and skip_prefix > 0)
+        if not share_prefix:
+            return self._sample_full_batch(
+                z,
+                node_mask,
+                edge_mask,
+                context,
+                fix_noise,
+                n_samples,
+            )
+
+        schedule = list(reversed(range(0, self.T)))
+        prefix_steps = min(int(skip_prefix), len(schedule))
+        if prefix_steps <= 0:
+            return self._sample_full_batch(
+                z,
+                node_mask,
+                edge_mask,
+                context,
+                fix_noise,
+                n_samples,
+            )
+
+        if edge_mask.dim() == 2:
+            # Restore per-sample edge mask layout: [batch, n_nodes, n_nodes, 1]
+            edge_mask = edge_mask.view(n_samples, n_nodes, n_nodes, -1)
+
+        group_index = group_index.view(-1)
+        # Each entry in ``group_index`` identifies which prompts share a prefix.
+        unique_groups = torch.unique(group_index)
+
+        context_slices = None
+        if context is not None:
+            # Pre-slice the conditioning payload so each group member receives its
+            # own prompt features without repeatedly indexing deep structures.
+            context_slices = [self._slice_context(context, idx) for idx in range(n_samples)]
+
+        # Reshape the batch into (num_groups, group_size, ...) so the references and
+        # their branched continuations can be driven in parallel.
+        group_ids, group_counts = torch.unique(group_index, sorted=True, return_counts=True)
+        if group_counts.numel() == 0:
+            raise ValueError("No group indices provided for shared-prefix sampling.")
+        if not torch.all(group_counts == group_counts[0]):
+            raise ValueError("All shared-prefix groups must have the same number of members.")
+
+        group_size = int(group_counts[0].item())
+        group_members = []
+        for group_id in group_ids:
+            member_indices = (group_index == group_id).nonzero(as_tuple=True)[0].sort().values
+            if member_indices.numel() != group_size:
+                raise ValueError("Group membership mismatch while stacking shared-prefix batches.")
+            group_members.append(member_indices)
+        group_members = torch.stack(group_members, dim=0).to(z.device)
+
+        num_groups = group_members.shape[0]
+        ref_indices = group_members[:, 0]
+        branch_indices = group_members[:, 1:] if group_size > 1 else None
+
+        grouped_z = z[group_members]
+        grouped_node_mask = node_mask[group_members]
+        grouped_edge_mask = edge_mask[group_members]
+
+        ref_z = grouped_z[:, 0]
+        ref_node_mask = grouped_node_mask[:, 0]
+        ref_edge_mask = grouped_edge_mask[:, 0]
+
+        if group_size > 1:
+            expected_mask = ref_node_mask.unsqueeze(1).expand_as(grouped_node_mask[:, 1:])
+            if not torch.equal(grouped_node_mask[:, 1:], expected_mask):
+                raise ValueError("All members of a shared prefix group must share the same node mask.")
+
+        ref_context = None
+        if context_slices is not None:
+            ref_context_slices = [context_slices[idx] for idx in ref_indices.tolist()]
+            ref_context = self._collate_context(ref_context_slices)
+
+        ref_result = self._rollout_member(
+            initial_z=ref_z,
+            node_mask=ref_node_mask,
+            edge_mask=ref_edge_mask,
+            context=ref_context,
+            fix_noise=fix_noise,
+            schedule=schedule,
+            start_idx=0,
+            prefix_cache=None,
+        )
+
+        results = [None for _ in range(n_samples)]
+        ref_split = self._split_member_results(ref_result)
+        for idx_tensor, member_result in zip(ref_indices.tolist(), ref_split):
+            results[idx_tensor] = member_result
+
+        if group_size > 1:
+            # Prepare the cached prefix once per group, then tile it across members.
+            prefix_cache = self._extract_batched_prefix_cache(ref_result, prefix_steps)
+            branch_prefix_cache = self._repeat_prefix_cache(prefix_cache, repeats=group_size - 1)
+
+            # Flatten the remaining members so the tail of every group rolls out together.
+            branch_z = grouped_z[:, 1:].reshape(-1, *grouped_z.shape[2:])
+            branch_node_mask = grouped_node_mask[:, 1:].reshape(-1, *grouped_node_mask.shape[2:])
+            branch_edge_mask = grouped_edge_mask[:, 1:].reshape(-1, *grouped_edge_mask.shape[2:])
+
+            branch_context = None
+            if context_slices is not None:
+                branch_index_list = branch_indices.reshape(-1).tolist()
+                branch_context_slices = [context_slices[idx] for idx in branch_index_list]
+                branch_context = self._collate_context(branch_context_slices)
+
+            branch_result = self._rollout_member(
+                initial_z=branch_z,
+                node_mask=branch_node_mask,
+                edge_mask=branch_edge_mask,
+                context=branch_context,
+                fix_noise=fix_noise,
+                schedule=schedule,
+                start_idx=prefix_steps,
+                prefix_cache=branch_prefix_cache,
+            )
+
+            branch_split = self._split_member_results(branch_result)
+            for idx_tensor, member_result in zip(branch_indices.reshape(-1).tolist(), branch_split):
+                results[idx_tensor] = member_result
+
+        latents, logps, timesteps, mus, sigmas, x, h = self._stack_member_results(results)
+
         self._assert_mean_zero_with_mask(x, node_mask)
 
         max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
@@ -192,28 +296,13 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
 
         return x, h, mu_x, sigma_x.squeeze(-1), log_p, zeros, xh
 
-    def compute_log_p_zs_given_zt(self, x, mu, sigma, node_mask = None):
-        '''
-        Compute log p(zs | zt) for a Gaussian distribution.
-
-        Args:
-            x (Tensor): The input tensor (e.g., zs values).
-            mu (Tensor): The mean tensor (e.g., zt values).
-            sigma (Tensor): The standard deviation tensor (e.g., sigma values).
-
-        Returns:
-            Tensor: The log of the probability p(zs | zt).
-        '''
-        # Ensure sigma is positive to avoid numerical issues
-        epsilon = 1e-6
-        sigma = torch.max(sigma, torch.tensor(epsilon, device=sigma.device))
-
-        delta = x.detach()
-        
-        log_p = -0.5 * ((delta - mu) ** 2) / (sigma ** 2) * node_mask
-        # Sum over dimensions and normalize
-        p_zs_zt = log_p.sum(dim=tuple(range(1, log_p.ndim))) / (node_mask.sum(dim=tuple(range(1, node_mask.ndim))) * 9)
-        return p_zs_zt 
+    def compute_log_p_zs_given_zt(self, x, mu, sigma, node_mask=None):
+        """Compute per-sample log-probability of zs conditioned on zt."""
+        if node_mask is None:
+            mask = torch.ones_like(x[..., :1], dtype=x.dtype, device=x.device)
+        else:
+            mask = node_mask.to(dtype=x.dtype, device=x.device)
+        return policy_step_logprob(x, mu, sigma, mask)
 
     def sample_p_zs_given_zt(self, s, t, zt, node_mask, edge_mask, context=None, fix_noise=False, prev_sample=None):
         """Samples from zs ~ p(zs | zt). """
@@ -227,7 +316,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         sigma_s = self.sigma(gamma_s, target_tensor=zt)
         sigma_t = self.sigma(gamma_t, target_tensor=zt)
         # Neural net prediction 
-        
+        # zt shape number of prompts \times num nodes \times 9
+        # z number of prompts \times 1
+        # node_mask number of prompts \times num nodes \times 9
+        # edge mask is flattened across batch and 
         eps_t = self.phi(zt, t, node_mask, edge_mask, context)
 
         # Compute mu for p(zs | zt).
@@ -257,6 +349,12 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         return zs, log_p, mu, sigma
 
     def _sample_initial_latents(self, n_samples, n_nodes, node_mask, group_index, share_initial_noise):
+        """Draw the starting latent noise, optionally synchronizing by group.
+
+        When ``share_initial_noise`` is true, grouped prompts reuse the same base
+        noise for their shared prefix. The returned tensor already contains the
+        broadcasted latents so the sampling loop can branch immediately.
+        """
         if share_initial_noise:
             group_index = group_index.to(node_mask.device).view(-1)
             if group_index.shape[0] != n_samples:
@@ -278,3 +376,329 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
 
         return self.sample_combined_position_feature_noise(n_samples, n_nodes, node_mask)
 
+    def _slice_context(self, context, index):
+        """Extract the ``index``-th prompt context while preserving structure.
+
+        The sampler receives per-sample conditioning tensors, dictionaries, or
+        sequences. This helper mirrors ``torch.utils.data.default_collate`` in
+        reverse so that each branched member sees only its own prompt features.
+        """
+        if context is None:
+            return None
+        if isinstance(context, torch.Tensor):
+            if context.size(0) == 1:
+                return context
+            return context[index : index + 1]
+        if isinstance(context, dict):
+            sliced = {}
+            for key, value in context.items():
+                if isinstance(value, (torch.Tensor, dict, list, tuple)):
+                    sliced[key] = self._slice_context(value, index)
+                else:
+                    sliced[key] = value
+            return sliced
+        if isinstance(context, (list, tuple)):
+            sliced_elems = []
+            for value in context:
+                if isinstance(value, (torch.Tensor, dict, list, tuple)):
+                    sliced_elems.append(self._slice_context(value, index))
+                else:
+                    sliced_elems.append(value)
+            if isinstance(context, tuple):
+                return tuple(sliced_elems)
+            return sliced_elems
+        return context
+
+    def _collate_context(self, contexts):
+        """Stack a list of per-member contexts into a batched structure."""
+        if contexts is None or len(contexts) == 0:
+            return None
+
+        example = contexts[0]
+        if example is None:
+            if any(ctx is not None for ctx in contexts):
+                raise ValueError("Mixed None/non-None contexts cannot be collated.")
+            return None
+        if isinstance(example, torch.Tensor):
+            return torch.cat(contexts, dim=0)
+        if isinstance(example, dict):
+            return {key: self._collate_context([ctx[key] for ctx in contexts]) for key in example}
+        if isinstance(example, (list, tuple)):
+            collated = [self._collate_context([ctx[i] for ctx in contexts]) for i in range(len(example))]
+            return tuple(collated) if isinstance(example, tuple) else collated
+        if isinstance(example, (int, float, str, bool)):
+            if any(ctx != example for ctx in contexts):
+                raise ValueError("Scalar contexts must be identical across branched members.")
+            return example
+        return example
+
+    def _sample_full_batch(self, z, node_mask, edge_mask, context, fix_noise, n_samples):
+        latents = []
+        logps = []
+        timesteps = []
+        mus = []
+        sigmas = []
+        latents.append(z)
+        # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
+        for s in tq(reversed(range(0, self.T)), desc="sampling", leave=False, unit="step"):
+            s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
+            t_array = s_array + 1
+            s_array = s_array / self.T
+            t_array = t_array / self.T
+            z, logp, mu, sigma = self.sample_p_zs_given_zt(
+                s_array,
+                t_array,
+                z,
+                node_mask,
+                edge_mask,
+                context,
+                fix_noise=fix_noise,
+            )
+            latents.append(z)
+            logps.append(logp)
+            timesteps.append(s)
+            mus.append(mu)
+            sigmas.append(sigma)
+
+        # Finally sample p(x, h | z_0).
+        x, h, mu, sigma, logp, s, z = self.sample_p_xh_given_z0(
+            z, node_mask, edge_mask, context, fix_noise=fix_noise
+        )
+
+        latents.append(z)
+        logps.append(logp)
+        timesteps.append(0)
+        mus.append(mu)
+        sigmas.append(sigma.unsqueeze(-1))
+
+        self._assert_mean_zero_with_mask(x, node_mask)
+
+        max_cog = torch.sum(x, dim=1, keepdim=True).abs().max().item()
+        if max_cog > 5e-2:
+            print(
+                f'Warning cog drift with error {max_cog:.3f}. Projecting '
+                f'the positions down.'
+            )
+            x = self._remove_mean_with_mask(x, node_mask)
+
+        return x, h, latents, logps, timesteps, mus, sigmas
+
+    def _rollout_member(
+        self,
+        initial_z,
+        node_mask,
+        edge_mask,
+        context,
+        fix_noise,
+        schedule,
+        start_idx,
+        prefix_cache=None,
+    ):
+        """Simulate one or more members' diffusion trajectories in parallel.
+
+        Args:
+            initial_z: Starting latents with a leading batch dimension.
+            start_idx: Where to resume in ``schedule`` (0 for reference members,
+                ``prefix_steps`` for branched members).
+            prefix_cache: Optional cached history from the reference trajectory.
+        """
+        latents = []
+        logps = []
+        mus = []
+        sigmas = []
+        timesteps = []
+
+        batch_size = initial_z.shape[0]
+
+        if prefix_cache is None:
+            z = initial_z
+            latents.append(z)
+        else:
+            # Broadcast the cached prefix so every branched member resumes from
+            # the exact same latent history.
+            latents = [
+                frame.expand(batch_size, *frame.shape[1:]).clone()
+                for frame in prefix_cache["latents"]
+            ]
+            logps = [
+                frame.expand(batch_size, *frame.shape[1:]).clone()
+                for frame in prefix_cache["logps"]
+            ]
+            mus = [
+                frame.expand(batch_size, *frame.shape[1:]).clone()
+                for frame in prefix_cache["mus"]
+            ]
+            sigmas = [
+                frame.expand(batch_size, *frame.shape[1:]).clone()
+                for frame in prefix_cache["sigmas"]
+            ]
+            timesteps = list(prefix_cache["timesteps"])
+            z = latents[-1]
+
+        # ``sample_p_zs_given_zt`` expects the flattened edge layout used during
+        # training, so reshape once outside the timestep loop for efficiency.
+        flat_edge_mask = edge_mask.view(edge_mask.shape[0], -1, edge_mask.shape[-1])
+        flat_edge_mask = flat_edge_mask.reshape(-1, flat_edge_mask.shape[-1])
+
+        for schedule_idx in range(start_idx, len(schedule)):
+            s = schedule[schedule_idx]
+            s_array = torch.full((batch_size, 1), fill_value=s, device=z.device)
+            t_array = s_array + 1
+            s_array = s_array / self.T
+            t_array = t_array / self.T
+            z, logp, mu, sigma = self.sample_p_zs_given_zt(
+                s_array,
+                t_array,
+                z,
+                node_mask,
+                flat_edge_mask,
+                context,
+                fix_noise=fix_noise,
+            )
+            latents.append(z)
+            logps.append(logp)
+            timesteps.append(s)
+            mus.append(mu)
+            sigmas.append(sigma)
+
+        x, h, mu, sigma, logp, s, z = self.sample_p_xh_given_z0(
+            z, node_mask, flat_edge_mask, context, fix_noise=fix_noise
+        )
+
+        latents.append(z)
+        logps.append(logp)
+        timesteps.append(0)
+        mus.append(mu)
+        sigmas.append(sigma.unsqueeze(-1))
+
+        return {
+            "latents": latents,
+            "logps": logps,
+            "mus": mus,
+            "sigmas": sigmas,
+            "timesteps": timesteps,
+            "x": x,
+            "h": h,
+        }
+
+    def _split_member_results(self, batched_result):
+        """Split a batched rollout dictionary back into per-member records."""
+        batch_size = batched_result["x"].shape[0]
+        member_results = []
+
+        for idx in range(batch_size):
+            member_result = {
+                "latents": [frame[idx : idx + 1].clone() for frame in batched_result["latents"]],
+                "logps": [frame[idx : idx + 1].clone() for frame in batched_result["logps"]],
+                "mus": [frame[idx : idx + 1].clone() for frame in batched_result["mus"]],
+                "sigmas": [frame[idx : idx + 1].clone() for frame in batched_result["sigmas"]],
+                "timesteps": list(batched_result["timesteps"]),
+                "x": batched_result["x"][idx : idx + 1].clone(),
+                "h": {
+                    "categorical": batched_result["h"]["categorical"][idx : idx + 1].clone(),
+                    "integer": batched_result["h"]["integer"][idx : idx + 1].clone(),
+                },
+            }
+            member_results.append(member_result)
+
+        return member_results
+
+    def _extract_batched_prefix_cache(self, member_result, prefix_steps):
+        """Clone the shared prefix from a batched reference rollout."""
+        if prefix_steps <= 0:
+            return None
+        cache = {
+            "latents": [
+                frame.clone()
+                for frame in member_result["latents"][: prefix_steps + 1]
+            ],
+            "logps": [
+                frame.clone()
+                for frame in member_result["logps"][:prefix_steps]
+            ],
+            "mus": [
+                frame.clone()
+                for frame in member_result["mus"][:prefix_steps]
+            ],
+            "sigmas": [
+                frame.clone()
+                for frame in member_result["sigmas"][:prefix_steps]
+            ],
+            "timesteps": list(member_result["timesteps"][:prefix_steps]),
+        }
+        return cache
+
+    def _repeat_prefix_cache(self, prefix_cache, repeats):
+        """Tile a batched prefix cache across additional group members."""
+        if prefix_cache is None or repeats <= 0:
+            return prefix_cache
+
+        repeated_cache = {
+            "latents": [
+                frame.repeat_interleave(repeats, dim=0)
+                for frame in prefix_cache["latents"]
+            ],
+            "logps": [
+                frame.repeat_interleave(repeats, dim=0)
+                for frame in prefix_cache["logps"]
+            ],
+            "mus": [
+                frame.repeat_interleave(repeats, dim=0)
+                for frame in prefix_cache["mus"]
+            ],
+            "sigmas": [
+                frame.repeat_interleave(repeats, dim=0)
+                for frame in prefix_cache["sigmas"]
+            ],
+            "timesteps": list(prefix_cache["timesteps"]),
+        }
+        return repeated_cache
+
+    def _stack_member_results(self, member_results):
+        """Stack the per-member dictionaries into batched tensors.
+
+        The return layout mirrors ``_sample_full_batch`` so downstream consumers
+        can treat shared-prefix and independent sampling paths identically.
+        """
+        if any(result is None for result in member_results):
+            missing = [idx for idx, result in enumerate(member_results) if result is None]
+            raise ValueError(f"Missing diffusion trajectories for sample indices: {missing}")
+
+        num_members = len(member_results)
+        num_latent_frames = len(member_results[0]["latents"])
+        num_logp_frames = len(member_results[0]["logps"])
+
+        latents = []
+        logps = []
+        mus = []
+        sigmas = []
+
+        for frame_idx in range(num_latent_frames):
+            frame = torch.cat(
+                [member_results[i]["latents"][frame_idx] for i in range(num_members)], dim=0
+            )
+            latents.append(frame)
+
+        for frame_idx in range(num_logp_frames):
+            logp_frame = torch.cat(
+                [member_results[i]["logps"][frame_idx] for i in range(num_members)], dim=0
+            )
+            mu_frame = torch.cat(
+                [member_results[i]["mus"][frame_idx] for i in range(num_members)], dim=0
+            )
+            sigma_frame = torch.cat(
+                [member_results[i]["sigmas"][frame_idx] for i in range(num_members)], dim=0
+            )
+            logps.append(logp_frame)
+            mus.append(mu_frame)
+            sigmas.append(sigma_frame)
+
+        timesteps = list(member_results[0]["timesteps"])
+        x = torch.cat([member_results[i]["x"] for i in range(num_members)], dim=0)
+        h_cat = torch.cat(
+            [member_results[i]["h"]["categorical"] for i in range(num_members)], dim=0
+        )
+        h_int = torch.cat([member_results[i]["h"]["integer"] for i in range(num_members)], dim=0)
+        h = {"categorical": h_cat, "integer": h_int}
+
+        return latents, logps, timesteps, mus, sigmas, x, h

@@ -100,6 +100,16 @@ def main(cfg: DictConfig) -> None:
             "local_rank": dist_state["local_rank"],
             "is_main_process": is_main_process,
         }
+        train_cfg = config.get("train")
+        if isinstance(train_cfg, dict):
+            grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
+            try:
+                grad_accum = int(grad_accum)
+            except (TypeError, ValueError):
+                grad_accum = 1
+            if grad_accum <= 0:
+                grad_accum = 1
+            train_cfg["gradient_accumulation_steps"] = grad_accum
 
     # Load EDM config
     edm_config_path = config["model"]["config"]

@@ -30,6 +30,18 @@ class EDMRollout(BaseRollout):
         else:
             self.force_alignment_enabled = bool(enabled_cfg)
         self.force_alignment_weight = raw_weight if self.force_alignment_enabled else 0.0
+
+        reward_cfg = self.config.get("reward") or {}
+        shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
+        scheduler_cfg = {}
+        if isinstance(shaping_cfg, dict):
+            scheduler_cfg = shaping_cfg.get("scheduler", {}) or {}
+        skip_default = shaping_cfg.get("skip_prefix", 0) if isinstance(shaping_cfg, dict) else 0
+        skip_value = scheduler_cfg.get("skip_prefix", skip_default)
+        try:
+            self.skip_prefix = max(0, int(skip_value))
+        except Exception:
+            self.skip_prefix = 0
         
         
     def start_async(self, prompts_queue):
@@ -128,6 +140,8 @@ class EDMRollout(BaseRollout):
         n_samples = batch_size
         n_nodes = max_n_nodes  # node_mask shape is [batch_size, n_nodes]
         # Call the model's sample method
+        # Delegate shared-prefix handling to the model so each group reuses the
+        # same prefix latents before branching into independent continuations.
         x, h, latents, logps, timesteps, mus, sigmas = model_ref.sample(
             n_samples=n_samples,
             n_nodes=n_nodes,
@@ -136,30 +150,37 @@ class EDMRollout(BaseRollout):
             timestep=self.config["model"]["time_step"],
             group_index=prompts.batch["group_index"],
             share_initial_noise=self.config["model"].get("share_initial_noise", False),
+            skip_prefix=self.skip_prefix,
         )
         device = x.device
-        
+
+        latents_tensor = torch.stack(latents, dim=1)
+        logps_tensor = torch.stack(logps, dim=1)
+        mus_tensor = torch.stack(mus, dim=1)
+
         # Convert timesteps to tensor and expand to batch_size
         timesteps_tensor = torch.tensor(timesteps, device=device)
         # Expand timesteps to have the same batch size as the other tensors
         # Shape will be [batch_size, num_timesteps]
         expanded_timesteps = timesteps_tensor.unsqueeze(0).repeat([batch_size,1])
-        
+
         # Create a dictionary with the results
         batch_data = {
             "x": x,
             "categorical": h["categorical"],
-            "latents": torch.stack(latents, dim=1),
-            "logps": torch.stack(logps, dim=1),
+            "latents": latents_tensor,
+            "logps": logps_tensor,
             "nodesxsample": nodesxsample,
             "timesteps": expanded_timesteps,
             "group_index": prompts.batch["group_index"],
         }
         if self.force_alignment_enabled and self.force_alignment_weight > 0.0:
-            batch_data["mus"] = torch.stack(mus, dim=1)
+            batch_data["mus"] = mus_tensor
 
         meta_info = prompts.meta_info.copy()
         meta_info["force_alignment_enabled"] = self.force_alignment_enabled and self.force_alignment_weight > 0.0
+        meta_info["skip_prefix"] = self.skip_prefix
+        meta_info["share_initial_noise"] = bool(self.config["model"].get("share_initial_noise", False))
 
         return DataProto(batch=TensorDict(batch_data, batch_size= batch_size), meta_info=meta_info)
     
@@ -177,7 +198,5 @@ class EDMRollout(BaseRollout):
             return self.output_queue.get(timeout=timeout)
         except queue.Empty:
             return None
-            
-    
-    
+
     

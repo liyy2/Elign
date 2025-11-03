@@ -12,7 +12,7 @@ from .base import BaseActor
 import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
-
+import torch.distributed as dist
 class EDMActor(BaseActor):
     def __init__(self, model, config):
         """
@@ -42,6 +42,7 @@ class EDMActor(BaseActor):
         self.train_micro_batch_size = self.config["train"]["train_micro_batch_size"]
         self.max_grad_norm = self.config["train"]["max_grad_norm"]
         self.clip_range = self.config["train"]["clip_range"]
+        self.adv_clip_max = max(0.0, float(self.config["train"].get("adv_clip_max", 5.0) or 5.0))
         self.epoch_per_rollout = max(int(self.config["train"].get("epoch_per_rollout", 1)), 1)
         self.num_timesteps = self.config["model"]["time_step"]
         alignment_cfg = self.config.get("train", {})
@@ -55,6 +56,22 @@ class EDMActor(BaseActor):
         self.force_alignment_min_force = float(alignment_cfg.get("force_alignment_min_force", 1e-4))
         self.force_alignment_min_delta = float(alignment_cfg.get("force_alignment_min_delta", 1e-4))
         self._force_alignment_eps = 1e-8
+        model_cfg = self.config.get("model") or {}
+        self.share_initial_noise = bool(model_cfg.get("share_initial_noise", False))
+        reward_cfg = self.config.get("reward") or {}
+        shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
+        scheduler_cfg = {}
+        if isinstance(shaping_cfg, dict):
+            scheduler_cfg = shaping_cfg.get("scheduler", {}) or {}
+        # The reward shaper mirrors DanceGRPO's API: allow a global skip prefix
+        # with optional per-scheduler overrides. Normalize everything to an int.
+        skip_default = shaping_cfg.get("skip_prefix", 0) if isinstance(shaping_cfg, dict) else 0
+        skip_value = scheduler_cfg.get("skip_prefix", skip_default)
+        try:
+            self.skip_prefix = max(0, int(skip_value))
+        except Exception:
+            self.skip_prefix = 0
+        self.active_num_timesteps = self.num_timesteps
 
     def setup_scheduler(self, total_training_steps: Optional[int] = None) -> None:
         """Initialize the learning rate scheduler if configured."""
@@ -125,8 +142,21 @@ class EDMActor(BaseActor):
         """
         info = defaultdict(list)
         # Train only over latent transitions (exclude terminal x/h step)
-        self.T = self.num_timesteps
+        self.T = getattr(self, "active_num_timesteps", self.num_timesteps)
+        if self.T <= 0:
+            metric = {
+                "ClipFrac": 0.0,
+                "Loss": 0.0,
+                "lr": self.optimizer.param_groups[0]["lr"],
+            }
+            return metric
         alignment_active = self.force_alignment_enabled and self.force_alignment_weight > 0.0
+        grad_accum_steps = int(self.config["train"].get("gradient_accumulation_steps", 1) or 1)
+        if grad_accum_steps <= 0:
+            grad_accum_steps = 1
+        num_batches = len(batched_samples)
+        self.optimizer.zero_grad()
+        last_lr = None
         for _i, sample in tq(
             enumerate(batched_samples),
             desc="Training",
@@ -134,7 +164,7 @@ class EDMActor(BaseActor):
             leave=False,
             disable=not self.is_main_process,
         ):
-            mus = sample.get("mus") if alignment_active else None
+            mus = sample.get("mus") if alignment_active else None # number of total samples \times number of active steps \times number of nodes \times dim (9)
             force_vectors = sample.get("force_vectors") if alignment_active else None
             force_indices = sample.get("force_schedule_indices") if alignment_active else None
             force_fine_mask = sample.get("force_fine_mask") if alignment_active else None
@@ -169,7 +199,7 @@ class EDMActor(BaseActor):
                     if force_index_lookup is not None:
                         slot = force_index_lookup.get(int(j))
                         if slot is not None:
-                            force_vectors_step = force_vectors[:, slot]
+                            force_vectors_step = force_vectors[:, slot] # number of total samples \times num nodes \times 3
                             if force_fine_mask is not None:
                                 fine_mask_step = force_fine_mask[:, slot]
                     if slot is None:
@@ -182,7 +212,7 @@ class EDMActor(BaseActor):
                             if force_fine_mask is not None:
                                 fine_mask_step = (force_fine_mask * force_mask_f).sum(dim=1)
 
-                loss, clipfrac, align_penalty, align_cosine = self.calculate_loss(
+                loss, clipfrac, adv_clipfrac, align_penalty, align_cosine = self.calculate_loss(
                         sample["latents"][:, j],
                         sample["timesteps"][:, j],
                         sample["next_latents"][:, j],
@@ -195,27 +225,43 @@ class EDMActor(BaseActor):
                         fine_stage_mask=fine_mask_step,
                     )
                 info["clipfrac"].append(clipfrac.item())
-                info["loss"].append(loss.item())
+                if adv_clipfrac is not None:
+                    info["adv_clipfrac"].append(adv_clipfrac.detach().cpu().item())
+                info["loss"].append(loss.detach().cpu().item())
                 if align_penalty is not None:
                     info["force_alignment_penalty"].append(align_penalty.detach().cpu().item())
                 if align_cosine is not None:
                     info["force_alignment_cosine"].append(align_cosine.detach().cpu().item())
-                loss.backward()
-                # Respect configured gradient clipping (train.max_grad_norm)
-                clip_grad_norm_(self.model.parameters(), max_norm=self.max_grad_norm)
+                scaled_loss = loss / float(grad_accum_steps * self.T)
+                scaled_loss.backward()
 
-        # Record learning rate before scheduler update for logging
-        current_lr = self.optimizer.param_groups[0]["lr"]
-        self.optimizer.step()
-        if self.lr_scheduler is not None:
-            self.lr_scheduler.step()
-        self.lr_history.append(current_lr)
-        self.optimizer.zero_grad()
+            step_condition = ((_i + 1) % grad_accum_steps == 0) or (_i + 1 == num_batches)
+            if step_condition:
+                current_lr = self.optimizer.param_groups[0]["lr"]
+                if self.max_grad_norm is not None and self.max_grad_norm > 0:
+                    # Clip gradients once per optimizer step, matching DanceGRPO's
+                    # accumulate-then-clip pattern instead of clipping after every
+                    # micro batch.
+                    clip_grad_norm_(
+                        self.model.parameters(),
+                        max_norm=float(self.max_grad_norm),
+                    )
+                self.optimizer.step()
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
+                self.lr_history.append(current_lr)
+                last_lr = current_lr
+                self.optimizer.zero_grad()
+        
             
         metric = {}
-        metric["ClipFrac"] = np.mean(np.array(info["clipfrac"]))
-        metric["Loss"] = np.mean(np.array(info["loss"]))
-        metric["lr"] = current_lr
+        metric["ClipFrac"] = float(np.mean(np.array(info["clipfrac"]))) if info["clipfrac"] else 0.0
+        metric["Loss"] = float(np.mean(np.array(info["loss"]))) if info["loss"] else 0.0
+        if info["adv_clipfrac"]:
+            metric["AdvClipFrac"] = float(np.mean(np.array(info["adv_clipfrac"])))
+        if last_lr is None:
+            last_lr = self.optimizer.param_groups[0]["lr"]
+        metric["lr"] = last_lr
         if info["force_alignment_penalty"]:
             metric["ForceAlignPenalty"] = np.mean(np.array(info["force_alignment_penalty"]))
         if info["force_alignment_cosine"]:
@@ -258,18 +304,23 @@ class EDMActor(BaseActor):
             fine_stage_mask (torch.Tensor, optional):
                 Per-sample indicator (1 -> fine-stage timestep) used to gate force alignment.
         Returns:
-            loss (torch.Tensor), clipfrac (torch.Tensor), alignment_penalty (torch.Tensor or None)
+            loss (torch.Tensor), clipfrac (torch.Tensor), adv_clipfrac (torch.Tensor or None), alignment_penalty (torch.Tensor or None), alignment_cosine (torch.Tensor or None)
         """
-        s_array = timesteps
+        s_array = timesteps # a broadcast vector of a scalar step
         t_array = s_array + 1
         s_array = s_array / self.num_timesteps
         t_array = t_array / self.num_timesteps
         ## need add
+        # Use the underlying model (in case it is wrapped by DataParallel) to build diffusion masks.
         model_ref = self.model.module if hasattr(self.model, "module") else self.model
+        # Generate the per-node and per-edge validity masks for this batch, given how many nodes each sample uses.
         node_mask, edge_mask = model_ref.get_mask(nodesxsample, latents.shape[0], self.max_n_nodes)
+        # Move masks onto the same device as the latent tensors so later ops don't hit CPU/GPU mismatches.
         node_mask = node_mask.to(latents.device)
         edge_mask = edge_mask.to(latents.device)
 
+        # Evaluate the current diffusion policy for the reverse step p(z_s | z_t) to get the
+        # transition log-probability and drift (mu) that will be compared against the behavior policy.
         _, log_prob_current, mu_current, _ = model_ref.sample_p_zs_given_zt(
             s_array,
             t_array,
@@ -285,17 +336,23 @@ class EDMActor(BaseActor):
         # compute the log prob of next_latents given latents under the current model
         dif_logp = (log_prob_current - log_prob_old)
         ratio = torch.exp(dif_logp)
+        adv_clipfrac = None
+        if self.adv_clip_max > 0:
+            clip_limit = float(self.adv_clip_max)
+            adv_clipfrac = (advantages.abs() > clip_limit).float().mean()
+            advantages = torch.clamp(advantages, -clip_limit, clip_limit)
+
         loss = self.loss(advantages, self.clip_range, ratio)
         clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.clip_range).float())
 
         alignment_penalty = None
         alignment_cosine = None
         if not (self.force_alignment_enabled and self.force_alignment_weight > 0):
-            return loss, clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None
         if mu_old is None or force_vectors is None or fine_stage_mask is None:
-            return loss, clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None
         if torch.is_tensor(fine_stage_mask) and torch.all(fine_stage_mask == 0):
-            return loss, clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None
 
         mu_old = mu_old.to(latents.device)
         force_vectors = force_vectors.to(latents.device)
@@ -312,7 +369,7 @@ class EDMActor(BaseActor):
         if alignment_penalty is not None:
             loss = loss + alignment_penalty
 
-        return loss, clipfrac, alignment_penalty, alignment_cosine
+        return loss, clipfrac, adv_clipfrac, alignment_penalty, alignment_cosine
 
     def _compute_force_alignment_penalty(self, mu_old, mu_new, force_vectors, node_mask, fine_stage_mask):
         """
@@ -382,30 +439,66 @@ class EDMActor(BaseActor):
         # Optional per-step advantages from reward shaping
         if "advantages_ts" in data.batch.keys():
             samples["advantages_ts"] = data.batch["advantages_ts"]
-            # Keep scalar as well for logging/compat
-            samples["advantages"] = data.batch.get("advantages", data.batch["advantages_ts"].sum(dim=1))
-        else:
+        if "advantages" in data.batch.keys():
             samples["advantages"] = data.batch["advantages"]
-        
+
         # Latent sequences contain z_T..z_0 and a final decoded x/h frame; exclude terminal for training
-        samples["latents"] = data.batch["latents"][:, : self.num_timesteps + 1].clone()
-        samples["next_latents"] = data.batch["latents"][:, 1 : self.num_timesteps + 1].clone()
-        samples["timesteps"] = data.batch["timesteps"][:, : self.num_timesteps]
-        samples["logps"] = data.batch["logps"][:, : self.num_timesteps]
+        latents_full = data.batch["latents"][:, : self.num_timesteps + 1].clone()
+        next_latents_full = data.batch["latents"][:, 1 : self.num_timesteps + 1].clone()
+        timesteps_full = data.batch["timesteps"][:, : self.num_timesteps].clone()
+        logps_full = data.batch["logps"][:, : self.num_timesteps].clone()
+
+        meta_skip_prefix = data.meta_info.get("skip_prefix", self.skip_prefix)
+        try:
+            meta_skip_prefix = int(meta_skip_prefix)
+        except Exception:
+            meta_skip_prefix = self.skip_prefix
+        share_prefix = bool(data.meta_info.get("share_initial_noise", self.share_initial_noise))
+        start_idx = min(meta_skip_prefix if share_prefix else 0, self.num_timesteps)
+
+        if start_idx > 0:
+            latents_full = latents_full[:, start_idx:]
+            next_latents_full = next_latents_full[:, start_idx:]
+            timesteps_full = timesteps_full[:, start_idx:]
+            logps_full = logps_full[:, start_idx:]
+
+        samples["latents"] = latents_full
+        samples["next_latents"] = next_latents_full
+        samples["timesteps"] = timesteps_full
+        samples["logps"] = logps_full
+        self.active_num_timesteps = logps_full.size(1)
         samples["nodesxsample"] = data.batch["nodesxsample"]
         if self.force_alignment_enabled and "mus" in data.batch.keys():
-            # Keep mu per latent step; terminal x/h not used in training loop
-            samples["mus"] = data.batch["mus"][:, : self.num_timesteps + 1].clone()
+            mus_full = data.batch["mus"][:, : self.num_timesteps + 1].clone()
+            if start_idx > 0:
+                mus_full = mus_full[:, start_idx:]
+            samples["mus"] = mus_full
         if self.force_alignment_enabled and "force_vectors_schedule" in data.batch.keys():
-            samples["force_vectors"] = data.batch["force_vectors_schedule"].clone()
-            samples["force_schedule_indices"] = data.batch["force_schedule_indices"].clone()
+            force_vectors = data.batch["force_vectors_schedule"].clone()
+            force_schedule_indices = data.batch["force_schedule_indices"].clone()
+            keep_mask = None
+            if start_idx > 0 and force_schedule_indices.numel() > 0:
+                keep_mask = force_schedule_indices[0] >= start_idx
+                force_vectors = force_vectors[:, keep_mask]
+                force_schedule_indices = force_schedule_indices[:, keep_mask]
+            force_schedule_indices = force_schedule_indices - start_idx
+            samples["force_vectors"] = force_vectors
+            samples["force_schedule_indices"] = force_schedule_indices
             if "force_fine_mask" in data.batch.keys():
-                samples["force_fine_mask"] = data.batch["force_fine_mask"].clone()
+                force_fine_mask = data.batch["force_fine_mask"].clone()
+                if keep_mask is not None and force_fine_mask.numel() > 0:
+                    force_fine_mask = force_fine_mask[:, keep_mask]
+                samples["force_fine_mask"] = force_fine_mask
         if self.condition:
-           samples["context"] = data.batch["context"]
+            samples["context"] = data.batch["context"]
         # Optional per-step advantages should align with latent steps only
         if "advantages_ts" in samples:
-            samples["advantages_ts"] = samples["advantages_ts"][:, : self.num_timesteps]
+            adv_ts = samples["advantages_ts"]
+            adv_ts = adv_ts[:, : self.num_timesteps]
+            if start_idx > 0:
+                adv_ts = adv_ts[:, start_idx:]
+            samples["advantages_ts"] = adv_ts
+            samples["advantages"] = adv_ts.sum(dim=1)
 
         original_keys = list(samples.keys())
         original_values = list(samples.values())

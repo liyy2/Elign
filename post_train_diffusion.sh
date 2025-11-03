@@ -24,22 +24,22 @@ sanitize_for_name() {
 }
 
 # Optimization / training loop
-LEARNING_RATE="0.000001"
-CLIP_RANGE="0.2"
-TRAIN_MICRO_BATCH_SIZE=128 # batch size for doing policy gradient, reduce if the training part is a bottleneck
-EPOCH_PER_ROLLOUT=5
+LEARNING_RATE="1e-5"
+CLIP_RANGE="5e-3"
+TRAIN_MICRO_BATCH_SIZE=2 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+EPOCH_PER_ROLLOUT=1
 
 # Diffusion rollout settings
 SAMPLE_GROUP_SIZE=1 # Number of groups
-EACH_PROMPT_SAMPLE=128 # Group Size in GRPO
+EACH_PROMPT_SAMPLE=12 # Group Size in GRPO
 TIME_STEP=1000
-SHARE_INITIAL_NOISE=false
+SHARE_INITIAL_NOISE=true
 FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=false
-MLFF_MODEL="uma-s-1p1"
-MLFF_BATCH_SIZE=32 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
+MLFF_MODEL="uma-m-1p1"
+MLFF_BATCH_SIZE=16 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="rms"
 STABILITY_WEIGHT="1"
 SKIP_PREFIX=700
@@ -89,7 +89,7 @@ SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
 
 mkdir -p "${SAVE_PATH}"
 
-GPUS_PER_NODE=4
+GPUS_PER_NODE=1
 
 export MASTER_ADDR=${MASTER_ADDR:-$(hostname)}
 export MASTER_PORT=${MASTER_PORT:-29500}

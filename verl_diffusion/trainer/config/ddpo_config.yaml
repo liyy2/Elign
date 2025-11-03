@@ -32,6 +32,7 @@ train:
   adam_epsilon: 0.00000001
   clip_range: 0.15
   train_micro_batch_size: 512
+  gradient_accumulation_steps: 1
   force_alignment_enabled: true
   epoch_per_rollout: 1
   force_alignment_weight: 0.5
@@ -63,7 +64,7 @@ reward:
     method: potential
     gamma: 1.0
     weight: 1.0
-    mlff_batch_size: 4
+    mlff_batch_size: 32
     terminal_weight: 5
     scheduler:
       mode: adaptive
