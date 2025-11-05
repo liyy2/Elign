@@ -449,6 +449,10 @@ class DDPOTrainer(BaseTrainer):
                     samples = self.compute_advantage(samples)
                     metrics = self.actor.update_policy(samples, epoch_callback=None)
                     metrics["epoch"] = epoch + 1
+                    # `reward` is the mean of the final scalar signal used for policy updates,
+                    # i.e. the force and energy components after weighting plus any shaping bonus.
+                    # `force_reward_mean` logs the unweighted force term, while
+                    # `weighted_force_reward_mean` reflects that same term after its configured weight.
                     metrics["reward"] = samples.batch["rewards"].mean().item()
                     metrics["filter_ratio"] = filter_ratio
                     metrics["novelty_penalty_ratio"] = novelty_penalty_ratio

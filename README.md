@@ -160,4 +160,46 @@ python eval_mlff_guided.py \
 └── README.md                           # This file
 ```
 
+Notes on Batch size:
 
+```
+Pipeline Flow
+
+DataLoader (EDMDataLoader)
+├─ sample_group_size = G (default 4)                         config: verl_diffusion/trainer/config/ddpo_config.yaml:13
+├─ each_prompt_sample = R (default 128)                      config: verl_diffusion/trainer/config/ddpo_config.yaml:14
+├─ Total prompts per DataProto batch = P = G × R (512)       verl_diffusion/dataloader/dataloader.py:35-134
+└─ Outputs batch_size = [P], nodesxsample, group_index, etc.
+         │
+         ▼
+Rollout.generate_samples                                      verl_diffusion/worker/rollout/edm_rollout.py:100-127
+├─ micro_batch_size = M (default 512)                        config: verl_diffusion/trainer/config/ddpo_config.yaml:18
+├─ num_chunks = ceil(P / M); each chunk has B prompts
+├─ generate_minibatch runs the diffusion sampler on B prompts
+└─ Mapped tensors include latents[B, S, N, D], timesteps[B, S], ...
+         │
+         ▼
+Reward.calculate_rewards (UMA + MLFF)                        verl_diffusion/worker/reward/force.py:492-548
+├─ B from latents shape is the rollout chunk size (prompts in this pass)
+├─ Scheduler picks selected_count diffusion steps per prompt
+├─ Total MLFF evaluations = B × selected_count
+└─ Chunked further by mlff_batch_size = L (default 32)       config: verl_diffusion/trainer/config/ddpo_config.yaml:72
+         │
+         ▼
+Actor.update_policy                                          verl_diffusion/worker/actor/edm_actor.py:426-538
+├─ Receives reward-enriched batch of B prompts
+├─ train_micro_batch_size = T (default 512)                  config: verl_diffusion/trainer/config/ddpo_config.yaml:38
+├─ Splits batch into ceil(B / T) optimizer steps
+└─ Runs PPO-style update (with gradient_accumulation if needed)
+```
+
+For example,
+post_train_diffusion.sh (lines 19-63) sets sample_group_size=1 and each_prompt_sample=24, so each dataloader emission holds P = 1 × 24 = 24 prompt trajectories on the GPU.
+No override for dataloader.micro_batch_size, so the default 512 from verl_diffusion/trainer/config/ddpo_config.yaml (line 15) stays active. Because P < 512, the sampler keeps the whole batch together: rollout chunk size B = 24.
+Reward scheduling uses the adaptive policy in verl_diffusion/worker/reward/scheduler.py (lines 17-107) with skip_prefix=700 (script override) and coarse_stride=10, fine_stride=2, threshold_fraction=0.25. For a 1000-step diffusion:
+coarse region: indices 700, 710, 720, 730, 740, 750
+fine region: indices 752 through 998 every 2 steps
+terminal step: 999 appended
+⇒ selected_count = 131 diffusion nodes per prompt.
+MLFF shaping in verl_diffusion/worker/reward/force.py (lines 492-544) therefore flattens B × selected_count = 24 × 131 = 3144 evaluations. With mlff_batch_size=16 (script override), the loop runs ceil(3144 / 16) = 197 UMA force calls.
+PPO training splits the same 24 samples via train_micro_batch_size=4 (post_train_diffusion.sh (line 27), consumed in verl_diffusion/worker/actor/edm_actor.py (lines 499-523)) into exactly 6 optimizer mini-batches per rollout epoch.

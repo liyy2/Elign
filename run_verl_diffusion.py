@@ -15,7 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 
 from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
 
-sys.path.append("/home/yl2428/project_pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
+sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
 
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders

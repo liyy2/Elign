@@ -212,7 +212,7 @@ class EDMActor(BaseActor):
                             if force_fine_mask is not None:
                                 fine_mask_step = (force_fine_mask * force_mask_f).sum(dim=1)
 
-                loss, clipfrac, adv_clipfrac, align_penalty, align_cosine = self.calculate_loss(
+                loss, clipfrac, _adv_clipfrac, align_penalty, align_cosine = self.calculate_loss(
                         sample["latents"][:, j],
                         sample["timesteps"][:, j],
                         sample["next_latents"][:, j],
@@ -225,8 +225,6 @@ class EDMActor(BaseActor):
                         fine_stage_mask=fine_mask_step,
                     )
                 info["clipfrac"].append(clipfrac.item())
-                if adv_clipfrac is not None:
-                    info["adv_clipfrac"].append(adv_clipfrac.detach().cpu().item())
                 info["loss"].append(loss.detach().cpu().item())
                 if align_penalty is not None:
                     info["force_alignment_penalty"].append(align_penalty.detach().cpu().item())
@@ -257,8 +255,6 @@ class EDMActor(BaseActor):
         metric = {}
         metric["ClipFrac"] = float(np.mean(np.array(info["clipfrac"]))) if info["clipfrac"] else 0.0
         metric["Loss"] = float(np.mean(np.array(info["loss"]))) if info["loss"] else 0.0
-        if info["adv_clipfrac"]:
-            metric["AdvClipFrac"] = float(np.mean(np.array(info["adv_clipfrac"])))
         if last_lr is None:
             last_lr = self.optimizer.param_groups[0]["lr"]
         metric["lr"] = last_lr

@@ -490,6 +490,8 @@ class UMAForceReward(BaseReward):
                 T_steps = latents.shape[1]
 
             B, S, N, D = latents.shape
+            # B corresponds to the number of prompts/molecules in the current rollout batch.
+            # It matches the sampler micro-batch size (after any chunking of the dataloader group).
             node_mask_b = processed["node_mask"].to(self.device)
             F_force = torch.zeros((B, S), device=self.device)
             F_energy = torch.zeros((B, S), device=self.device) if self.use_energy else None
@@ -526,6 +528,8 @@ class UMAForceReward(BaseReward):
                 fine_mask_selected = fine_mask_selected.float()
             latents_selected = torch.index_select(latents, 1, schedule_indices).contiguous()
             flat_total = B * selected_count
+            # selected_count is the number of diffusion steps passing through MLFF;
+            # the total samples evaluated is prompts (B) times those scheduled steps.
             if self.mlff_batch_size > 0:
                 chunk_size = max(1, min(self.mlff_batch_size, flat_total))
             else:

@@ -24,21 +24,20 @@ sanitize_for_name() {
 }
 
 # Optimization / training loop
-LEARNING_RATE="1e-5"
-CLIP_RANGE="5e-3"
-TRAIN_MICRO_BATCH_SIZE=2 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+LEARNING_RATE="4e-6"
+CLIP_RANGE="2e-3"
+TRAIN_MICRO_BATCH_SIZE=4 # batch size for doing policy gradient, reduce if the training part is a bottleneck
 EPOCH_PER_ROLLOUT=1
-
 # Diffusion rollout settings
 SAMPLE_GROUP_SIZE=1 # Number of groups
-EACH_PROMPT_SAMPLE=12 # Group Size in GRPO
+EACH_PROMPT_SAMPLE=24 # Group Size in GRPO
 TIME_STEP=1000
 SHARE_INITIAL_NOISE=true
 FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=false
-MLFF_MODEL="uma-m-1p1"
+MLFF_MODEL="uma-s-1p1"
 MLFF_BATCH_SIZE=16 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="rms"
 STABILITY_WEIGHT="1"
@@ -84,7 +83,7 @@ _decay_$(sanitize_for_name "${SCHEDULER_MIN_LR_RATIO}")\
 _epoch_per_rollout_$(sanitize_for_name "${EPOCH_PER_ROLLOUT}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
-SAVE_ROOT="/home/yl2428/project_pi_mg269/yl2428/logs"
+SAVE_ROOT="/home/yl2428/logs"
 SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
 
 mkdir -p "${SAVE_PATH}"
