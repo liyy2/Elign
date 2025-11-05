@@ -42,6 +42,7 @@ MLFF_BATCH_SIZE=16 # Batch size for calculating reward, reduce if the reward cal
 FORCE_AGGREGATION="rms"
 STABILITY_WEIGHT="1"
 SKIP_PREFIX=700
+REWARD_SHAPING_ENABLED=false # Set to false to disable shaping and rely on terminal-only rewards
 
 # Scheduler configuration
 SCHEDULER_NAME="cosine"
@@ -80,6 +81,7 @@ _sched_$(sanitize_for_name "${SCHEDULER_NAME}")\
 _warmup_$(sanitize_for_name "${SCHEDULER_WARMUP_STEPS}")\
 _steps_$(sanitize_for_name "${SCHEDULER_TOTAL_STEPS}")\
 _decay_$(sanitize_for_name "${SCHEDULER_MIN_LR_RATIO}")\
+_shaping_$(sanitize_for_name "${REWARD_SHAPING_ENABLED}")\
 _epoch_per_rollout_$(sanitize_for_name "${EPOCH_PER_ROLLOUT}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
@@ -93,6 +95,16 @@ GPUS_PER_NODE=1
 export MASTER_ADDR=${MASTER_ADDR:-$(hostname)}
 export MASTER_PORT=${MASTER_PORT:-29500}
 
+declare -a SHAPING_FLAGS
+if [[ "${REWARD_SHAPING_ENABLED}" == true ]]; then
+  SHAPING_FLAGS=(
+    "reward.shaping.enabled=true"
+    "reward.shaping.scheduler.skip_prefix=${SKIP_PREFIX}"
+  )
+else
+  SHAPING_FLAGS=("reward.shaping.enabled=false")
+fi
+
 # Launch training
 torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py \
   wandb.enabled=true \
@@ -102,7 +114,6 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   train.clip_range="${CLIP_RANGE}" \
   model.share_initial_noise="${SHARE_INITIAL_NOISE}" \
   dataloader.each_prompt_sample="${EACH_PROMPT_SAMPLE}" \
-  reward.shaping.scheduler.skip_prefix="${SKIP_PREFIX}" \
   train.force_alignment_enabled="${FORCE_ALIGNMENT_ENABLED}" \
   train.train_micro_batch_size="${TRAIN_MICRO_BATCH_SIZE}" \
   train.epoch_per_rollout="${EPOCH_PER_ROLLOUT}" \
@@ -116,5 +127,6 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   train.scheduler.total_steps="${SCHEDULER_TOTAL_STEPS}" \
   train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}" \
   reward.use_energy="${USE_ENERGY}" \
-  reward.mlff_model="${MLFF_MODEL}"
+  reward.mlff_model="${MLFF_MODEL}" \
+  "${SHAPING_FLAGS[@]}"
   

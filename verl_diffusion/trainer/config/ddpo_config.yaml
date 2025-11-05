@@ -12,6 +12,9 @@ best_checkpoint_mode: max
 dataloader:
   sample_group_size: 4
   each_prompt_sample: 128
+  # Maximum number of prompts sent to the diffusion sampler at once.
+  # Dataloader batches larger than this value are split into smaller micro-batches
+  # to control GPU memory during rollout generation.
   micro_batch_size: 512
   epoches: 100
   smiles_path: "qm9/temp/qm9_smiles.pickle"
@@ -31,6 +34,8 @@ train:
   adam_weight_decay: 0.0001
   adam_epsilon: 0.00000001
   clip_range: 0.15
+  # Number of generated samples consumed per optimizer step when updating the policy.
+  # If the rollout batch is larger, it is chunked into blocks of this size for training.
   train_micro_batch_size: 512
   gradient_accumulation_steps: 1
   force_alignment_enabled: true
@@ -64,6 +69,8 @@ reward:
     method: potential
     gamma: 1.0
     weight: 1.0
+    # Cap on the number of diffusion steps evaluated in a single MLFF call.
+    # Larger schedules are processed in chunks of this size to limit MLFF memory usage.
     mlff_batch_size: 32
     terminal_weight: 5
     scheduler:
