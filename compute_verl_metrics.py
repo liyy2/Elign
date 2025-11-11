@@ -15,6 +15,7 @@ sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
 from edm_source.configs.datasets_config import get_dataset_info
 from verl_diffusion.protocol import DataProto
 from verl_diffusion.worker.reward.force import UMAForceReward
+from verl_diffusion.utils.rdkit_metrics import compute_rdkit_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -114,17 +115,19 @@ def select_device(device_arg: Optional[str]) -> torch.device:
     return torch.device("cpu")
 
 
-def load_samples(samples_path: Path) -> List[Dict[str, torch.Tensor]]:
+def load_samples(samples_path: Path) -> Tuple[List[Dict[str, torch.Tensor]], Dict[str, Any]]:
     payload = torch.load(samples_path, map_location="cpu")
+    metadata: Dict[str, Any] = {}
     if isinstance(payload, dict) and "samples" in payload:
         samples = payload["samples"]
+        metadata = {k: v for k, v in payload.items() if k != "samples"}
     elif isinstance(payload, list):
         samples = payload
     else:
         raise ValueError(f"Unrecognized sample payload structure in {samples_path}")
     if not isinstance(samples, list) or not samples:
         raise ValueError(f"No samples found in {samples_path}")
-    return samples
+    return samples, metadata
 
 
 def build_dataproto(
@@ -312,7 +315,7 @@ def main() -> None:
     device = select_device(args.device)
     rewarder = init_rewarder(dataset_info, reward_cfg, device)
 
-    samples = load_samples(samples_path)
+    samples, sample_metadata = load_samples(samples_path)
     batch_size = max(1, int(args.batch_size))
     metric_store: Dict[str, List[torch.Tensor]] = {}
 
@@ -326,18 +329,40 @@ def main() -> None:
         append_metrics(metric_store, result_proto.batch)
 
     summary, flattened = summarize_metrics(metric_store)
+    rdkit_metrics = sample_metadata.get("rdkit_metrics") if sample_metadata else None
+    if not rdkit_metrics:
+        rdkit_metrics = compute_rdkit_metrics(samples, dataset_info)
+    summary["rdkit_metrics"] = rdkit_metrics
 
     print("UMA evaluation complete")
     print(f"Total samples: {summary.get('num_samples', 0)}")
     for key, stats in summary.items():
-        if key in {"num_samples", "stability_rate"}:
+        if key in {"num_samples", "stability_rate", "rdkit_metrics"}:
             continue
-        if isinstance(stats, dict):
+        if isinstance(stats, dict) and "mean" in stats and "std" in stats:
             mean = stats["mean"]
             std = stats["std"]
             print(f"{key:>25}: mean={mean:.6f} std={std:.6f}")
     if "stability_rate" in summary:
         print(f"{'stability_rate':>25}: {summary['stability_rate']:.6f}")
+    if rdkit_metrics:
+        if "error" in rdkit_metrics:
+            print(f"{'rdkit_metrics':>25}: {rdkit_metrics['error']}")
+        else:
+            validity_pct = rdkit_metrics["validity"] * 100.0
+            uniqueness_pct = rdkit_metrics["uniqueness"] * 100.0
+            num_total = rdkit_metrics["num_total"]
+            num_valid = rdkit_metrics["num_valid"]
+            num_unique = rdkit_metrics["num_unique"]
+            print(
+                f"{'rdkit_validity':>25}: {validity_pct:.2f}% ({num_valid}/{num_total})"
+            )
+            if num_valid > 0:
+                print(
+                    f"{'rdkit_uniqueness':>25}: {uniqueness_pct:.2f}% ({num_unique}/{num_valid} valid)"
+                )
+            else:
+                print(f"{'rdkit_uniqueness':>25}: n/a (no valid molecules)")
 
     if args.output:
         output_path = make_absolute(args.output, run_dir) if not Path(args.output).is_absolute() else Path(args.output)

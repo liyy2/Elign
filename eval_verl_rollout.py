@@ -17,6 +17,7 @@ from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.model.edm_model import EDMModel
 from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
+from verl_diffusion.utils.rdkit_metrics import compute_rdkit_metrics
 
 
 
@@ -259,8 +260,14 @@ def prepare_sampling_config(
     return cfg
 
 
-def serialize_samples(samples: List[Dict[str, Any]], output_path: Path) -> None:
+def serialize_samples(
+    samples: List[Dict[str, Any]],
+    output_path: Path,
+    rdkit_metrics: Optional[Dict[str, Any]] = None,
+) -> None:
     payload = {"samples": samples}
+    if rdkit_metrics is not None:
+        payload["rdkit_metrics"] = rdkit_metrics
     torch.save(payload, output_path)
 
 
@@ -401,11 +408,31 @@ def main() -> None:
 
     progress.close()
 
-    serialize_samples(generated[:target], output_path)
+    final_samples = generated[:target]
+    rdkit_metrics = compute_rdkit_metrics(final_samples, dataset_info)
+    serialize_samples(final_samples, output_path, rdkit_metrics)
     print(
-        f"Saved {len(generated[:target])} molecules to {output_path}. "
+        f"Saved {len(final_samples)} molecules to {output_path}. "
         f"(batch_size={batch_size}, batches={total_batches}, device={device})"
     )
+    rdkit_error = rdkit_metrics.get("error") if isinstance(rdkit_metrics, dict) else None
+    if rdkit_error:
+        print(f"[WARN] Skipped RDKit metrics: {rdkit_error}")
+    else:
+        validity_pct = rdkit_metrics["validity"] * 100.0
+        uniqueness_pct = rdkit_metrics["uniqueness"] * 100.0
+        num_total = rdkit_metrics["num_total"]
+        num_valid = rdkit_metrics["num_valid"]
+        num_unique = rdkit_metrics["num_unique"]
+        print(
+            f"RDKit validity: {validity_pct:.2f}% ({num_valid}/{num_total})"
+        )
+        if num_valid > 0:
+            print(
+                f"RDKit uniqueness: {uniqueness_pct:.2f}% ({num_unique}/{num_valid} valid)"
+            )
+        else:
+            print("RDKit uniqueness: n/a (no valid molecules)")
 
 
 if __name__ == "__main__":
