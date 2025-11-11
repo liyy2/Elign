@@ -19,6 +19,11 @@ dataloader:
   epoches: 100
   smiles_path: "qm9/temp/qm9_smiles.pickle"
 
+filters:
+  condition: false
+  enable_filtering: false
+  enable_penalty: false
+
 model:
   config: "./pretrained/edm/edm_qm9/args.pickle"
   model_path: "./pretrained/edm/edm_qm9/generative_model_ema.npy"

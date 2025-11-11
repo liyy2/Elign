@@ -196,7 +196,17 @@ def main(cfg: DictConfig) -> None:
         energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
     )
 
-    filters = Filter(dataset_info, config["dataloader"]["smiles_path"], False, False, False)
+    filter_cfg = config.get("filters", {})
+    filter_condition = filter_cfg.get("condition", False)
+    filter_enable_filtering = filter_cfg.get("enable_filtering", False)
+    filter_enable_penalty = filter_cfg.get("enable_penalty", False)
+    filters = Filter(
+        dataset_info,
+        config["dataloader"]["smiles_path"],
+        filter_condition,
+        filter_enable_filtering,
+        filter_enable_penalty,
+    )
     actor = EDMActor(model, config)
 
     if is_main_process and not ray.is_initialized():

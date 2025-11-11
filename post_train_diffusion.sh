@@ -6,8 +6,8 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --time=48:00:00
-#SBATCH --gres=gpu:4
-#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+#SBATCH --partition=gpu_h200
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=yunyang.li@yale.edu
 
@@ -37,12 +37,19 @@ FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=false
-MLFF_MODEL="uma-s-1p1"
+MLFF_MODEL="uma-m-1p1"
 MLFF_BATCH_SIZE=16 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="rms"
-STABILITY_WEIGHT="1"
+STABILITY_WEIGHT="0"
 SKIP_PREFIX=700
 REWARD_SHAPING_ENABLED=false # Set to false to disable shaping and rely on terminal-only rewards
+
+# Note: when shaping is enabled, PPO advantages are computed from per-step
+# force/energy traces, so scalar rewards (and any novelty penalty applied to them)
+# only affect logs unless the penalty is injected into those traces.
+
+# Filtering configuration
+ENABLE_NOVELTY_PENALTY=false
 
 # Scheduler configuration
 SCHEDULER_NAME="cosine"
@@ -63,6 +70,7 @@ else
   ENERGY_TAG="no_energy"
 fi
 MODEL_TAG=$(sanitize_for_name "${MLFF_MODEL}")
+NOVELTY_PENALTY_TAG=$(sanitize_for_name "${ENABLE_NOVELTY_PENALTY}")
 
 RUN_NAME_BASE="verl_model_${MODEL_TAG}\
 _energy_$(sanitize_for_name "${ENERGY_TAG}")\
@@ -82,6 +90,7 @@ _warmup_$(sanitize_for_name "${SCHEDULER_WARMUP_STEPS}")\
 _steps_$(sanitize_for_name "${SCHEDULER_TOTAL_STEPS}")\
 _decay_$(sanitize_for_name "${SCHEDULER_MIN_LR_RATIO}")\
 _shaping_$(sanitize_for_name "${REWARD_SHAPING_ENABLED}")\
+_novpen_${NOVELTY_PENALTY_TAG}\
 _epoch_per_rollout_$(sanitize_for_name "${EPOCH_PER_ROLLOUT}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
@@ -128,5 +137,6 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}" \
   reward.use_energy="${USE_ENERGY}" \
   reward.mlff_model="${MLFF_MODEL}" \
+  filters.enable_penalty="${ENABLE_NOVELTY_PENALTY}" \
   "${SHAPING_FLAGS[@]}"
   
