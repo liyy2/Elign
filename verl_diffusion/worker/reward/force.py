@@ -317,8 +317,6 @@ class UMAForceReward(BaseReward):
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Option to shape only with energy while keeping force+energy terminals intact.
         self.shaping_energy_only = bool(self.shaping_cfg.get("only_energy_reshape", False))
-        # Weight for adding shaped sum to final reward
-        self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
         # Control number of diffusion steps per MLFF evaluation batch (0 => no chunking)
         self.mlff_batch_size = int(self.shaping_cfg.get("mlff_batch_size", 0) or 32)
 
@@ -481,6 +479,12 @@ class UMAForceReward(BaseReward):
         stability_flags = torch.zeros(batch_size, device=self.device)
         result = {}
         shaped_sum_tensor = None
+        rewards_ts = None
+        force_rewards_ts = None
+        energy_rewards_ts = None
+        terminal_force_metric = None
+        terminal_energy_metric = None
+        last_idx = None
 
 
         if shaping_active:
@@ -621,9 +625,8 @@ class UMAForceReward(BaseReward):
             #    ``shaped_force`` before accumulating the transition deltas. Summing
             #    the tensor therefore produced ``(F_last - F_first) + F_last`` and the
             #    terminal reward path added another ``F_last`` on top. The trainer was
-            #    effectively optimizing ``(terminal_weight + shaping_weight)·F_last -
-            #    shaping_weight·F_first`` instead of the intended potential
-            #    difference.
+            #    effectively optimizing ``(terminal_weight + 1)·F_last - F_first``
+            #    instead of the intended potential difference.
             # 2. Commit 6b9e5d7 removed the terminal write so the shaped sum collapsed
             #    to ``F_last - F_first``. However, it also left the terminal column in
             #    ``force_rewards_ts`` and ``energy_rewards_ts`` at zero, so
@@ -634,10 +637,6 @@ class UMAForceReward(BaseReward):
             #    traces. This preserves the unbiased ``F_last - F_first`` shaping
             #    signal and ensures the PPO advantage calculation still consumes the
             #    terminal metric exactly once.
-            terminal_force_metric = None
-            terminal_energy_metric = None
-            shaped_sum_tensor = None
-            last_idx = None
             # Vectorized potential-shaping over the scheduled indices, accounting for stride length.
             selected_count = int(schedule_indices.numel())
             if selected_count > 0:
@@ -693,33 +692,29 @@ class UMAForceReward(BaseReward):
             weighted_shaped_energy = (
                 self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
             )
-            shaped = weighted_shaped_force + weighted_shaped_energy
-
-            rewards_ts = shaped.clone()
-            force_rewards_ts = shaped_force.clone()
-            if self.use_energy:
-                energy_rewards_ts = shaped_energy.clone()
-            else:
-                energy_rewards_ts = None
 
             if last_idx is not None:
                 if terminal_force_metric is not None:
-                    terminal_force_weighted = self.force_weight * terminal_force_metric
-                    rewards_ts[:, last_idx] = terminal_force_weighted
-                    force_rewards_ts[:, last_idx] = terminal_force_metric
-                if terminal_energy_metric is not None and energy_rewards_ts is not None:
-                    terminal_energy_weighted = self.energy_weight * terminal_energy_metric
-                    rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + terminal_energy_weighted
-                    energy_rewards_ts[:, last_idx] = terminal_energy_metric
+                    terminal_force_weighted = self.force_weight * self.terminal_reward_weight * terminal_force_metric
+                else:
+                    terminal_force_weighted = None
+                if self.use_energy and terminal_energy_metric is not None:
+                    terminal_energy_weighted = self.energy_weight * self.terminal_reward_weight * terminal_energy_metric
+                else:
+                    terminal_energy_weighted = None
 
-            result["rewards_ts"] = rewards_ts.detach().cpu()
-            result["force_rewards_ts"] = force_rewards_ts.detach().cpu()
-            if self.use_energy and energy_rewards_ts is not None:
-                result["energy_rewards_ts"] = energy_rewards_ts.detach().cpu()
-            if terminal_force_metric is not None:
-                result["force_terminal_metric"] = terminal_force_metric.detach().cpu()
-            if terminal_energy_metric is not None:
-                result["energy_terminal_metric"] = terminal_energy_metric.detach().cpu()
+            rewards_ts = weighted_shaped_force + weighted_shaped_energy
+            force_rewards_ts = shaped_force.clone()
+            if self.use_energy:
+                energy_rewards_ts = shaped_energy.clone()
+
+            if last_idx is not None:
+                if terminal_force_metric is not None:
+                    rewards_ts[:, last_idx] = terminal_force_weighted
+                    force_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_force_metric
+                if terminal_energy_metric is not None and energy_rewards_ts is not None:
+                    rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + terminal_energy_weighted
+                    energy_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_energy_metric
 
             if alignment_active and force_vectors_selected is not None and fine_mask_selected is not None:
                 schedule_indices_cpu = (
@@ -798,12 +793,29 @@ class UMAForceReward(BaseReward):
         weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
         rewards = weighted_force_rewards + weighted_energy_rewards
 
+        # Inject stability bonus into per-step traces so PPO sees the same signal as scalar rewards.
+        if rewards_ts is not None and last_idx is not None:
+            stability_term = self.force_weight * self.terminal_reward_weight * stability_bonus
+            rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + stability_term
+            if force_rewards_ts is not None:
+                force_rewards_ts[:, last_idx] = force_rewards_ts[:, last_idx] + self.terminal_reward_weight * stability_bonus
+
         if shaped_sum_tensor is not None:
-            total_rewards = rewards + self.shaping_weight * shaped_sum_tensor
+            total_rewards = rewards + shaped_sum_tensor
         else:
             total_rewards = rewards
 
         # Populate final fields
+        if rewards_ts is not None:
+            result["rewards_ts"] = rewards_ts.detach().cpu()
+            result["force_rewards_ts"] = force_rewards_ts.detach().cpu()
+            if self.use_energy and energy_rewards_ts is not None:
+                result["energy_rewards_ts"] = energy_rewards_ts.detach().cpu()
+            if terminal_force_metric is not None:
+                result["force_terminal_metric"] = terminal_force_metric.detach().cpu()
+            if terminal_energy_metric is not None:
+                result["energy_terminal_metric"] = terminal_energy_metric.detach().cpu()
+
         result["rewards"] = total_rewards.detach().cpu()
         result["force_rewards"] = force_rewards.detach().cpu()
         result["energy_rewards"] = energy_rewards.detach().cpu()
