@@ -78,13 +78,13 @@ def get_mlff_predictor(
         mlff_predictor = pretrained_mlip.get_predict_unit(model_name, device=load_device)
         logger.info(f"Successfully loaded MLFF predictor: {model_name}")
 
-        if mlff_predictor is not None and hasattr(mlff_predictor, "lazy_model_intialized"):
+        if mlff_predictor is not None and hasattr(mlff_predictor, "lazy_model_initialized"):
             if load_device == "cuda":
                 current_index = torch.cuda.current_device()
                 mlff_predictor.device = f"cuda:{current_index}"
             else:
                 mlff_predictor.device = "cpu"
-            mlff_predictor.lazy_model_intialized = False
+            mlff_predictor.lazy_model_initialized = False
 
         return mlff_predictor
 
