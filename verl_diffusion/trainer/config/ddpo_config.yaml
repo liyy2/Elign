@@ -22,7 +22,8 @@ dataloader:
 filters:
   condition: false
   enable_filtering: false
-  enable_penalty: false
+  enable_penalty: true
+  penalty_scale: 0.5
 
 model:
   config: "./pretrained/edm/edm_qm9/args.pickle"
@@ -39,6 +40,7 @@ train:
   adam_weight_decay: 0.0001
   adam_epsilon: 0.00000001
   clip_range: 0.15
+  kl_penalty_weight: 0.0
   # Number of generated samples consumed per optimizer step when updating the policy.
   # If the rollout batch is larger, it is chunked into blocks of this size for training.
   train_micro_batch_size: 512
@@ -74,6 +76,8 @@ reward:
     method: potential
     gamma: 1.0
     weight: 1.0
+    # If true, apply shaping on energy deltas only; terminal reward still mixes force+energy.
+    only_energy_reshape: false
     # Cap on the number of diffusion steps evaluated in a single MLFF call.
     # Larger schedules are processed in chunks of this size to limit MLFF memory usage.
     mlff_batch_size: 32

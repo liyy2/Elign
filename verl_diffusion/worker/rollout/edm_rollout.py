@@ -142,7 +142,7 @@ class EDMRollout(BaseRollout):
         # Call the model's sample method
         # Delegate shared-prefix handling to the model so each group reuses the
         # same prefix latents before branching into independent continuations.
-        x, h, latents, logps, timesteps, mus, sigmas = model_ref.sample(
+        x, h, latents, logps, timesteps, mus, sigmas, z0_preds = model_ref.sample(
             n_samples=n_samples,
             n_nodes=n_nodes,
             node_mask=node_mask,
@@ -157,6 +157,7 @@ class EDMRollout(BaseRollout):
         latents_tensor = torch.stack(latents, dim=1)
         logps_tensor = torch.stack(logps, dim=1)
         mus_tensor = torch.stack(mus, dim=1)
+        z0_preds_tensor = torch.stack(z0_preds, dim=1)
 
         # Convert timesteps to tensor and expand to batch_size
         timesteps_tensor = torch.tensor(timesteps, device=device)
@@ -169,6 +170,7 @@ class EDMRollout(BaseRollout):
             "x": x,
             "categorical": h["categorical"],
             "latents": latents_tensor,
+            "z0_preds": z0_preds_tensor,
             "logps": logps_tensor,
             "nodesxsample": nodesxsample,
             "timesteps": expanded_timesteps,

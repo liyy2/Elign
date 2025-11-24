@@ -6,7 +6,15 @@ import random
 import numpy as np
 
 class Filter:
-    def __init__(self, dataset_info, file_name, condition, enable_filtering=True, enable_penalty=True):
+    def __init__(
+        self,
+        dataset_info,
+        file_name,
+        condition,
+        enable_filtering=True,
+        enable_penalty=True,
+        penalty_scale=0.1,
+    ):
         self.dataset_info = dataset_info
         with open(file_name, 'rb') as f:
             self.dataset_smiles_list = pickle.load(f)
@@ -14,6 +22,7 @@ class Filter:
         self.condition = condition
         self.enable_filtering = enable_filtering
         self.enable_penalty = enable_penalty
+        self.penalty_scale = penalty_scale
     def process_data(self, samples:DataProto) -> list:
         """
         Process the DataProto object to prepare it for force calculation.
@@ -91,7 +100,7 @@ class Filter:
         # Apply penalty if enabled
         if self.enable_penalty:
             novelty_penalty = torch.tensor(novelty_penalty).to(data.batch["rewards"].device)
-            data.batch["rewards"] = data.batch["rewards"] + novelty_penalty * 0.1
+            data.batch["rewards"] = data.batch["rewards"] + novelty_penalty * self.penalty_scale
             
         # filter 
         if self.enable_filtering:

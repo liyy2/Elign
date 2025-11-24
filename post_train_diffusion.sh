@@ -28,6 +28,7 @@ LEARNING_RATE="4e-6"
 CLIP_RANGE="2e-3"
 TRAIN_MICRO_BATCH_SIZE=4 # batch size for doing policy gradient, reduce if the training part is a bottleneck
 EPOCH_PER_ROLLOUT=1
+KL_PENALTY_WEIGHT=0.04 # Flow-GRPO commonly uses beta≈0.04
 # Diffusion rollout settings
 SAMPLE_GROUP_SIZE=1 # Number of groups
 EACH_PROMPT_SAMPLE=24 # Group Size in GRPO
@@ -36,13 +37,15 @@ SHARE_INITIAL_NOISE=true
 FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
-USE_ENERGY=false
+USE_ENERGY=true
 MLFF_MODEL="uma-m-1p1"
-MLFF_BATCH_SIZE=16 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
+MLFF_BATCH_SIZE=8 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
 FORCE_AGGREGATION="rms"
 STABILITY_WEIGHT="0"
 SKIP_PREFIX=700
-REWARD_SHAPING_ENABLED=false # Set to false to disable shaping and rely on terminal-only rewards
+REWARD_SHAPING_ENABLED=true # Set to false to disable shaping and rely on terminal-only rewards
+# When shaping is enabled, set true to reshape only energy deltas (forces still used for terminals).
+SHAPING_ONLY_ENERGY=true
 
 # Note: when shaping is enabled, PPO advantages are computed from per-step
 # force/energy traces, so scalar rewards (and any novelty penalty applied to them)
@@ -50,6 +53,7 @@ REWARD_SHAPING_ENABLED=false # Set to false to disable shaping and rely on termi
 
 # Filtering configuration
 ENABLE_NOVELTY_PENALTY=false
+NOVELTY_PENALTY_SCALE="0.5"
 
 # Scheduler configuration
 SCHEDULER_NAME="cosine"
@@ -71,26 +75,20 @@ else
 fi
 MODEL_TAG=$(sanitize_for_name "${MLFF_MODEL}")
 NOVELTY_PENALTY_TAG=$(sanitize_for_name "${ENABLE_NOVELTY_PENALTY}")
+NOVELTY_PENALTY_SCALE_TAG=$(sanitize_for_name "${NOVELTY_PENALTY_SCALE}")
 
 RUN_NAME_BASE="verl_model_${MODEL_TAG}\
 _energy_$(sanitize_for_name "${ENERGY_TAG}")\
 _lr_$(sanitize_for_name "${LEARNING_RATE}")\
-_clip_$(sanitize_for_name "${CLIP_RANGE}")\
-_share_noise_$(sanitize_for_name "${SHARE_INITIAL_NOISE}")\
 _pps_$(sanitize_for_name "${EACH_PROMPT_SAMPLE}")\
 _skip_$(sanitize_for_name "${SKIP_PREFIX}")\
+_klw_$(sanitize_for_name "${KL_PENALTY_WEIGHT}")\
 _force_align_$(sanitize_for_name "${FORCE_ALIGNMENT_ENABLED}")\
-_tstep_$(sanitize_for_name "${TIME_STEP}")\
 _sg_$(sanitize_for_name "${SAMPLE_GROUP_SIZE}")\
-_mlff_$(sanitize_for_name "${MLFF_BATCH_SIZE}")\
-_fagg_$(sanitize_for_name "${FORCE_AGGREGATION}")\
-_stabW_$(sanitize_for_name "${STABILITY_WEIGHT}")\
-_sched_$(sanitize_for_name "${SCHEDULER_NAME}")\
-_warmup_$(sanitize_for_name "${SCHEDULER_WARMUP_STEPS}")\
-_steps_$(sanitize_for_name "${SCHEDULER_TOTAL_STEPS}")\
-_decay_$(sanitize_for_name "${SCHEDULER_MIN_LR_RATIO}")\
 _shaping_$(sanitize_for_name "${REWARD_SHAPING_ENABLED}")\
+_shape_energy_only_$(sanitize_for_name "${SHAPING_ONLY_ENERGY}")\
 _novpen_${NOVELTY_PENALTY_TAG}\
+_novpen_scale_${NOVELTY_PENALTY_SCALE_TAG}\
 _epoch_per_rollout_$(sanitize_for_name "${EPOCH_PER_ROLLOUT}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
@@ -109,6 +107,7 @@ if [[ "${REWARD_SHAPING_ENABLED}" == true ]]; then
   SHAPING_FLAGS=(
     "reward.shaping.enabled=true"
     "reward.shaping.scheduler.skip_prefix=${SKIP_PREFIX}"
+    "reward.shaping.only_energy_reshape=${SHAPING_ONLY_ENERGY}"
   )
 else
   SHAPING_FLAGS=("reward.shaping.enabled=false")
@@ -121,6 +120,7 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   save_path="${SAVE_PATH}" \
   train.learning_rate="${LEARNING_RATE}" \
   train.clip_range="${CLIP_RANGE}" \
+  train.kl_penalty_weight="${KL_PENALTY_WEIGHT}" \
   model.share_initial_noise="${SHARE_INITIAL_NOISE}" \
   dataloader.each_prompt_sample="${EACH_PROMPT_SAMPLE}" \
   train.force_alignment_enabled="${FORCE_ALIGNMENT_ENABLED}" \
@@ -138,5 +138,6 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   reward.use_energy="${USE_ENERGY}" \
   reward.mlff_model="${MLFF_MODEL}" \
   filters.enable_penalty="${ENABLE_NOVELTY_PENALTY}" \
+  filters.penalty_scale="${NOVELTY_PENALTY_SCALE}" \
   "${SHAPING_FLAGS[@]}"
   

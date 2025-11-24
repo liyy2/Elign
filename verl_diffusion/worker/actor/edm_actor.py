@@ -1,8 +1,8 @@
+import copy
 from typing import Callable, Dict, Optional
 from tqdm import tqdm as tq
 from collections import defaultdict
 from verl_diffusion.protocol import DataProto
-from verl_diffusion.utils.math import kl_divergence_normal
 from verl_diffusion.utils.torch_functional import (
     get_constant_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
@@ -14,7 +14,7 @@ from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import torch.distributed as dist
 class EDMActor(BaseActor):
-    def __init__(self, model, config):
+    def __init__(self, model, config, reference_model=None):
         """
         Initialize the EDM rollout worker.
         
@@ -24,6 +24,7 @@ class EDMActor(BaseActor):
         """
         super().__init__()  
         self.model = model
+        self.reference_model = None
         self.config = config
         dist_cfg = self.config.get("distributed") or {}
         self.is_main_process = bool(dist_cfg.get("is_main_process", True))
@@ -45,6 +46,12 @@ class EDMActor(BaseActor):
         self.adv_clip_max = max(0.0, float(self.config["train"].get("adv_clip_max", 5.0) or 5.0))
         self.epoch_per_rollout = max(int(self.config["train"].get("epoch_per_rollout", 1)), 1)
         self.num_timesteps = self.config["model"]["time_step"]
+        kl_weight = self.config["train"].get("kl_penalty_weight", 0.0)
+        try:
+            kl_weight = float(kl_weight)
+        except (TypeError, ValueError):
+            kl_weight = 0.0
+        self.kl_penalty_weight = max(0.0, kl_weight)
         alignment_cfg = self.config.get("train", {})
         raw_alignment_weight = float(alignment_cfg.get("force_alignment_weight", 0.0))
         enabled_cfg = alignment_cfg.get("force_alignment_enabled")
@@ -56,6 +63,7 @@ class EDMActor(BaseActor):
         self.force_alignment_min_force = float(alignment_cfg.get("force_alignment_min_force", 1e-4))
         self.force_alignment_min_delta = float(alignment_cfg.get("force_alignment_min_delta", 1e-4))
         self._force_alignment_eps = 1e-8
+        self._maybe_init_reference_model(reference_model)
         model_cfg = self.config.get("model") or {}
         self.share_initial_noise = bool(model_cfg.get("share_initial_noise", False))
         reward_cfg = self.config.get("reward") or {}
@@ -72,6 +80,23 @@ class EDMActor(BaseActor):
         except Exception:
             self.skip_prefix = 0
         self.active_num_timesteps = self.num_timesteps
+
+    def _maybe_init_reference_model(self, external_reference):
+        if self.kl_penalty_weight <= 0:
+            self.reference_model = None
+            return
+        ref = external_reference
+        if ref is None:
+            base = self.model.module if hasattr(self.model, "module") else self.model
+            ref = copy.deepcopy(base)
+        if hasattr(ref, "module"):
+            ref = ref.module
+        ref.eval()
+        for param in ref.parameters():
+            param.requires_grad_(False)
+        device = next(self.model.parameters()).device
+        ref.to(device)
+        self.reference_model = ref
 
     def setup_scheduler(self, total_training_steps: Optional[int] = None) -> None:
         """Initialize the learning rate scheduler if configured."""
@@ -212,7 +237,14 @@ class EDMActor(BaseActor):
                             if force_fine_mask is not None:
                                 fine_mask_step = (force_fine_mask * force_mask_f).sum(dim=1)
 
-                loss, clipfrac, _adv_clipfrac, align_penalty, align_cosine = self.calculate_loss(
+                (
+                    loss,
+                    clipfrac,
+                    _adv_clipfrac,
+                    align_penalty,
+                    align_cosine,
+                    kl_loss,
+                ) = self.calculate_loss(
                         sample["latents"][:, j],
                         sample["timesteps"][:, j],
                         sample["next_latents"][:, j],
@@ -226,6 +258,8 @@ class EDMActor(BaseActor):
                     )
                 info["clipfrac"].append(clipfrac.item())
                 info["loss"].append(loss.detach().cpu().item())
+                if kl_loss is not None:
+                    info["kl_loss"].append(kl_loss.detach().cpu().item())
                 if align_penalty is not None:
                     info["force_alignment_penalty"].append(align_penalty.detach().cpu().item())
                 if align_cosine is not None:
@@ -258,6 +292,8 @@ class EDMActor(BaseActor):
         if last_lr is None:
             last_lr = self.optimizer.param_groups[0]["lr"]
         metric["lr"] = last_lr
+        if info["kl_loss"]:
+            metric["kl_loss"] = float(np.mean(np.array(info["kl_loss"])))
         if info["force_alignment_penalty"]:
             metric["ForceAlignPenalty"] = np.mean(np.array(info["force_alignment_penalty"]))
         if info["force_alignment_cosine"]:
@@ -300,7 +336,9 @@ class EDMActor(BaseActor):
             fine_stage_mask (torch.Tensor, optional):
                 Per-sample indicator (1 -> fine-stage timestep) used to gate force alignment.
         Returns:
-            loss (torch.Tensor), clipfrac (torch.Tensor), adv_clipfrac (torch.Tensor or None), alignment_penalty (torch.Tensor or None), alignment_cosine (torch.Tensor or None)
+            loss (torch.Tensor), clipfrac (torch.Tensor), adv_clipfrac (torch.Tensor or None),
+            alignment_penalty (torch.Tensor or None), alignment_cosine (torch.Tensor or None),
+            kl_loss (torch.Tensor)
         """
         s_array = timesteps # a broadcast vector of a scalar step
         t_array = s_array + 1
@@ -317,7 +355,7 @@ class EDMActor(BaseActor):
 
         # Evaluate the current diffusion policy for the reverse step p(z_s | z_t) to get the
         # transition log-probability and drift (mu) that will be compared against the behavior policy.
-        _, log_prob_current, mu_current, _ = model_ref.sample_p_zs_given_zt(
+        _, log_prob_current, mu_current, sigma_current, _ = model_ref.sample_p_zs_given_zt(
             s_array,
             t_array,
             latents,
@@ -339,16 +377,31 @@ class EDMActor(BaseActor):
             advantages = torch.clamp(advantages, -clip_limit, clip_limit)
 
         loss = self.loss(advantages, self.clip_range, ratio)
+        kl_loss = None
+        if self.reference_model is not None and self.kl_penalty_weight > 0.0:
+            with torch.no_grad():
+                _, _, mu_reference, _, _ = self.reference_model.sample_p_zs_given_zt(
+                    s_array,
+                    t_array,
+                    latents,
+                    node_mask,
+                    edge_mask,
+                    prev_sample=next_latents,
+                    context=context,
+                )
+            kl_per_sample = self._compute_reference_kl(mu_current, mu_reference, sigma_current, node_mask)
+            kl_loss = kl_per_sample.mean()
+            loss = loss + self.kl_penalty_weight * kl_loss
         clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.clip_range).float())
 
         alignment_penalty = None
         alignment_cosine = None
         if not (self.force_alignment_enabled and self.force_alignment_weight > 0):
-            return loss, clipfrac, adv_clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None, kl_loss
         if mu_old is None or force_vectors is None or fine_stage_mask is None:
-            return loss, clipfrac, adv_clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None, kl_loss
         if torch.is_tensor(fine_stage_mask) and torch.all(fine_stage_mask == 0):
-            return loss, clipfrac, adv_clipfrac, None, None
+            return loss, clipfrac, adv_clipfrac, None, None, kl_loss
 
         mu_old = mu_old.to(latents.device)
         force_vectors = force_vectors.to(latents.device)
@@ -365,7 +418,7 @@ class EDMActor(BaseActor):
         if alignment_penalty is not None:
             loss = loss + alignment_penalty
 
-        return loss, clipfrac, adv_clipfrac, alignment_penalty, alignment_cosine
+        return loss, clipfrac, adv_clipfrac, alignment_penalty, alignment_cosine, kl_loss
 
     def _compute_force_alignment_penalty(self, mu_old, mu_new, force_vectors, node_mask, fine_stage_mask):
         """
@@ -407,6 +460,26 @@ class EDMActor(BaseActor):
         penalty = self.force_alignment_weight * penalty_scalar
         mean_cosine = (cosine * weighted_area).sum() / (weighted_area.sum() + self._force_alignment_eps)
         return penalty, mean_cosine
+
+    def _compute_reference_kl(self, mu_current, mu_reference, sigma, node_mask):
+        """Compute KL(new || reference) assuming equal diagonal covariance."""
+        if node_mask is None:
+            mask = torch.ones_like(mu_current[..., :1], dtype=mu_current.dtype, device=mu_current.device)
+        else:
+            mask = node_mask.to(dtype=mu_current.dtype, device=mu_current.device)
+        while mask.dim() < mu_current.dim():
+            mask = mask.unsqueeze(-1)
+
+        mu_reference = mu_reference.to(dtype=mu_current.dtype, device=mu_current.device)
+        sigma = torch.clamp(sigma.to(dtype=mu_current.dtype, device=mu_current.device), min=1e-8)
+        while sigma.dim() < mu_current.dim():
+            sigma = sigma.unsqueeze(-1)
+
+        diff = mu_current - mu_reference
+        kl = (diff ** 2) / (2.0 * sigma ** 2 + 1e-12)
+        kl = kl * mask
+        reduce_dims = tuple(range(1, kl.dim()))
+        return kl.sum(dim=reduce_dims)
     
     def loss(
         self,

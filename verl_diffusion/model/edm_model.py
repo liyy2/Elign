@@ -254,7 +254,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             for idx_tensor, member_result in zip(branch_indices.reshape(-1).tolist(), branch_split):
                 results[idx_tensor] = member_result
 
-        latents, logps, timesteps, mus, sigmas, x, h = self._stack_member_results(results)
+        latents, logps, timesteps, mus, sigmas, x, h, z0_preds = self._stack_member_results(results)
 
         self._assert_mean_zero_with_mask(x, node_mask)
 
@@ -264,7 +264,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
                   f'the positions down.')
             x = self._remove_mean_with_mask(x, node_mask)
 
-        return x, h, latents, logps, timesteps, mus, sigmas
+        return x, h, latents, logps, timesteps, mus, sigmas, z0_preds
     
     def sample_p_xh_given_z0(self, z0, node_mask, edge_mask, context = None, fix_noise=False, prev_sample=None):
         """Samples x ~ p(x|z0)."""
@@ -322,6 +322,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         # edge mask is flattened across batch and 
         eps_t = self.phi(zt, t, node_mask, edge_mask, context)
 
+        # Compute z0 prediction
+        gamma_t = self.gamma(t)
+        z0_pred = self.compute_x_pred(eps_t, zt, gamma_t)
+
         # Compute mu for p(zs | zt).
         self._assert_mean_zero_with_mask(zt[:, :, :self.n_dims], node_mask)
         self._assert_mean_zero_with_mask(eps_t[:, :, :self.n_dims], node_mask)
@@ -346,7 +350,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         else:
             log_p = self.compute_log_p_zs_given_zt(zs, mu, sigma,  node_mask=node_mask)
             
-        return zs, log_p, mu, sigma
+        return zs, log_p, mu, sigma, z0_pred
 
     def _sample_initial_latents(self, n_samples, n_nodes, node_mask, group_index, share_initial_noise):
         """Draw the starting latent noise, optionally synchronizing by group.
@@ -438,6 +442,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         timesteps = []
         mus = []
         sigmas = []
+        z0_preds = []
         latents.append(z)
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
         for s in tq(reversed(range(0, self.T)), desc="sampling", leave=False, unit="step"):
@@ -445,7 +450,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             t_array = s_array + 1
             s_array = s_array / self.T
             t_array = t_array / self.T
-            z, logp, mu, sigma = self.sample_p_zs_given_zt(
+            z, logp, mu, sigma, z0_pred = self.sample_p_zs_given_zt(
                 s_array,
                 t_array,
                 z,
@@ -459,6 +464,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             timesteps.append(s)
             mus.append(mu)
             sigmas.append(sigma)
+            z0_preds.append(z0_pred)
 
         # Finally sample p(x, h | z_0).
         x, h, mu, sigma, logp, s, z = self.sample_p_xh_given_z0(
@@ -470,6 +476,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         timesteps.append(0)
         mus.append(mu)
         sigmas.append(sigma.unsqueeze(-1))
+        z0_preds.append(z)
 
         self._assert_mean_zero_with_mask(x, node_mask)
 
@@ -481,7 +488,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             )
             x = self._remove_mean_with_mask(x, node_mask)
 
-        return x, h, latents, logps, timesteps, mus, sigmas
+        return x, h, latents, logps, timesteps, mus, sigmas, z0_preds
 
     def _rollout_member(
         self,
@@ -507,6 +514,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         mus = []
         sigmas = []
         timesteps = []
+        z0_preds = []
 
         batch_size = initial_z.shape[0]
 
@@ -532,6 +540,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
                 frame.expand(batch_size, *frame.shape[1:]).clone()
                 for frame in prefix_cache["sigmas"]
             ]
+            z0_preds = [
+                frame.expand(batch_size, *frame.shape[1:]).clone()
+                for frame in prefix_cache["z0_preds"]
+            ]
             timesteps = list(prefix_cache["timesteps"])
             z = latents[-1]
 
@@ -546,7 +558,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             t_array = s_array + 1
             s_array = s_array / self.T
             t_array = t_array / self.T
-            z, logp, mu, sigma = self.sample_p_zs_given_zt(
+            z, logp, mu, sigma, z0_pred = self.sample_p_zs_given_zt(
                 s_array,
                 t_array,
                 z,
@@ -560,6 +572,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             timesteps.append(s)
             mus.append(mu)
             sigmas.append(sigma)
+            z0_preds.append(z0_pred)
 
         x, h, mu, sigma, logp, s, z = self.sample_p_xh_given_z0(
             z, node_mask, flat_edge_mask, context, fix_noise=fix_noise
@@ -570,6 +583,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         timesteps.append(0)
         mus.append(mu)
         sigmas.append(sigma.unsqueeze(-1))
+        z0_preds.append(z)
 
         return {
             "latents": latents,
@@ -579,6 +593,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             "timesteps": timesteps,
             "x": x,
             "h": h,
+            "z0_preds": z0_preds,
         }
 
     def _split_member_results(self, batched_result):
@@ -592,6 +607,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
                 "logps": [frame[idx : idx + 1].clone() for frame in batched_result["logps"]],
                 "mus": [frame[idx : idx + 1].clone() for frame in batched_result["mus"]],
                 "sigmas": [frame[idx : idx + 1].clone() for frame in batched_result["sigmas"]],
+                "z0_preds": [frame[idx : idx + 1].clone() for frame in batched_result["z0_preds"]],
                 "timesteps": list(batched_result["timesteps"]),
                 "x": batched_result["x"][idx : idx + 1].clone(),
                 "h": {
@@ -624,6 +640,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
                 frame.clone()
                 for frame in member_result["sigmas"][:prefix_steps]
             ],
+            "z0_preds": [
+                frame.clone()
+                for frame in member_result["z0_preds"][:prefix_steps]
+            ],
             "timesteps": list(member_result["timesteps"][:prefix_steps]),
         }
         return cache
@@ -650,6 +670,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
                 frame.repeat_interleave(repeats, dim=0)
                 for frame in prefix_cache["sigmas"]
             ],
+            "z0_preds": [
+                frame.repeat_interleave(repeats, dim=0)
+                for frame in prefix_cache["z0_preds"]
+            ],
             "timesteps": list(prefix_cache["timesteps"]),
         }
         return repeated_cache
@@ -667,11 +691,13 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         num_members = len(member_results)
         num_latent_frames = len(member_results[0]["latents"])
         num_logp_frames = len(member_results[0]["logps"])
+        num_z0_frames = len(member_results[0]["z0_preds"])
 
         latents = []
         logps = []
         mus = []
         sigmas = []
+        z0_preds = []
 
         for frame_idx in range(num_latent_frames):
             frame = torch.cat(
@@ -692,6 +718,12 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             logps.append(logp_frame)
             mus.append(mu_frame)
             sigmas.append(sigma_frame)
+        
+        for frame_idx in range(num_z0_frames):
+            z0_frame = torch.cat(
+                [member_results[i]["z0_preds"][frame_idx] for i in range(num_members)], dim=0
+            )
+            z0_preds.append(z0_frame)
 
         timesteps = list(member_results[0]["timesteps"])
         x = torch.cat([member_results[i]["x"] for i in range(num_members)], dim=0)
@@ -701,4 +733,4 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         h_int = torch.cat([member_results[i]["h"]["integer"] for i in range(num_members)], dim=0)
         h = {"categorical": h_cat, "integer": h_int}
 
-        return latents, logps, timesteps, mus, sigmas, x, h
+        return latents, logps, timesteps, mus, sigmas, x, h, z0_preds

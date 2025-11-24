@@ -16,7 +16,6 @@ from omegaconf import DictConfig, OmegaConf
 from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
 
 sys.path.append("/home/yl2428/project_pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
-
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
 from edm_source.qm9.models import get_model
@@ -200,12 +199,14 @@ def main(cfg: DictConfig) -> None:
     filter_condition = filter_cfg.get("condition", False)
     filter_enable_filtering = filter_cfg.get("enable_filtering", False)
     filter_enable_penalty = filter_cfg.get("enable_penalty", False)
+    filter_penalty_scale = filter_cfg.get("penalty_scale", 0.5)
     filters = Filter(
         dataset_info,
         config["dataloader"]["smiles_path"],
         filter_condition,
         filter_enable_filtering,
         filter_enable_penalty,
+        filter_penalty_scale,
     )
     actor = EDMActor(model, config)
 

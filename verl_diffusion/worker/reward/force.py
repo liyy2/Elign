@@ -315,6 +315,8 @@ class UMAForceReward(BaseReward):
         self.shaping_method = self.shaping_cfg.get("method", "potential")
         self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
+        # Option to shape only with energy while keeping force+energy terminals intact.
+        self.shaping_energy_only = bool(self.shaping_cfg.get("only_energy_reshape", False))
         # Weight for adding shaped sum to final reward
         self.shaping_weight = float(self.shaping_cfg.get("weight", 1.0))
         # Control number of diffusion steps per MLFF evaluation batch (0 => no chunking)
@@ -482,7 +484,11 @@ class UMAForceReward(BaseReward):
 
 
         if shaping_active:
-            latents = data.batch["latents"]
+            if "z0_preds" in data.batch.keys():
+                latents = data.batch["z0_preds"]
+            else:
+                latents = data.batch["latents"]
+
             if "timesteps" in data.batch.keys():
                 T_steps = data.batch["timesteps"].shape[1]
                 latents = latents[:, :T_steps]
@@ -650,12 +656,21 @@ class UMAForceReward(BaseReward):
                         intervals_f,
                     )
 
-                    force_current = torch.index_select(F_force, 1, idx_current)
-                    force_next = torch.index_select(F_force, 1, idx_next)
-                    shaped_vals = (
-                        gamma_factor.unsqueeze(0) * force_next - force_current
-                    )
-                    shaped_force.index_copy_(1, idx_current, shaped_vals)
+                    if not self.shaping_energy_only:
+                        force_current = torch.index_select(F_force, 1, idx_current)
+                        force_next = torch.index_select(F_force, 1, idx_next)
+                        shaped_vals = (
+                            gamma_factor.unsqueeze(0) * force_next - force_current
+                        )
+                        shaped_force.index_copy_(1, idx_current, shaped_vals)
+
+                        # Only accumulate force-based shaping when enabled.
+                        shaped_force_sum = (self.force_weight * shaped_vals).sum(dim=1)
+                        shaped_sum_tensor = (
+                            shaped_force_sum
+                            if shaped_sum_tensor is None
+                            else shaped_sum_tensor + shaped_force_sum
+                        )
 
                     if self.use_energy and F_energy is not None:
                         energy_current = torch.index_select(F_energy, 1, idx_current)
@@ -665,20 +680,6 @@ class UMAForceReward(BaseReward):
                         )
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
 
-                    # The shaped contributions are only defined on the transition
-                    # slices (idx_current). By leaving the terminal column at zero
-                    # we ensure the shaped sum collapses to F_last - F_first without
-                    # re-injecting the terminal potential. Summing just the populated
-                    # entries keeps the computation explicit and avoids relying on
-                    # implicit zeros in the time-series tensor.
-                    shaped_force_sum = (self.force_weight * shaped_vals).sum(dim=1)
-                    shaped_sum_tensor = (
-                        shaped_force_sum
-                        if shaped_sum_tensor is None
-                        else shaped_sum_tensor + shaped_force_sum
-                    )
-
-                    if self.use_energy and F_energy is not None:
                         shaped_energy_sum = (
                             self.energy_weight * shaped_energy_vals
                         ).sum(dim=1)
