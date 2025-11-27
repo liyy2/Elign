@@ -80,6 +80,8 @@ class DDPOTrainer(BaseTrainer):
             reward_cfg = {}
         self.force_adv_weight = float(reward_cfg.get("force_adv_weight", reward_cfg.get("force_weight", 1.0)))
         self.energy_adv_weight = float(reward_cfg.get("energy_adv_weight", reward_cfg.get("energy_weight", 1.0)))
+        shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
+        self.terminal_adv_weight = float(shaping_cfg.get("terminal_weight", 1.5))
 
         # Initialize learning rate scheduler if configured
         scheduler_cfg = (self.config.get("train") or {}).get("scheduler")
@@ -256,6 +258,7 @@ class DDPOTrainer(BaseTrainer):
         )
         force_adv_weight = getattr(self, "force_adv_weight", 1.0)
         energy_adv_weight = getattr(self, "energy_adv_weight", 1.0)
+        terminal_weight_applied = False
 
         # Per-timestep rewards available (reward shaping)
         if "rewards_ts" in samples.batch.keys():
@@ -314,6 +317,15 @@ class DDPOTrainer(BaseTrainer):
                 weighted_energy_advantages_ts = energy_adv_weight * energy_advantages_ts
                 advantages_ts = weighted_force_advantages_ts + weighted_energy_advantages_ts
 
+                # Reapply terminal weighting so PPO sees the same emphasis as scalar rewards
+                if advantages_ts.shape[1] > 0 and self.terminal_adv_weight != 1.0:
+                    time_weights = torch.ones_like(advantages_ts)
+                    time_weights[:, -1] = self.terminal_adv_weight
+                    advantages_ts = advantages_ts * time_weights
+                    weighted_force_advantages_ts = weighted_force_advantages_ts * time_weights
+                    weighted_energy_advantages_ts = weighted_energy_advantages_ts * time_weights
+                    terminal_weight_applied = True
+
                 # Store separate advantages for logging/analysis if needed
                 samples.batch["force_advantages_ts"] = torch.clamp(
                     weighted_force_advantages_ts, -clip_value, clip_value
@@ -330,6 +342,12 @@ class DDPOTrainer(BaseTrainer):
                         mean = grp.mean(dim=0, keepdim=True)  # [1, S]
                         std = grp.std(dim=0, keepdim=True)
                         advantages_ts[gmask] = (grp - mean) / (std + 1e-8)
+
+            # Apply terminal weighting to per-step advantages before clipping/summing
+            if advantages_ts.shape[1] > 0 and self.terminal_adv_weight != 1.0 and not terminal_weight_applied:
+                time_weights = torch.ones_like(advantages_ts)
+                time_weights[:, -1] = self.terminal_adv_weight
+                advantages_ts = advantages_ts * time_weights
 
             # Clip per-step advantages
             advantages_ts = torch.clamp(advantages_ts, -clip_value, clip_value)
