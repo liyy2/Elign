@@ -64,6 +64,11 @@ class DDPOTrainer(BaseTrainer):
         self.reward_results = []
         self.filters = filters
         self.actor = actor
+        model_cfg = self.config.get("model") or {}
+        try:
+            self.num_timesteps = int(model_cfg.get("time_step", 0))
+        except Exception:
+            self.num_timesteps = 0
         self.best_checkpoint_metric = config.get("best_checkpoint_metric", "reward")
         self.best_checkpoint_mode = str(config.get("best_checkpoint_mode", "max")).lower()
         if self.best_checkpoint_mode not in {"max", "min"}:
@@ -255,6 +260,18 @@ class DDPOTrainer(BaseTrainer):
         # Per-timestep rewards available (reward shaping)
         if "rewards_ts" in samples.batch.keys():
             rewards_ts = samples.batch["rewards_ts"].to(group_index.device)  # [B, S]
+            # Align terminal column (decode step) to the last diffusion transition.
+            target_T = getattr(self, "num_timesteps", 0)
+            if target_T <= 0:
+                target_T = rewards_ts.size(1)
+            if rewards_ts.size(1) > target_T:
+                extra = rewards_ts[:, target_T:]
+                rewards_ts = rewards_ts[:, :target_T].clone()
+                rewards_ts[:, -1] = rewards_ts[:, -1] + extra.sum(dim=1)
+                samples.batch["rewards_ts"] = rewards_ts
+            elif rewards_ts.size(1) < target_T:
+                target_T = rewards_ts.size(1)
+
             unique_groups = torch.unique(group_index)
             advantages_ts = torch.zeros_like(rewards_ts)
 
@@ -262,6 +279,16 @@ class DDPOTrainer(BaseTrainer):
             if "force_rewards_ts" in samples.batch.keys() and "energy_rewards_ts" in samples.batch.keys():
                 force_rewards_ts = samples.batch["force_rewards_ts"].to(group_index.device)  # [B, S]
                 energy_rewards_ts = samples.batch["energy_rewards_ts"].to(group_index.device)  # [B, S]
+                if force_rewards_ts.size(1) > target_T:
+                    extra_force = force_rewards_ts[:, target_T:]
+                    force_rewards_ts = force_rewards_ts[:, :target_T].clone()
+                    force_rewards_ts[:, -1] = force_rewards_ts[:, -1] + extra_force.sum(dim=1)
+                    samples.batch["force_rewards_ts"] = force_rewards_ts
+                if energy_rewards_ts.size(1) > target_T:
+                    extra_energy = energy_rewards_ts[:, target_T:]
+                    energy_rewards_ts = energy_rewards_ts[:, :target_T].clone()
+                    energy_rewards_ts[:, -1] = energy_rewards_ts[:, -1] + extra_energy.sum(dim=1)
+                    samples.batch["energy_rewards_ts"] = energy_rewards_ts
 
                 force_advantages_ts = torch.zeros_like(force_rewards_ts)
                 energy_advantages_ts = torch.zeros_like(energy_rewards_ts)
