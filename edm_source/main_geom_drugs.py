@@ -129,8 +129,15 @@ dtype = torch.float32
 split_data = build_geom_dataset.load_split_data(data_file, val_proportion=0.1, test_proportion=0.1, filter_size=args.filter_molecule_size)
 transform = build_geom_dataset.GeomDrugsTransform(dataset_info, args.include_charges, device, args.sequential)
 dataloaders = {}
-for key, data_list in zip(['train', 'val', 'test'], split_data):
-    dataset = build_geom_dataset.GeomDrugsDataset(data_list, transform=transform)
+for key, indices in zip(['train', 'val', 'test'], split_data["splits"]):
+    dataset = build_geom_dataset.GeomDrugsDataset(
+        conformation_file=split_data["conformation_file"],
+        indices=indices,
+        starts=split_data["starts"],
+        lengths=split_data["lengths"],
+        transform=transform,
+        sequential=args.sequential,
+    )
     shuffle = (key == 'train') and not args.sequential
 
     # Sequential dataloading disabled for now.

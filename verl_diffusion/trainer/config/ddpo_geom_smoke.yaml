@@ -1,0 +1,55 @@
+defaults:
+  - _self_
+
+name: edm-geom-smoke
+seed: 0
+save_path: null
+
+dataloader:
+  sample_group_size: 1
+  each_prompt_sample: 2
+  micro_batch_size: 2
+  epoches: 1
+  geom_data_file: null
+  smiles_path: null
+
+filters:
+  condition: false
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.0
+
+model:
+  config: "./pretrained/edm/edm_geom_drugs/args.pickle"
+  model_path: "./pretrained/edm/edm_geom_drugs/generative_model_ema.npy"
+  # Keep this small for a quick rollout on CPU.
+  time_step: 20
+  share_initial_noise: false
+
+train:
+  adv_clip_max: 5
+  max_grad_norm: 1
+  learning_rate: 0.000001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 0.00000001
+  clip_range: 0.15
+  kl_penalty_weight: 0.0
+  train_micro_batch_size: 2
+  gradient_accumulation_steps: 1
+  force_alignment_enabled: false
+  epoch_per_rollout: 1
+
+reward:
+  type: dummy
+  reward_value: 0.0
+  stability_value: 0.0
+
+wandb:
+  enabled: false
+
+hydra:
+  job:
+    chdir: false
+

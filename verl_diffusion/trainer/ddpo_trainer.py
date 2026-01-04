@@ -93,8 +93,15 @@ class DDPOTrainer(BaseTrainer):
             if total_training_steps is not None:
                 self.actor.setup_scheduler(int(total_training_steps))
 
-        # Initialize Ray for parallel processing
-        if self.is_main_process and not ray.is_initialized():
+        # Initialize Ray for parallel processing (optional).
+        ray_cfg = self.config.get("ray", {})
+        ray_enabled = False
+        if isinstance(ray_cfg, dict):
+            ray_enabled = bool(ray_cfg.get("enabled", False))
+        elif ray_cfg:
+            ray_enabled = True
+
+        if ray_enabled and self.is_main_process and not ray.is_initialized():
             ray.init()
 
         # Initialize wandb if enabled in config

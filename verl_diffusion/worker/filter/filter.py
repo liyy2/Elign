@@ -1,5 +1,4 @@
 from verl_diffusion.protocol import DataProto
-from edm_source.qm9.rdkit_functions import build_molecule, mol2smiles
 import torch
 import pickle
 import random
@@ -16,13 +15,23 @@ class Filter:
         penalty_scale=0.1,
     ):
         self.dataset_info = dataset_info
-        with open(file_name, 'rb') as f:
-            self.dataset_smiles_list = pickle.load(f)
+        self.dataset_smiles_list = []
+        self.file_name = file_name
+        if self.enable_penalty_requires_smiles(enable_penalty) and not file_name:
+            raise ValueError("filters.enable_penalty=true requires dataloader.smiles_path to be set")
+
+        if file_name:
+            with open(file_name, "rb") as f:
+                self.dataset_smiles_list = pickle.load(f)
         self.dataset_smiles = set(self.dataset_smiles_list)
         self.condition = condition
         self.enable_filtering = enable_filtering
         self.enable_penalty = enable_penalty
         self.penalty_scale = penalty_scale
+
+    @staticmethod
+    def enable_penalty_requires_smiles(enable_penalty: bool) -> bool:
+        return bool(enable_penalty)
     def process_data(self, samples:DataProto) -> list:
         """
         Process the DataProto object to prepare it for force calculation.
@@ -56,7 +65,12 @@ class Filter:
                 
         return processed_list
         
-    def filter(self, data: DataProto) -> tuple[DataProto, float]:
+    def filter(self, data: DataProto) -> tuple[DataProto, float, float]:
+        if not self.enable_filtering and not self.enable_penalty:
+            return data, 1.0, 1.0
+
+        from edm_source.qm9.rdkit_functions import build_molecule, mol2smiles
+
         processed_list = self.process_data(data)
         all_smiles = []
         for graph in processed_list:

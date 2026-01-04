@@ -15,7 +15,12 @@ from omegaconf import DictConfig, OmegaConf
 
 from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
 
-sys.path.append("/home/yl2428/project_pi_mg269/yl2428/e3_diffusion_for_molecules-main/edm_source")
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+EDM_SOURCE_ROOT = os.path.join(REPO_ROOT, "edm_source")
+for path in (REPO_ROOT, EDM_SOURCE_ROOT):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
 from edm_source.qm9.models import get_model
@@ -24,6 +29,7 @@ from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.model.edm_model import EDMModel
 from verl_diffusion.worker.actor.edm_actor import EDMActor
 from verl_diffusion.worker.filter.filter import Filter
+from verl_diffusion.worker.reward.dummy import DummyReward
 from verl_diffusion.worker.reward.force import UMAForceReward
 from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
 
@@ -87,8 +93,10 @@ def main(cfg: DictConfig) -> None:
     cfg.model.config = _make_absolute(cfg.model.get("config"))
     cfg.model.model_path = _make_absolute(cfg.model.get("model_path"))
     cfg.dataloader.smiles_path = _make_absolute(cfg.dataloader.get("smiles_path"))
+    cfg.dataloader.geom_data_file = _make_absolute(cfg.dataloader.get("geom_data_file"))
     cfg.save_path = _make_absolute(cfg.get("save_path"))
-    cfg.checkpoint_path = _make_absolute(cfg.get("checkpoint_path"))
+    if "checkpoint_path" in cfg:
+        cfg.checkpoint_path = _make_absolute(cfg.get("checkpoint_path"))
 
     # Convert OmegaConf to standard Python dict for downstream components
     config = OmegaConf.to_container(cfg, resolve=True)
@@ -115,8 +123,17 @@ def main(cfg: DictConfig) -> None:
     with open(edm_config_path, "rb") as f:
         edm_config = pickle.load(f)
 
-    # Use the same processed data directory convention as eval_mlff_guided.py
-    edm_config.datadir = "qm9/temp"
+    # Keep QM9 data under the processed cache directory; GEOM uses an explicit `.npy` file path.
+    dataset_name = getattr(edm_config, "dataset", "")
+    if isinstance(dataset_name, str) and "qm9" in dataset_name:
+        edm_config.datadir = "qm9/temp"
+
+    dataloader_cfg = config.get("dataloader") or {}
+    if isinstance(dataloader_cfg, dict):
+        geom_data_file = dataloader_cfg.get("geom_data_file")
+        if geom_data_file:
+            setattr(edm_config, "geom_data_file", geom_data_file)
+            setattr(edm_config, "geom_data_path", geom_data_file)
     if is_main_process:
         print(edm_config)
 
@@ -136,7 +153,21 @@ def main(cfg: DictConfig) -> None:
 
     # Load dataset info and model
     dataset_info = get_dataset_info(edm_config.dataset, edm_config.remove_h)
-    retrieve_qm9_smiles(dataset_info)
+
+    filter_cfg = config.get("filters") or {}
+    enable_penalty = False
+    if isinstance(filter_cfg, dict):
+        enable_penalty = bool(filter_cfg.get("enable_penalty", False))
+    smiles_path = (config.get("dataloader") or {}).get("smiles_path")
+    if enable_penalty and isinstance(smiles_path, str) and smiles_path:
+        if not os.path.exists(smiles_path):
+            if "qm9" in str(dataset_info.get("name", "")):
+                retrieve_qm9_smiles(dataset_info)
+            else:
+                raise FileNotFoundError(
+                    f"SMILES pickle not found at {smiles_path}. "
+                    "Provide `dataloader.smiles_path` or disable `filters.enable_penalty`."
+                )
     dataloaders, _ = retrieve_dataloaders(edm_config)
     flow, nodes_dist, prop_dist = get_model(
         edm_config, edm_config.device, dataset_info, dataloaders["train"]
@@ -173,27 +204,41 @@ def main(cfg: DictConfig) -> None:
     # Initialize rollout and rewarder in main function
     rollout = EDMRollout(model, config)
 
-    reward_cfg = config.get("reward", {})
+    reward_cfg = config.get("reward", {}) or {}
+    reward_type = "uma"
+    if isinstance(reward_cfg, dict):
+        reward_type = str(reward_cfg.get("type", reward_type)).lower()
+
     reward_device = device
     mlff_device = device if device.type == "cuda" else "cpu"
-    rewarder = UMAForceReward(
-        dataset_info,
-        condition=False,
-        mlff_model=reward_cfg.get("mlff_model", "uma-s-1p1"),
-        mlff_predictor=None,
-        position_scale=None,
-        force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
-        device=reward_device,
-        mlff_device=mlff_device,
-        shaping=reward_cfg.get("shaping", {}),
-        use_energy=reward_cfg.get("use_energy", False),
-        force_weight=reward_cfg.get("force_weight", 1.0),
-        energy_weight=reward_cfg.get("energy_weight", 1.0),
-        stability_weight=reward_cfg.get("stability_weight", 0.0),
-        force_aggregation=reward_cfg.get("force_aggregation", "rms"),
-        energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
-        energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
-    )
+
+    if reward_type == "dummy":
+        rewarder = DummyReward(
+            reward_value=float(reward_cfg.get("reward_value", 0.0)),
+            stability_value=float(reward_cfg.get("stability_value", 0.0)),
+            device=reward_device,
+        )
+    elif reward_type in {"uma", "mlff"}:
+        rewarder = UMAForceReward(
+            dataset_info,
+            condition=False,
+            mlff_model=reward_cfg.get("mlff_model", "uma-s-1p1"),
+            mlff_predictor=None,
+            position_scale=None,
+            force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
+            device=reward_device,
+            mlff_device=mlff_device,
+            shaping=reward_cfg.get("shaping", {}),
+            use_energy=reward_cfg.get("use_energy", False),
+            force_weight=reward_cfg.get("force_weight", 1.0),
+            energy_weight=reward_cfg.get("energy_weight", 1.0),
+            stability_weight=reward_cfg.get("stability_weight", 0.0),
+            force_aggregation=reward_cfg.get("force_aggregation", "rms"),
+            energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
+            energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
+        )
+    else:
+        raise ValueError(f"Unsupported reward.type '{reward_type}'. Use 'uma' or 'dummy'.")
 
     filter_cfg = config.get("filters", {})
     filter_condition = filter_cfg.get("condition", False)
@@ -210,7 +255,14 @@ def main(cfg: DictConfig) -> None:
     )
     actor = EDMActor(model, config)
 
-    if is_main_process and not ray.is_initialized():
+    ray_cfg = config.get("ray", {})
+    ray_enabled = False
+    if isinstance(ray_cfg, dict):
+        ray_enabled = bool(ray_cfg.get("enabled", False))
+    elif ray_cfg:
+        ray_enabled = True
+
+    if ray_enabled and is_main_process and not ray.is_initialized():
         ray.init()
         print("Ray initialized")
 

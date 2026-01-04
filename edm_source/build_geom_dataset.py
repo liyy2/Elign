@@ -4,7 +4,56 @@ import numpy as np
 import torch
 from torch.utils.data import BatchSampler, DataLoader, Dataset, SequentialSampler
 import argparse
-from qm9.data import collate as qm9_collate
+from typing import Optional
+
+try:
+    from qm9.data import collate as qm9_collate
+except ModuleNotFoundError:
+    from edm_source.qm9.data import collate as qm9_collate
+
+
+def _select_lowest_energy_conformers(conformers, num_conformations: int):
+    """Return indices of the lowest-energy conformers (up to ``num_conformations``)."""
+    if not conformers:
+        return []
+    energies_list = []
+    for conf in conformers:
+        if not isinstance(conf, dict):
+            energies_list.append(np.inf)
+            continue
+        value = conf.get("totalenergy", np.inf)
+        try:
+            energy = float(value) if value is not None else np.inf
+        except (TypeError, ValueError):
+            energy = np.inf
+        energies_list.append(energy)
+
+    energies = np.asarray(energies_list, dtype=np.float64)
+    if energies.size == 0:
+        return []
+    k = int(num_conformations)
+    if k <= 0:
+        return []
+    if energies.size <= k:
+        return list(np.argsort(energies))
+    # Partial selection avoids sorting the full list for large conformer pools.
+    idx = np.argpartition(energies, k - 1)[:k]
+    idx = idx[np.argsort(energies[idx])]
+    return idx.tolist()
+
+
+def _normalize_conformers(conformers) -> list:
+    """Normalize GEOM conformer containers into a list of conformer dicts."""
+    if conformers is None:
+        return []
+    if isinstance(conformers, dict):
+        values = conformers.values()
+    elif isinstance(conformers, (list, tuple)):
+        values = conformers
+    else:
+        return []
+
+    return [conf for conf in values if isinstance(conf, dict)]
 
 
 def extract_conformers(args):
@@ -13,55 +62,172 @@ def extract_conformers(args):
     smiles_list_file = 'geom_drugs_smiles.txt'
     number_atoms_file = f"geom_drugs_n_{'no_h_' if args.remove_h else ''}{args.conformations}"
 
-    unpacker = msgpack.Unpacker(open(drugs_file, "rb"))
+    if getattr(args, "output_dtype", None):
+        output_dtype = str(args.output_dtype).lower()
+    else:
+        output_dtype = "float32"
+    dtype = np.float32 if output_dtype in {"float32", "f4"} else np.float64
 
-    all_smiles = []
-    all_number_atoms = []
-    dataset_conformers = []
+    output_base = os.path.join(args.data_dir, save_file)
+    output_path = output_base if output_base.endswith(".npy") else f"{output_base}.npy"
+
+    smiles_path = os.path.join(args.data_dir, smiles_list_file)
+    n_atoms_base = os.path.join(args.data_dir, number_atoms_file)
+    n_atoms_path = n_atoms_base if n_atoms_base.endswith(".npy") else f"{n_atoms_base}.npy"
+
+    use_streaming = bool(getattr(args, "streaming", True))
+    if not use_streaming:
+        unpacker = msgpack.Unpacker(open(drugs_file, "rb"), raw=False, strict_map_key=False)
+
+        all_smiles = []
+        all_number_atoms = []
+        dataset_conformers = []
+        mol_id = 0
+        for i, drugs_1k in enumerate(unpacker):
+            if not isinstance(drugs_1k, dict):
+                continue
+            print(f"Unpacking file {i}...")
+            for smiles, all_info in drugs_1k.items():
+                if not isinstance(smiles, str) or not isinstance(all_info, dict):
+                    continue
+                all_smiles.append(smiles)
+                conformers = _normalize_conformers(all_info.get('conformers', []))
+                lowest_energies = _select_lowest_energy_conformers(conformers, args.conformations)
+                for conf_idx in lowest_energies:
+                    conformer = conformers[conf_idx]
+                    if "xyz" not in conformer:
+                        continue
+                    try:
+                        coords = np.asarray(conformer["xyz"], dtype=dtype)
+                    except Exception:
+                        continue
+                    if coords.ndim != 2 or coords.shape[1] < 4:
+                        continue
+                    coords = coords[:, :4]  # [atomic_number, x, y, z]
+                    if args.remove_h:
+                        coords = coords[coords[:, 0] != 1.0]
+                    n = coords.shape[0]
+                    if n == 0:
+                        continue
+                    all_number_atoms.append(n)
+                    mol_id_arr = float(mol_id) * np.ones((n, 1), dtype=dtype)
+                    id_coords = np.hstack((mol_id_arr, coords))
+
+                    dataset_conformers.append(id_coords)
+                    mol_id += 1
+
+        print("Total number of conformers saved", mol_id)
+        all_number_atoms = np.asarray(all_number_atoms, dtype=np.int32)
+        dataset = np.vstack(dataset_conformers)
+
+        print("Total number of atoms in the dataset", dataset.shape[0])
+        print("Average number of atoms per molecule", dataset.shape[0] / mol_id)
+
+        np.save(output_base, dataset)
+        with open(smiles_path, 'w', encoding="utf-8") as f:
+            for s in all_smiles:
+                f.write(s)
+                f.write('\n')
+
+        np.save(n_atoms_base, all_number_atoms)
+        print("Dataset processed.")
+        return
+
+    # Streaming build (two-pass): suitable for the full GEOM-Drugs dataset without large RAM.
+    total_atoms = 0
+    total_conformers = 0
+    with open(drugs_file, "rb") as handle:
+        unpacker = msgpack.Unpacker(handle, raw=False, strict_map_key=False)
+        for i, drugs_1k in enumerate(unpacker):
+            if not isinstance(drugs_1k, dict):
+                continue
+            if i % 10 == 0:
+                print(f"[pass1] Unpacking chunk {i}...")
+            for smiles, all_info in drugs_1k.items():
+                if not isinstance(smiles, str) or not isinstance(all_info, dict):
+                    continue
+                conformers = _normalize_conformers(all_info.get("conformers", []))
+                lowest = _select_lowest_energy_conformers(conformers, args.conformations)
+                for conf_idx in lowest:
+                    conformer = conformers[conf_idx]
+                    if "xyz" not in conformer:
+                        continue
+                    try:
+                        coords = np.asarray(conformer["xyz"], dtype=dtype)
+                    except Exception:
+                        continue
+                    if coords.ndim != 2 or coords.shape[1] < 4:
+                        continue
+                    coords = coords[:, :4]
+                    if args.remove_h:
+                        coords = coords[coords[:, 0] != 1.0]
+                    n = int(coords.shape[0])
+                    if n == 0:
+                        continue
+                    total_atoms += n
+                    total_conformers += 1
+
+    print("Total number of conformers saved", total_conformers)
+    print("Total number of atoms in the dataset", total_atoms)
+    if total_conformers > 0:
+        print("Average number of atoms per molecule", total_atoms / float(total_conformers))
+
+    os.makedirs(args.data_dir, exist_ok=True)
+    dataset_memmap = np.lib.format.open_memmap(
+        output_path, mode="w+", dtype=dtype, shape=(total_atoms, 5)
+    )
+    n_atoms_per_conf = np.empty((total_conformers,), dtype=np.int32)
+
+    cursor = 0
     mol_id = 0
-    for i, drugs_1k in enumerate(unpacker):
-        print(f"Unpacking file {i}...")
-        for smiles, all_info in drugs_1k.items():
-            all_smiles.append(smiles)
-            conformers = all_info['conformers']
-            # Get the energy of each conformer. Keep only the lowest values
-            all_energies = []
-            for conformer in conformers:
-                all_energies.append(conformer['totalenergy'])
-            all_energies = np.array(all_energies)
-            argsort = np.argsort(all_energies)
-            lowest_energies = argsort[:args.conformations]
-            for id in lowest_energies:
-                conformer = conformers[id]
-                coords = np.array(conformer['xyz']).astype(float)        # n x 4
-                if args.remove_h:
-                    mask = coords[:, 0] != 1.0
-                    coords = coords[mask]
-                n = coords.shape[0]
-                all_number_atoms.append(n)
-                mol_id_arr = mol_id * np.ones((n, 1), dtype=float)
-                id_coords = np.hstack((mol_id_arr, coords))
+    with open(drugs_file, "rb") as handle, open(smiles_path, "w", encoding="utf-8") as smiles_handle:
+        unpacker = msgpack.Unpacker(handle, raw=False, strict_map_key=False)
+        for i, drugs_1k in enumerate(unpacker):
+            if not isinstance(drugs_1k, dict):
+                continue
+            if i % 10 == 0:
+                print(f"[pass2] Unpacking chunk {i} (written atoms={cursor}, conformers={mol_id})...")
+            for smiles, all_info in drugs_1k.items():
+                if not isinstance(smiles, str) or not isinstance(all_info, dict):
+                    continue
+                smiles_handle.write(smiles)
+                smiles_handle.write("\n")
+                conformers = _normalize_conformers(all_info.get("conformers", []))
+                lowest = _select_lowest_energy_conformers(conformers, args.conformations)
+                for conf_idx in lowest:
+                    conformer = conformers[conf_idx]
+                    if "xyz" not in conformer:
+                        continue
+                    try:
+                        coords = np.asarray(conformer["xyz"], dtype=dtype)
+                    except Exception:
+                        continue
+                    if coords.ndim != 2 or coords.shape[1] < 4:
+                        continue
+                    coords = coords[:, :4]
+                    if args.remove_h:
+                        coords = coords[coords[:, 0] != 1.0]
+                    n = int(coords.shape[0])
+                    if n == 0:
+                        continue
+                    end = cursor + n
+                    dataset_memmap[cursor:end, 0] = float(mol_id)
+                    dataset_memmap[cursor:end, 1:] = coords
+                    n_atoms_per_conf[mol_id] = n
+                    cursor = end
+                    mol_id += 1
 
-                dataset_conformers.append(id_coords)
-                mol_id += 1
+    if cursor != total_atoms or mol_id != total_conformers:
+        raise RuntimeError(
+            f"Streaming build mismatch: wrote atoms={cursor} (expected {total_atoms}), "
+            f"conformers={mol_id} (expected {total_conformers})."
+        )
 
-    print("Total number of conformers saved", mol_id)
-    all_number_atoms = np.array(all_number_atoms)
-    dataset = np.vstack(dataset_conformers)
-
-    print("Total number of atoms in the dataset", dataset.shape[0])
-    print("Average number of atoms per molecule", dataset.shape[0] / mol_id)
-
-    # Save conformations
-    np.save(os.path.join(args.data_dir, save_file), dataset)
-    # Save SMILES
-    with open(os.path.join(args.data_dir, smiles_list_file), 'w') as f:
-        for s in all_smiles:
-            f.write(s)
-            f.write('\n')
-
-    # Save number of atoms per conformation
-    np.save(os.path.join(args.data_dir, number_atoms_file), all_number_atoms)
+    dataset_memmap.flush()
+    np.save(n_atoms_base, n_atoms_per_conf)
+    print(f"Saved conformations to {output_path}")
+    print(f"Saved smiles list to {smiles_path}")
+    print(f"Saved atoms-per-conformer to {n_atoms_path}")
     print("Dataset processed.")
 
 
@@ -71,44 +237,119 @@ def load_split_data(conformation_file, val_proportion=0.1, test_proportion=0.1,
     path = Path(conformation_file)
     base_path = path.parent.absolute()
 
-    # base_path = os.path.dirname(conformation_file)
-    all_data = np.load(conformation_file)  # 2d array: num_atoms x 5
+    all_data = np.load(conformation_file, mmap_mode="r")
+    if all_data.ndim != 2 or all_data.shape[1] != 5:
+        raise ValueError(
+            f"Expected GEOM conformations array with shape [num_atoms, 5], got {all_data.shape}"
+        )
 
-    mol_id = all_data[:, 0].astype(int)
-    conformers = all_data[:, 1:]
-    # Get ids corresponding to new molecules
-    split_indices = np.nonzero(mol_id[:-1] - mol_id[1:])[0] + 1
-    data_list = np.split(conformers, split_indices)
+    n_atoms_file = None
+    stem = path.stem  # e.g., geom_drugs_30 / geom_drugs_no_h_30
+    if stem.startswith("geom_drugs_"):
+        suffix = stem[len("geom_drugs_") :]
+        candidate = base_path / f"geom_drugs_n_{suffix}.npy"
+        if candidate.exists():
+            n_atoms_file = candidate
 
-    # Filter based on molecule size.
+    if n_atoms_file is not None:
+        lengths = np.load(n_atoms_file).astype(np.int32, copy=False)
+        if lengths.ndim != 1:
+            raise ValueError(f"Expected atoms-per-conformer vector at {n_atoms_file}, got {lengths.shape}")
+        starts = np.empty((lengths.shape[0],), dtype=np.int64)
+        starts[0] = 0
+        if lengths.shape[0] > 1:
+            starts[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
+    else:
+        # Fallback: derive starts/lengths by scanning the mol_id column. This is
+        # memory-safe but slower than using the `geom_drugs_n_*.npy` companion.
+        mol_id = all_data[:, 0]
+        total_atoms = int(mol_id.shape[0])
+        if total_atoms == 0:
+            raise ValueError("Empty GEOM dataset.")
+
+        chunk_size = 5_000_000
+        boundary_chunks = []
+        prev_last = None
+        for offset in range(0, total_atoms, chunk_size):
+            end = min(offset + chunk_size, total_atoms)
+            chunk = mol_id[offset:end]
+            if chunk.size == 0:
+                continue
+            boundaries = np.nonzero(chunk[1:] != chunk[:-1])[0] + offset + 1
+            if prev_last is not None and chunk[0] != prev_last:
+                boundaries = np.concatenate(([offset], boundaries))
+            boundary_chunks.append(boundaries.astype(np.int64, copy=False))
+            prev_last = chunk[-1]
+
+        split_indices = (
+            np.concatenate(boundary_chunks) if boundary_chunks else np.empty((0,), dtype=np.int64)
+        )
+        starts = np.concatenate(([0], split_indices)).astype(np.int64, copy=False)
+        ends = np.concatenate((split_indices, [total_atoms])).astype(np.int64, copy=False)
+        lengths = (ends - starts).astype(np.int32, copy=False)
+
+    total_atoms_expected = int(starts[-1] + lengths[-1]) if lengths.size else 0
+    if total_atoms_expected != int(all_data.shape[0]):
+        raise RuntimeError(
+            f"GEOM index mismatch: starts/lengths imply {total_atoms_expected} atoms "
+            f"but file has {all_data.shape[0]} rows. Regenerate the dataset or its `geom_drugs_n_*.npy`."
+        )
+
+    num_conformers = int(lengths.shape[0])
     if filter_size is not None:
-        # Keep only molecules <= filter_size
-        data_list = [molecule for molecule in data_list
-                     if molecule.shape[0] <= filter_size]
+        keep = np.nonzero(lengths <= int(filter_size))[0].astype(np.int32, copy=False)
+        if keep.size == 0:
+            raise ValueError("No molecules left after filter.")
+        valid_indices = keep
+    else:
+        valid_indices = np.arange(num_conformers, dtype=np.int32)
 
-        assert len(data_list) > 0, 'No molecules left after filter.'
+    perm_path = os.path.join(base_path, 'geom_permutation.npy')
+    use_saved_perm = filter_size is None and os.path.exists(perm_path)
 
-    # CAREFUL! Only for first time run:
-    # perm = np.random.permutation(len(data_list)).astype('int32')
-    # print('Warning, currently taking a random permutation for '
-    #       'train/val/test partitions, this needs to be fixed for'
-    #       'reproducibility.')
-    # assert not os.path.exists(os.path.join(base_path, 'geom_permutation.npy'))
-    # np.save(os.path.join(base_path, 'geom_permutation.npy'), perm)
-    # del perm
+    perm = None
+    if use_saved_perm:
+        try:
+            perm = np.load(perm_path)
+        except Exception:
+            perm = None
 
-    perm = np.load(os.path.join(base_path, 'geom_permutation.npy'))
-    data_list = [data_list[i] for i in perm]
+    if perm is None or len(perm) != len(valid_indices):
+        rng = np.random.RandomState(0)
+        perm = rng.permutation(len(valid_indices)).astype('int32')
+        if filter_size is None:
+            try:
+                np.save(perm_path, perm)
+            except Exception:
+                pass
 
-    num_mol = len(data_list)
+    ordered_indices = valid_indices[perm]
+
+    num_mol = len(ordered_indices)
     val_index = int(num_mol * val_proportion)
     test_index = val_index + int(num_mol * test_proportion)
-    val_data, test_data, train_data = np.split(data_list, [val_index, test_index])
-    return train_data, val_data, test_data
+    val_idx, test_idx, train_idx = np.split(ordered_indices, [val_index, test_index])
+
+    return {
+        "conformation_file": str(conformation_file),
+        "starts": starts,
+        "lengths": lengths,
+        "splits": (train_idx, val_idx, test_idx),
+    }
 
 
 class GeomDrugsDataset(Dataset):
-    def __init__(self, data_list, transform=None):
+    def __init__(
+        self,
+        data_list=None,
+        transform=None,
+        *,
+        conformation_file: Optional[str] = None,
+        indices: Optional[np.ndarray] = None,
+        starts: Optional[np.ndarray] = None,
+        lengths: Optional[np.ndarray] = None,
+        sequential: bool = False,
+    ):
         """
         Args:
             transform (callable, optional): Optional transform to be applied
@@ -116,21 +357,50 @@ class GeomDrugsDataset(Dataset):
         """
         self.transform = transform
 
-        # Sort the data list by size
-        lengths = [s.shape[0] for s in data_list]
-        argsort = np.argsort(lengths)               # Sort by decreasing size
-        self.data_list = [data_list[i] for i in argsort]
-        # Store indices where the size changes
-        self.split_indices = np.unique(np.sort(lengths), return_index=True)[1][1:]
+        self._file_backed = conformation_file is not None
+        self.sequential = bool(sequential)
+        if self._file_backed:
+            if indices is None or starts is None or lengths is None:
+                raise ValueError("File-backed GEOM dataset requires indices/starts/lengths.")
+            self._all_data = np.load(conformation_file, mmap_mode="r")
+            self._starts = np.asarray(starts, dtype=np.int64)
+            self._lengths = np.asarray(lengths, dtype=np.int32)
+            self.indices = np.asarray(indices, dtype=np.int64)
+
+            if self.sequential:
+                subset_lengths = self._lengths[self.indices]
+                order = np.argsort(subset_lengths)
+                self.indices = self.indices[order]
+                subset_lengths = subset_lengths[order]
+                self.split_indices = np.unique(subset_lengths, return_index=True)[1][1:]
+            else:
+                self.split_indices = np.asarray([], dtype=np.int64)
+        else:
+            if data_list is None:
+                raise ValueError("Provide either data_list or conformation_file.")
+            # Sort the data list by size
+            list_lengths = [s.shape[0] for s in data_list]
+            argsort = np.argsort(list_lengths)               # Sort by decreasing size
+            self.data_list = [data_list[i] for i in argsort]
+            # Store indices where the size changes
+            self.split_indices = np.unique(np.sort(list_lengths), return_index=True)[1][1:]
 
     def __len__(self):
+        if self._file_backed:
+            return int(self.indices.shape[0])
         return len(self.data_list)
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        sample = self.data_list[idx]
+        if self._file_backed:
+            conf_idx = int(self.indices[idx])
+            start = int(self._starts[conf_idx])
+            n = int(self._lengths[conf_idx])
+            sample = np.array(self._all_data[start : start + n, 1:], copy=True)
+        else:
+            sample = self.data_list[idx]
         if self.transform:
             sample = self.transform(sample)
         return sample
@@ -240,5 +510,25 @@ if __name__ == '__main__':
     parser.add_argument("--remove_h", action='store_true', help="Remove hydrogens from the dataset.")
     parser.add_argument("--data_dir", type=str, default='~/diffusion/data/geom/')
     parser.add_argument("--data_file", type=str, default="drugs_crude.msgpack")
+    parser.add_argument(
+        "--output_dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float64"],
+        help="Numeric dtype for the saved .npy conformations array.",
+    )
+    parser.add_argument(
+        "--streaming",
+        dest="streaming",
+        action="store_true",
+        help="Build the output array via a two-pass streaming pipeline (low RAM, slower).",
+    )
+    parser.add_argument(
+        "--no-streaming",
+        dest="streaming",
+        action="store_false",
+        help="Build the output array in-memory (fast, requires large RAM).",
+    )
+    parser.set_defaults(streaming=True)
     args = parser.parse_args()
     extract_conformers(args)

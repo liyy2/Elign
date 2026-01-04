@@ -257,6 +257,7 @@ class UMAForceReward(BaseReward):
         condition: bool = False,
         mlff_model: str = "uma-s-1p1",
         mlff_predictor: Optional[object] = None,
+        force_computer: Optional[object] = None,
         position_scale: Optional[float] = None,
         force_clip_threshold: Optional[float] = None,
         device: Optional[Union[str, torch.device]] = None,
@@ -346,21 +347,25 @@ class UMAForceReward(BaseReward):
         self.terminal_reward_weight = max(0.0, float(self.shaping_cfg.get("terminal_weight", 1.5)))
 
 
-        if mlff_predictor is not None:
-            self.mlff_predictor = mlff_predictor
+        if force_computer is not None:
+            self.force_computer = force_computer
+            self.mlff_predictor = getattr(force_computer, "mlff_predictor", mlff_predictor)
         else:
-            self.mlff_predictor = get_mlff_predictor(mlff_model, self.mlff_device)
+            if mlff_predictor is not None:
+                self.mlff_predictor = mlff_predictor
+            else:
+                self.mlff_predictor = get_mlff_predictor(mlff_model, self.mlff_device)
 
-        if self.mlff_predictor is not None:
-            self.force_computer = MLFFForceComputer(
-                mlff_predictor=self.mlff_predictor,
-                position_scale=self.position_scale,
-                device=self.device,
-                compute_energy=self.use_energy,  # Enable energy computation based on config
-            )
-        else:
-            self.force_computer = None
-            logger.warning("UMAForceReward: MLFF predictor not loaded, rewards will default to zero.")
+            if self.mlff_predictor is not None:
+                self.force_computer = MLFFForceComputer(
+                    mlff_predictor=self.mlff_predictor,
+                    position_scale=self.position_scale,
+                    device=self.device,
+                    compute_energy=self.use_energy,  # Enable energy computation based on config
+                )
+            else:
+                self.force_computer = None
+                logger.warning("UMAForceReward: MLFF predictor not loaded, rewards will default to zero.")
 
     def start_async(self):
         if self.running:

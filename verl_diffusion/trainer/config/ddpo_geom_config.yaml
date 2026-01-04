@@ -1,0 +1,98 @@
+defaults:
+  - _self_
+
+name: edm-geom
+seed: 42
+save_path: null
+resume: false
+checkpoint_path: null
+best_checkpoint_metric: molecule_stability
+best_checkpoint_mode: max
+
+dataloader:
+  sample_group_size: 4
+  each_prompt_sample: 128
+  micro_batch_size: 256
+  epoches: 100
+  # Optional: override GEOM conformation file path when conditioning is enabled.
+  # geom_data_file: "/path/to/geom_drugs_30.npy"
+  geom_data_file: null
+  # Disable novelty filtering by default for GEOM unless you have prepared a SMILES pickle.
+  smiles_path: null
+
+filters:
+  condition: false
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.5
+
+model:
+  config: "./pretrained/edm/edm_geom_drugs/args.pickle"
+  model_path: "./pretrained/edm/edm_geom_drugs/generative_model_ema.npy"
+  time_step: 1000
+  share_initial_noise: false
+
+train:
+  adv_clip_max: 5
+  max_grad_norm: 1
+  learning_rate: 0.000005
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0001
+  adam_epsilon: 0.00000001
+  clip_range: 0.15
+  kl_penalty_weight: 0.0
+  train_micro_batch_size: 256
+  gradient_accumulation_steps: 1
+  force_alignment_enabled: true
+  epoch_per_rollout: 1
+  force_alignment_weight: 0.5
+  force_alignment_min_force: 0.0001
+  force_alignment_min_delta: 0.0001
+  scheduler:
+    name: cosine
+    warmup_steps: 10
+    total_steps: 150
+    min_lr_ratio: 0.05
+    num_cycles: 0.5
+    stable_ratio: 0.9
+
+reward:
+  type: uma
+  mlff_model: uma-s-1p1
+  force_clip_threshold: null
+  use_energy: false
+  force_weight: 1.0
+  energy_weight: 1.0
+  stability_weight: 0.0
+  force_aggregation: rms
+  force_adv_weight: 1.0
+  energy_adv_weight: 0.1
+  energy_transform_offset: 10000.0
+  energy_transform_scale: 1000.0
+  shaping:
+    enabled: true
+    method: potential
+    gamma: 1.0
+    weight: 1.0
+    only_energy_reshape: false
+    mlff_batch_size: 32
+    terminal_weight: 5
+    scheduler:
+      mode: adaptive
+      skip_prefix: 500
+      uniform_stride: 1
+      include_terminal: true
+      adaptive:
+        coarse_stride: 10
+        fine_stride: 2
+        threshold_fraction: 0.25
+
+wandb:
+  enabled: false
+  wandb_project: "ddpo"
+  wandb_name: "edm-geom-ddp"
+
+hydra:
+  job:
+    chdir: false
