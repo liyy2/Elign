@@ -1,0 +1,15 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence
+  - _self_
+
+# QM9 post-training config that targets the dominant stability gap:
+# many generations are RDKit-valid but QM9-unstable due to ±1 valence errors
+# (e.g., C=3 or C=5, N=2 or N=4). This adds an explicit over-bond penalty on
+# top of the existing under-bond penalty.
+
+reward:
+  # Penalize each missing bond order (e.g., C with 3 instead of 4 contributes 1).
+  valence_underbond_weight: 1.5
+  # Penalize each excess bond order (e.g., C with 5 instead of 4 contributes 1).
+  valence_overbond_weight: 1.0
+

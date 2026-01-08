@@ -1,0 +1,92 @@
+defaults:
+  - ddpo_geom_config
+  - _self_
+
+# GEOM RL (DDPO/GRPO) tuned for validity × uniqueness.
+#
+# Key ideas:
+# - Use shared-prefix sampling (DanceGRPO-style) and train only on the suffix.
+#   This dramatically reduces compute for large groups while keeping PPO updates focused
+#   on the low-noise steps that determine final chemistry.
+# - Optimize directly for RDKit validity and batch uniqueness via penalties + reward gating.
+# - Start with terminal-only force reward (no potential shaping) to reduce reward noise.
+
+name: edm-geom-force-vxu-suffix
+best_checkpoint_metric: validity_x_uniqueness
+best_checkpoint_mode: max
+
+dataloader:
+  # Total batch = sample_group_size * each_prompt_sample
+  sample_group_size: 4
+  each_prompt_sample: 32
+  # Keep this aligned with `each_prompt_sample` so prompt-groups stay intact
+  # (shared-prefix sampling requires grouped members in the same forward pass).
+  micro_batch_size: 32
+  # Use time-based stopping; keep this large.
+  epoches: 1000000
+  geom_data_file: null
+  smiles_path: null
+
+filters:
+  condition: false
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.0
+  # Validity/uniqueness shaping (no dataset SMILES file required).
+  invalid_penalty_scale: 0.2
+  duplicate_penalty_scale: 0.05
+
+model:
+  time_step: 1000
+  # Shared-prefix rollout: all samples in a prompt-group share the first `skip_prefix` steps.
+  share_initial_noise: true
+  skip_prefix: 900
+  # Memory/perf: return only the suffix trajectory (starting at skip_prefix).
+  return_suffix_only: true
+
+train:
+  # Hard compute budget.
+  max_time_hours: 6
+  # Stop when validity×uniqueness plateaus.
+  early_stop_metric: validity_x_uniqueness
+  early_stop_mode: max
+  early_stop_patience_minutes: 60
+  early_stop_min_delta: 0.002
+
+  # PPO/optimizer knobs.
+  learning_rate: 0.00001
+  clip_range: 0.2
+  adv_clip_max: 5
+  max_grad_norm: 1
+  # Keep PPO update memory comfortably under the 30GB cap.
+  train_micro_batch_size: 16
+  # Accumulate so we still apply ~1 optimizer step per rollout batch.
+  gradient_accumulation_steps: 8
+
+  # Disable force-alignment until the base run is stable.
+  force_alignment_enabled: false
+  force_alignment_weight: 0.0
+
+  # Keep LR constant (cosine schedules can decay too quickly under time-based stopping).
+  scheduler:
+    name: none
+
+reward:
+  type: uma
+  mlff_model: uma-s-1p1
+  use_energy: false
+  force_weight: 1.0
+  energy_weight: 0.0
+  stability_weight: 0.0
+  force_aggregation: rms
+  shaping:
+    enabled: false
+    # Even with shaping disabled, UMA terminal evaluation is chunked using this value.
+    mlff_batch_size: 16
+
+wandb:
+  enabled: false
+
+hydra:
+  job:
+    chdir: false

@@ -1,0 +1,18 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_softvalence
+  - _self_
+
+# Full-trajectory QM9 post-training (energy + force) with valence shaping and a force gate.
+#
+# Why:
+# - The main gap we observe is "RDKit-valid but QM9-unstable": chemistry can be sanitized by
+#   adding implicit H, but `check_stability` requires *explicit* valence under the distance->bond
+#   heuristic. This is dominated by under-bonded atoms (often C/N missing 1 bond order).
+# - The base full-trajectory + (soft) valence shaping configs already add strong graded penalties.
+# - `force_only_if_stable=true` prevents a failure mode where an unstable structure can achieve
+#   low forces by "disconnecting" atoms (e.g., a stray H far away), which would otherwise be
+#   rewarded by the force term.
+
+reward:
+  force_only_if_stable: true
+

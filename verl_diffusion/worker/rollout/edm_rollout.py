@@ -42,6 +42,15 @@ class EDMRollout(BaseRollout):
             self.skip_prefix = max(0, int(skip_value))
         except Exception:
             self.skip_prefix = 0
+
+        # Prefer an explicit shared-prefix setting under model.* so callers can
+        # decouple training truncation from reward shaping schedules.
+        model_cfg = self.config.get("model") or {}
+        if isinstance(model_cfg, dict) and model_cfg.get("skip_prefix") is not None:
+            try:
+                self.skip_prefix = max(0, int(model_cfg.get("skip_prefix")))
+            except Exception:
+                pass
         
         
     def start_async(self, prompts_queue):
@@ -105,26 +114,17 @@ class EDMRollout(BaseRollout):
             micro_bs = int(micro_cfg)
         except Exception:
             micro_bs = batch_size
-        num_chunks = max(batch_size // micro_bs, 1)
-        
-        # Chunk the prompts into smaller batches
-        batch_prompts = prompts.chunk(chunks=num_chunks)
-        
-        # Process each chunk and collect results
+        micro_bs = max(1, micro_bs)
+
+        # Process in micro-batches to control memory footprint.
         results = []
-        for chunk in batch_prompts:
-            result = self.generate_minibatch(chunk)
-            results.append(result)
-            
-        # Combine results into a single DataProto
-        # This assumes the generate_minibatch returns a DataProto
-        # Implement appropriate merging logic based on your data structure
-        combined_result = results[0]  # Initialize with first result
-        if len(results) > 1:
-            for res in results[1:]:
-                combined_result = combined_result.merge(res)
-                
-        return combined_result
+        for start in range(0, batch_size, micro_bs):
+            chunk = prompts[start : start + micro_bs]
+            results.append(self.generate_minibatch(chunk))
+
+        if len(results) == 1:
+            return results[0]
+        return DataProto.concat(results)
     
     def generate_minibatch(self, prompts: DataProto) -> DataProto:       
         # Extract necessary data from prompts for the model
@@ -139,6 +139,9 @@ class EDMRollout(BaseRollout):
         edge_mask = edge_mask.to(nodesxsample.device)
         n_samples = batch_size
         n_nodes = max_n_nodes  # node_mask shape is [batch_size, n_nodes]
+        model_cfg = self.config.get("model") or {}
+        return_suffix_only = bool(model_cfg.get("return_suffix_only", False))
+        share_prefix = bool(model_cfg.get("share_initial_noise", False) and self.skip_prefix > 0)
         # Call the model's sample method
         # Delegate shared-prefix handling to the model so each group reuses the
         # same prefix latents before branching into independent continuations.
@@ -151,12 +154,17 @@ class EDMRollout(BaseRollout):
             group_index=prompts.batch["group_index"],
             share_initial_noise=self.config["model"].get("share_initial_noise", False),
             skip_prefix=self.skip_prefix,
+            return_suffix_only=return_suffix_only,
         )
         device = x.device
 
+        effective_skip_prefix = 0 if (return_suffix_only and share_prefix) else self.skip_prefix
+
         latents_tensor = torch.stack(latents, dim=1)
         logps_tensor = torch.stack(logps, dim=1)
-        mus_tensor = torch.stack(mus, dim=1)
+        mus_tensor = None
+        if self.force_alignment_enabled and self.force_alignment_weight > 0.0:
+            mus_tensor = torch.stack(mus, dim=1)
         z0_preds_tensor = torch.stack(z0_preds, dim=1)
 
         # Convert timesteps to tensor and expand to batch_size
@@ -176,12 +184,13 @@ class EDMRollout(BaseRollout):
             "timesteps": expanded_timesteps,
             "group_index": prompts.batch["group_index"],
         }
-        if self.force_alignment_enabled and self.force_alignment_weight > 0.0:
+        if mus_tensor is not None:
             batch_data["mus"] = mus_tensor
 
         meta_info = prompts.meta_info.copy()
         meta_info["force_alignment_enabled"] = self.force_alignment_enabled and self.force_alignment_weight > 0.0
-        meta_info["skip_prefix"] = self.skip_prefix
+        meta_info["skip_prefix"] = effective_skip_prefix
+        meta_info["original_skip_prefix"] = self.skip_prefix
         meta_info["share_initial_noise"] = bool(self.config["model"].get("share_initial_noise", False))
 
         return DataProto(batch=TensorDict(batch_data, batch_size= batch_size), meta_info=meta_info)

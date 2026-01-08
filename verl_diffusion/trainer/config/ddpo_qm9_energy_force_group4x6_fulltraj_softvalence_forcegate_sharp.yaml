@@ -1,0 +1,27 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate
+  - _self_
+
+# Stability-focused follow-up:
+# - The dominant RDKit-valid-but-unstable failure mode is **under-bonded heavy atoms** (mostly C/N),
+#   and a large fraction of those are near the discrete double/triple bond cutoffs.
+# - The sigmoid-soft valence shaping provides a dense signal around these cutoffs; making it
+#   *sharper* improves the ranking signal used by GRPO/DDPO without changing the discrete metric.
+# - Increasing PPO clip slightly helps the policy move the categorical/geometry distribution enough
+#   to reduce the persistent under-bonded fraction, while we rely on KL + duplicate penalties to
+#   avoid collapse.
+
+filters:
+  # Anti-collapse: penalize duplicate SMILES within the same rollout batch.
+  duplicate_penalty_scale: 0.2
+
+train:
+  # Allow slightly larger PPO updates (was 2e-3 in the base group4x6 configs).
+  clip_range: 4.0e-3
+
+reward:
+  # Sharpen the sigmoid around bond-order thresholds (esp. double/triple cutoffs).
+  valence_soft_temperature: 0.01
+  # Increase soft penalties so near-threshold bonds get pushed to the correct side.
+  valence_underbond_soft_weight: 4.0
+  valence_overbond_soft_weight: 2.0

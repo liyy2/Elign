@@ -5,9 +5,10 @@ ONLY computes forces - no logging or statistics.
 """
 
 import logging
-import torch
+from typing import Dict, List, Tuple
+
 import numpy as np
-from typing import Dict, List
+import torch
 from ase import Atoms
 from fairchem.core.datasets.atomic_data import AtomicData
 from fairchem.core.datasets import data_list_collater
@@ -38,9 +39,17 @@ class MLFFForceComputer:
         
         # Default task name for MLFF predictor
         self.task_name = "omol"  # For molecular systems
+        # Fallback magnitude (in normalized force units) assigned when MLFF evaluation fails.
+        # This should be large enough to act as a penalty via the force aggregation reward.
+        self.fallback_force_magnitude = 5.0
         
-    def diffusion_to_atomic_data(self, z: torch.Tensor, node_mask: torch.Tensor, 
-                                 dataset_info: Dict, batch_size: int) -> List[AtomicData]:
+    def diffusion_to_atomic_data(
+        self,
+        z: torch.Tensor,
+        node_mask: torch.Tensor,
+        dataset_info: Dict,
+        batch_size: int,
+    ) -> List[Tuple[int, AtomicData]]:
         """
         Convert diffusion state to AtomicData format for MLFF.
         
@@ -65,7 +74,7 @@ class MLFFForceComputer:
         
         # Convert one-hot encoded features to atomic numbers
         atom_decoder = dataset_info['atom_decoder']
-        atomic_data_list = []
+        atomic_data_list: List[Tuple[int, AtomicData]] = []
         
         # Create a mapping from atomic symbols to atomic numbers
         # QM9 contains H, C, N, O, F (F is rare with only ~2300 occurrences)
@@ -126,9 +135,10 @@ class MLFFForceComputer:
                     task_name=self.task_name,
                     r_data_keys=["charge", "spin"]
                 )
-                # Debug: Check natoms for each molecule
-                # print(f"Batch {batch_idx}: Created AtomicData with {atomic_data.natoms.item()} atoms")
-                atomic_data_list.append(atomic_data)
+                edge_index = getattr(atomic_data, "edge_index", None)
+                if edge_index is None or edge_index.numel() == 0:
+                    continue
+                atomic_data_list.append((batch_idx, atomic_data))
             except Exception:
                 continue
         
@@ -150,24 +160,32 @@ class MLFFForceComputer:
         """
         batch_size, max_n_nodes, _ = z.shape
         
-        # Initialize zero forces
+        # Initialize fallback forces; valid systems will overwrite these entries.
         forces = torch.zeros((batch_size, max_n_nodes, 3), device=self.device)
+        forces[:, :, 0] = self.fallback_force_magnitude
         if self.compute_energy:
             energies = torch.zeros(batch_size, device=self.device)
         
-        # Convert to atomic data format
-        atomic_data_list = self.diffusion_to_atomic_data(z, node_mask, dataset_info, batch_size)
+        # Convert to atomic data format (keep mapping to original batch indices)
+        atomic_data_pairs = self.diffusion_to_atomic_data(z, node_mask, dataset_info, batch_size)
         
-        if not atomic_data_list:
+        if not atomic_data_pairs:
             return (forces, energies) if self.compute_energy else forces
+
+        batch_indices, atomic_data_list = zip(*atomic_data_pairs)
+        batch_indices = list(batch_indices)
+        atomic_data_list = list(atomic_data_list)
         
         # Batch the atomic data using FAIRChem's collater
         try:
             batch = data_list_collater(atomic_data_list, otf_graph=True)
             batch = batch.to(self.device)
         except Exception as exc:
-            logger.exception("MLFFForceComputer: failed to collate atomic data for MLFF inference: %s", exc)
-            raise
+            logger.warning(
+                "MLFFForceComputer: failed to collate atomic data for MLFF inference (%s). Returning fallback forces.",
+                exc,
+            )
+            return (forces, energies) if self.compute_energy else forces
         
         # Compute forces (and energy) using MLFF
         try:
@@ -180,18 +198,19 @@ class MLFFForceComputer:
                 
                 # Map forces back to original batch structure
                 atom_idx = 0
-                for batch_idx, atomic_data in enumerate(atomic_data_list):
+                for slot_idx, atomic_data in enumerate(atomic_data_list):
                     n_atoms = atomic_data.natoms.item()
                     batch_forces = mlff_forces[atom_idx:atom_idx + n_atoms]  # [n_atoms, 3]
                     
                     # Get valid node indices for this batch
-                    mask = node_mask[batch_idx, :, 0].bool()
+                    original_idx = int(batch_indices[slot_idx])
+                    mask = node_mask[original_idx, :, 0].bool()
                     valid_indices = torch.where(mask)[0]
                     
                     if len(valid_indices) == n_atoms:
                         # Ensure batch_forces is on the same device as forces
                         batch_forces = batch_forces.to(forces.device)
-                        forces[batch_idx, valid_indices] = batch_forces
+                        forces[original_idx, valid_indices] = batch_forces
                         
                     atom_idx += n_atoms
                 
@@ -205,11 +224,15 @@ class MLFFForceComputer:
                 if mlff_energy.dim() > 1:
                     mlff_energy = mlff_energy.squeeze(-1)
                 # Map energies back to batch (accounting for skipped systems)
-                for idx, _ in enumerate(atomic_data_list):
-                    energies[idx] = mlff_energy[idx].item()
+                for slot_idx in range(len(atomic_data_list)):
+                    original_idx = int(batch_indices[slot_idx])
+                    energies[original_idx] = mlff_energy[slot_idx].item()
             
             return (forces, energies) if self.compute_energy else forces
             
         except Exception as exc:
-            logger.exception("MLFFForceComputer: MLFF predictor execution failed: %s", exc)
-            raise
+            logger.warning(
+                "MLFFForceComputer: MLFF predictor execution failed (%s). Returning fallback forces.",
+                exc,
+            )
+            return (forces, energies) if self.compute_energy else forces

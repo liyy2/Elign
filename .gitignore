@@ -212,3 +212,11 @@ e3_diffusion_for_molecules-main/generated_samples/
 exp_*.err
 exp_*.out
 exp/*
+
+# Local agent artifacts (not part of the project).
+.claude_resources.json
+force_output_1000_step.npy
+
+# Third-party vendored deps (installed via pip/conda in most setups).
+fairchem/
+codex_attempts/

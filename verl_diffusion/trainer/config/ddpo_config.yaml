@@ -16,6 +16,19 @@ dataloader:
   # Dataloader batches larger than this value are split into smaller micro-batches
   # to control GPU memory during rollout generation.
   micro_batch_size: 512
+  # Optional reweighting of the node-count prior used during *RL training* rollouts.
+  #
+  # Motivation: QM9 stability under `check_stability` is substantially worse for small molecules
+  # (e.g., 12–15 atoms) than for larger ones. The node-count prior is not learned during PPO, so
+  # if small sizes are under-trained, the global stability rate can plateau. Reweighting lets us
+  # oversample the difficult sizes during training without changing the eval-time distribution.
+  #
+  # If `nodes_dist_focus_min/max` are set (inclusive), their probabilities are multiplied by
+  # `nodes_dist_focus_multiplier` and then renormalized.
+  nodes_dist_focus_min: null
+  nodes_dist_focus_max: null
+  nodes_dist_focus_multiplier: 1.0
+  # Number of rollout/update iterations to run.
   epoches: 100
   smiles_path: "qm9/temp/qm9_smiles.pickle"
 
@@ -24,6 +37,13 @@ filters:
   enable_filtering: false
   enable_penalty: true
   penalty_scale: 0.5
+  # Optional extra penalty applied only to RDKit-invalid molecules (smiles == None).
+  # Use this when you want to optimize validity without also penalizing in-dataset molecules.
+  invalid_penalty_scale: 0.0
+  # Optional penalty applied when multiple samples in the *same rollout batch* share the
+  # same canonical SMILES. This helps prevent mode collapse (uniqueness → ~0).
+  # Set to 0 to disable.
+  duplicate_penalty_scale: 0.0
 
 model:
   config: "./pretrained/edm/edm_qm9/args.pickle"
@@ -57,25 +77,61 @@ train:
     min_lr_ratio: 0.05
     num_cycles: 0.5
     stable_ratio: 0.9
+  # Optional wall-clock cap for the training loop.
+  # Example: set to 6 for a 6-hour budget.
+  max_time_hours: null
+  # Optional early stopping based on a logged metric (e.g. `validity_x_uniqueness`).
+  early_stop_metric: null
+  early_stop_mode: max
+  early_stop_patience_minutes: null
+  early_stop_min_delta: 0.0
 
 reward:
   type: uma
   mlff_model: uma-s-1p1
+  # Optional per-atom force clipping (in the same units as the MLFF forces).
+  # Use this if a few extreme-force atoms dominate the reward and kill exploration.
   force_clip_threshold: null
   use_energy: false
+  # Normalize energy by number of atoms before transforming.
+  # If you enable this, you likely also want to adjust `energy_transform_offset/scale`
+  # because QM9 per-atom energies are ~O(1e3) smaller than total energies.
+  energy_normalize_by_atoms: false
+  # Gate energy reward to stable molecules only.
+  energy_only_if_stable: false
+  # Optional: gate force reward to stable molecules only. This prevents unstable low-force
+  # structures (e.g., stretched/missing bonds) from receiving a high force reward.
+  force_only_if_stable: false
   force_weight: 1.0
   energy_weight: 1.0
+  # Adds +w for stable molecules and -w for unstable molecules.
   stability_weight: 0.0
+  # Optional: penalize missing valence bonds (under-bonded atoms). This targets the
+  # \"RDKit-valid but QM9-unstable\" failure mode where RDKit uses implicit H to satisfy valence.
+  # Interpreted as a penalty per missing bond order (higher => pushes harder for full valence).
+  valence_underbond_weight: 0.0
+  # Optional: penalize excess valence bonds (over-bonded atoms).
+  # This targets RDKit-invalid failures like C with valence 5 (too many inferred bonds).
+  valence_overbond_weight: 0.0
+  # Optional: smooth (sigmoid) version of the valence penalties that provides a dense signal when
+  # atom pairs are close to the bond-length cutoff. This helps reduce the discontinuity in the
+  # discrete bond-order heuristic (which flips 0/1/2/3 at fixed thresholds).
+  valence_underbond_soft_weight: 0.0
+  valence_overbond_soft_weight: 0.0
+  valence_soft_temperature: 0.02
   force_aggregation: rms # rms or max
+  # Weights applied to normalized GRPO advantages (DDPOTrainer), not to the raw rewards.
   force_adv_weight: 1.0
   energy_adv_weight: 0.1
+  # Energy is transformed as: (E + offset) / scale, then optionally clipped, then negated (minimize energy).
   energy_transform_offset: 10000.0
   energy_transform_scale: 1000.0
+  # Optional clamp applied after (energy + offset) / scale, before negation.
+  # Useful to prevent extreme-energy outliers from dominating PPO advantages.
+  energy_transform_clip: null
   shaping:
     enabled: true
-    method: potential
     gamma: 1.0
-    weight: 1.0
     # If true, apply shaping on energy deltas only; terminal reward still mixes force+energy.
     only_energy_reshape: false
     # Cap on the number of diffusion steps evaluated in a single MLFF call.

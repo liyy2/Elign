@@ -1,0 +1,20 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence
+  - _self_
+
+# Force-only stability run.
+#
+# Drops the energy channel (often noisy / out-of-distribution) and relies on:
+# - UMA force magnitude (local relaxation)
+# - explicit QM9 valence stability bonus
+# - explicit missing-valence (under-bond) penalty
+# while keeping RDKit validity×uniqueness high via filtering/invalid penalties.
+
+reward:
+  use_energy: false
+  energy_adv_weight: 0.0
+  # Push harder on stability/valence than the mixed energy+force config.
+  stability_weight: 6.0
+  atom_stability_weight: 50.0
+  valence_underbond_weight: 5.0
+

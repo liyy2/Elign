@@ -1,0 +1,26 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_forcegate_stability
+  - _self_
+
+# QM9 energy+force post-training with a larger GRPO group and an explicit valence (under-bond) penalty.
+#
+# Motivation:
+# - The common "RDKit-valid but QM9-unstable" failure mode is a heavy atom that is *missing one bond*
+#   under the QM9 distance->bond-order heuristic. RDKit can still sanitize by adding implicit H, but
+#   `check_stability` requires explicit valence.
+# - `valence_underbond_weight` penalizes the *count* of missing bond order across atoms, providing a
+#   more specific signal than the binary stable/unstable flag.
+#
+# Grouping:
+# - 2 prompts × 12 samples each = 24 rollouts per iteration (same total batch size as 4×6),
+#   but with a larger within-prompt group for GRPO normalization.
+
+dataloader:
+  sample_group_size: 2
+  each_prompt_sample: 12
+  micro_batch_size: 24
+
+reward:
+  # Penalty per missing bond-order unit (e.g., C with 3 instead of 4 contributes 1).
+  valence_underbond_weight: 3.0
+

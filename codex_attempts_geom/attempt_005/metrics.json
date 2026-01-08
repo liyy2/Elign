@@ -1,0 +1,16 @@
+{
+  "description": "Force-only (2h budget)",
+  "start_time": "2026-01-08 11:50:14",
+  "duration_hours": 0.09308475638888888,
+  "status": "completed",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_20260108_115011.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_20260108_115011_phase1_force",
+  "best_epoch": 7,
+  "reward": -3.0060529708862305,
+  "atom_stability": 0.8203842043876648,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 0.9921875,
+  "rdkit_uniqueness": 0.7480314960629921,
+  "validity_x_uniqueness": 0.7421875
+}
+

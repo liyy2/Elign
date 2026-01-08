@@ -9,6 +9,7 @@ dataloader:
   sample_group_size: 1
   each_prompt_sample: 2
   micro_batch_size: 2
+  # Number of rollout/update iterations to run.
   epoches: 1
   geom_data_file: null
   smiles_path: null
@@ -52,4 +53,3 @@ wandb:
 hydra:
   job:
     chdir: false
-

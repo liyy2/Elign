@@ -1,0 +1,35 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence_overbond
+  - _self_
+
+# Follow-up for the stability gap (QM9):
+#
+# With shared-prefix sampling (`model.share_initial_noise=true` + skip_prefix>0), PPO only updates
+# the last part of the diffusion trajectory. That is great for speed, but it makes it hard to fix
+# stability failures that originate early (especially stray H placement).
+#
+# This config disables shared-prefix sampling so PPO trains the *full* trajectory, and increases
+# the graded stability penalties (under/over-bond valence errors) that are directly aligned with
+# `edm_source.qm9.analyze.check_stability`.
+
+model:
+  share_initial_noise: false
+
+train:
+  # Full-trajectory updates are higher variance; slightly lower LR is more stable.
+  learning_rate: 3.0e-6
+  # Force alignment requires per-step MLFF traces (reward shaping). This config is terminal-only,
+  # so keep the alignment penalty disabled to avoid confusion.
+  force_alignment_enabled: false
+
+reward:
+  # Stronger penalties for the dominant failure modes:
+  # - under-bonded (often stray H): missing explicit bond orders
+  # - over-bonded: too-short distances that create extra inferred bonds (often RDKit-invalid)
+  valence_underbond_weight: 4.0
+  valence_overbond_weight: 2.0
+  atom_stability_weight: 30.0
+  shaping:
+    scheduler:
+      # Keep prefix skipping disabled when we train the full trajectory.
+      skip_prefix: 0

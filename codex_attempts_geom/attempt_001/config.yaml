@@ -1,0 +1,95 @@
+best_checkpoint_metric: validity_x_uniqueness
+best_checkpoint_mode: max
+checkpoint_path: null
+dataloader:
+  each_prompt_sample: 32
+  epoches: 1000000
+  geom_data_file: null
+  micro_batch_size: 32
+  sample_group_size: 4
+  smiles_path: null
+distributed:
+  is_main_process: true
+  local_rank: 0
+  rank: 0
+  world_size: 1
+filters:
+  condition: false
+  duplicate_penalty_scale: 0.05
+  enable_filtering: false
+  enable_penalty: false
+  invalid_penalty_scale: 0.2
+  penalty_scale: 0.0
+model:
+  config: /home/yl2428/e3_diffusion_for_molecules-main/pretrained/edm/edm_geom_drugs/args.pickle
+  model_path: /home/yl2428/e3_diffusion_for_molecules-main/pretrained/edm/edm_geom_drugs/generative_model_ema.npy
+  return_suffix_only: true
+  share_initial_noise: true
+  skip_prefix: 900
+  time_step: 1000
+name: edm-geom-force-vxu-suffix
+resume: false
+reward:
+  energy_adv_weight: 0.1
+  energy_transform_offset: 10000.0
+  energy_transform_scale: 1000.0
+  energy_weight: 0.0
+  force_adv_weight: 1.0
+  force_aggregation: rms
+  force_clip_threshold: null
+  force_weight: 1.0
+  mlff_model: uma-s-1p1
+  shaping:
+    enabled: false
+    gamma: 1.0
+    mlff_batch_size: 16
+    only_energy_reshape: false
+    scheduler:
+      adaptive:
+        coarse_stride: 10
+        fine_stride: 2
+        threshold_fraction: 0.25
+      include_terminal: true
+      mode: adaptive
+      skip_prefix: 500
+      uniform_stride: 1
+    terminal_weight: 5
+  stability_weight: 0.0
+  type: uma
+  use_energy: false
+save_path: /home/yl2428/e3_diffusion_for_molecules-main/outputs/verl/geom_vxu/geom_vxu_20260108_113124_phase1_force
+seed: 42
+train:
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_epsilon: 1.0e-08
+  adam_weight_decay: 0.0001
+  adv_clip_max: 5
+  clip_range: 0.2
+  early_stop_metric: validity_x_uniqueness
+  early_stop_min_delta: 0.002
+  early_stop_mode: max
+  early_stop_patience_minutes: 60
+  epoch_per_rollout: 1
+  force_alignment_enabled: false
+  force_alignment_min_delta: 0.0001
+  force_alignment_min_force: 0.0001
+  force_alignment_weight: 0.0
+  gradient_accumulation_steps: 4
+  kl_penalty_weight: 0.0
+  learning_rate: 1.0e-05
+  max_grad_norm: 1
+  max_time_hours: 2.0
+  scheduler:
+    min_lr_ratio: 0.05
+    name: none
+    num_cycles: 0.5
+    stable_ratio: 0.9
+    total_steps: 150
+    warmup_steps: 10
+  train_micro_batch_size: 32
+wandb:
+  enabled: false
+  wandb_name: edm-geom-ddp
+  wandb_project: ddpo
+

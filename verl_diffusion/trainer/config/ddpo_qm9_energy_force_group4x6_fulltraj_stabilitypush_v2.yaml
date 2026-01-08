@@ -1,0 +1,33 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush
+  - _self_
+
+# Second stability push for QM9 (energy + force).
+#
+# Observed failure mode (even when RDKit validity is high):
+# - A small tail of samples remains QM9-unstable due to under-bonded valence under
+#   `edm_source.qm9.analyze.check_stability` (typically missing ~1 bond-order unit).
+#
+# Changes vs `..._stabilitypush`:
+# - Sharpen the soft-valence signal so near-threshold bonds saturate closer to integer order.
+# - Increase graded stability pressure so PPO keeps improving the long tail.
+# - Normalize energy by atom count to reduce composition-size bias in the energy objective.
+# - Slightly stronger KL keeps the policy closer to the pre-trained EDM prior (often more stable).
+
+train:
+  kl_penalty_weight: 0.10
+
+reward:
+  # Sharper sigmoid around bond thresholds -> less penalty on already-stable bonds, more separation
+  # between stable and near-miss cases.
+  valence_soft_temperature: 0.01
+
+  # Stronger stability shaping.
+  stability_weight: 8.0
+  atom_stability_weight: 120.0
+  valence_underbond_weight: 6.0
+  valence_underbond_soft_weight: 8.0
+
+  # Energy is extensive; normalize to per-atom so it doesn't implicitly prefer certain sizes/types.
+  energy_normalize_by_atoms: true
+

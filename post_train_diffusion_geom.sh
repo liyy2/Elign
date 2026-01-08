@@ -34,6 +34,10 @@ EPOCHES="${EPOCHES:-}"             # optional override for dataloader.epoches
 MODEL_CONFIG="${MODEL_CONFIG:-./pretrained/edm/edm_geom_drugs/args.pickle}"
 MODEL_WEIGHTS="${MODEL_WEIGHTS:-./pretrained/edm/edm_geom_drugs/generative_model_ema.npy}"
 
+# Optional: resume a DDPO checkpoint (full optimizer/model state).
+# NOTE: `checkpoint_path` is ignored unless `resume=true`.
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+
 # GEOM data (.npy). Prefer passing an absolute path via `GEOM_DATA_FILE=...`.
 GEOM_DATA_FILE="${GEOM_DATA_FILE:-}"
 
@@ -151,6 +155,11 @@ else
   WANDB_FLAGS=("wandb.enabled=false")
 fi
 
+declare -a RESUME_FLAGS=()
+if [[ -n "${CHECKPOINT_PATH}" ]]; then
+  RESUME_FLAGS=("resume=true" "checkpoint_path=${CHECKPOINT_PATH}")
+fi
+
 EXTRA_FLAGS=()
 if [[ -n "${EPOCHES}" ]]; then
   EXTRA_FLAGS+=("dataloader.epoches=${EPOCHES}")
@@ -166,6 +175,7 @@ fi
   --config-name "${CONFIG_NAME}" \
   "${WANDB_FLAGS[@]}" \
   save_path="${SAVE_PATH}" \
+  "${RESUME_FLAGS[@]}" \
   model.config="${MODEL_CONFIG}" \
   model.model_path="${MODEL_WEIGHTS}" \
   dataloader.geom_data_file="${GEOM_DATA_FILE}" \

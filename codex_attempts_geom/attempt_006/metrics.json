@@ -1,0 +1,16 @@
+{
+  "description": "Force-only (6h budget; interrupted)",
+  "start_time": "2026-01-08 12:06:09",
+  "duration_hours": 0.18066279583333333,
+  "status": "early_stop",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_exp_20260108_120601.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_exp_20260108_120601_phase1_force",
+  "best_epoch": 13,
+  "reward": -5.43410587310791,
+  "atom_stability": 0.7052749991416931,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 0.8515625,
+  "rdkit_uniqueness": 0.8990825688073395,
+  "validity_x_uniqueness": 0.765625
+}
+

@@ -105,6 +105,7 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         group_index=None,
         share_initial_noise=False,
         skip_prefix=0,
+        return_suffix_only: bool = False,
     ):
         """Draw samples from the generative model.
 
@@ -217,6 +218,118 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             start_idx=0,
             prefix_cache=None,
         )
+
+        if return_suffix_only:
+            # Suffix-only output for shared-prefix sampling:
+            # - Avoid materializing the repeated prefix cache for every group member.
+            # - Return only the suffix trajectory starting at `prefix_steps` (plus terminal decode).
+            #
+            # This is critical for large timesteps/group sizes where the prefix history would
+            # otherwise dominate GPU memory without contributing to PPO updates.
+            suffix_latents_ref = ref_result["latents"][prefix_steps:]
+            suffix_logps_ref = ref_result["logps"][prefix_steps:]
+            suffix_mus_ref = ref_result["mus"][prefix_steps:]
+            suffix_sigmas_ref = ref_result["sigmas"][prefix_steps:]
+            suffix_z0_preds_ref = ref_result["z0_preds"][prefix_steps:]
+            suffix_timesteps = list(ref_result["timesteps"][prefix_steps:])
+
+            if group_size > 1:
+                branch_node_mask = grouped_node_mask[:, 1:].reshape(-1, *grouped_node_mask.shape[2:])
+                branch_edge_mask = grouped_edge_mask[:, 1:].reshape(-1, *grouped_edge_mask.shape[2:])
+
+                branch_context = None
+                if context_slices is not None:
+                    branch_index_list = branch_indices.reshape(-1).tolist()
+                    branch_context_slices = [context_slices[idx] for idx in branch_index_list]
+                    branch_context = self._collate_context(branch_context_slices)
+
+                boundary_latent = ref_result["latents"][prefix_steps]
+                branch_initial_z = boundary_latent.repeat_interleave(group_size - 1, dim=0)
+                branch_result = self._rollout_member(
+                    initial_z=branch_initial_z,
+                    node_mask=branch_node_mask,
+                    edge_mask=branch_edge_mask,
+                    context=branch_context,
+                    fix_noise=fix_noise,
+                    schedule=schedule,
+                    start_idx=prefix_steps,
+                    prefix_cache=None,
+                )
+            else:
+                branch_result = None
+
+            x_out = ref_result["x"].new_empty((n_samples,) + ref_result["x"].shape[1:])
+            h_cat_out = ref_result["h"]["categorical"].new_empty(
+                (n_samples,) + ref_result["h"]["categorical"].shape[1:]
+            )
+            h_int_out = ref_result["h"]["integer"].new_empty(
+                (n_samples,) + ref_result["h"]["integer"].shape[1:]
+            )
+            x_out[ref_indices] = ref_result["x"]
+            h_cat_out[ref_indices] = ref_result["h"]["categorical"]
+            h_int_out[ref_indices] = ref_result["h"]["integer"]
+
+            branch_indices_flat = None
+            if group_size > 1 and branch_indices is not None:
+                branch_indices_flat = branch_indices.reshape(-1)
+                x_out[branch_indices_flat] = branch_result["x"]
+                h_cat_out[branch_indices_flat] = branch_result["h"]["categorical"]
+                h_int_out[branch_indices_flat] = branch_result["h"]["integer"]
+
+            h_out = {"categorical": h_cat_out, "integer": h_int_out}
+
+            latents_out = []
+            for frame_ref in suffix_latents_ref:
+                frame = frame_ref.new_empty((n_samples,) + frame_ref.shape[1:])
+                frame[ref_indices] = frame_ref
+                if branch_indices_flat is not None:
+                    frame[branch_indices_flat] = branch_result["latents"][len(latents_out)]
+                latents_out.append(frame)
+
+            logps_out = []
+            mus_out = []
+            sigmas_out = []
+            z0_preds_out = []
+            for idx in range(len(suffix_logps_ref)):
+                logp_ref = suffix_logps_ref[idx]
+                logp = logp_ref.new_empty((n_samples,) + logp_ref.shape[1:])
+                logp[ref_indices] = logp_ref
+                if branch_indices_flat is not None:
+                    logp[branch_indices_flat] = branch_result["logps"][idx]
+                logps_out.append(logp)
+
+                mu_ref = suffix_mus_ref[idx]
+                mu = mu_ref.new_empty((n_samples,) + mu_ref.shape[1:])
+                mu[ref_indices] = mu_ref
+                if branch_indices_flat is not None:
+                    mu[branch_indices_flat] = branch_result["mus"][idx]
+                mus_out.append(mu)
+
+                sigma_ref = suffix_sigmas_ref[idx]
+                sigma = sigma_ref.new_empty((n_samples,) + sigma_ref.shape[1:])
+                sigma[ref_indices] = sigma_ref
+                if branch_indices_flat is not None:
+                    sigma[branch_indices_flat] = branch_result["sigmas"][idx]
+                sigmas_out.append(sigma)
+
+                z0_ref = suffix_z0_preds_ref[idx]
+                z0 = z0_ref.new_empty((n_samples,) + z0_ref.shape[1:])
+                z0[ref_indices] = z0_ref
+                if branch_indices_flat is not None:
+                    z0[branch_indices_flat] = branch_result["z0_preds"][idx]
+                z0_preds_out.append(z0)
+
+            self._assert_mean_zero_with_mask(x_out, node_mask)
+
+            max_cog = torch.sum(x_out, dim=1, keepdim=True).abs().max().item()
+            if max_cog > 5e-2:
+                print(
+                    f'Warning cog drift with error {max_cog:.3f}. Projecting '
+                    f'the positions down.'
+                )
+                x_out = self._remove_mean_with_mask(x_out, node_mask)
+
+            return x_out, h_out, latents_out, logps_out, suffix_timesteps, mus_out, sigmas_out, z0_preds_out
 
         results = [None for _ in range(n_samples)]
         ref_split = self._split_member_results(ref_result)

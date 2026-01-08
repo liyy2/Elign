@@ -53,6 +53,23 @@ class EGNN_dynamics_QM9(nn.Module):
         edges = [x.to(self.device) for x in edges]
         node_mask = node_mask.reshape(bs * n_nodes, 1)
         edge_mask = edge_mask.reshape(bs * n_nodes * n_nodes, 1)
+
+        # Performance/memory optimization:
+        # The model uses a dense (all-pairs) edge index, but padded nodes/diagonal edges
+        # are masked out via `edge_mask`. Computing MLP messages for masked edges is
+        # wasteful and can dominate VRAM for GEOM (max_n_nodes=181).
+        #
+        # Filtering edges by `edge_mask` is equivalent to multiplying their messages
+        # by zero, but avoids allocating giant intermediate tensors.
+        if edge_mask is not None:
+            keep = (edge_mask.view(-1) > 0.5)
+            if torch.any(keep):
+                edges = [edges[0][keep], edges[1][keep]]
+                edge_mask = edge_mask[keep]
+            else:
+                # Degenerate case (e.g., empty graphs): keep empty edge tensors.
+                edges = [edges[0][:0], edges[1][:0]]
+                edge_mask = edge_mask[:0]
         xh = xh.reshape(bs * n_nodes, -1).clone() * node_mask
         x = xh[:, 0:self.n_dims].clone()
         if h_dims == 0:
@@ -97,9 +114,18 @@ class EGNN_dynamics_QM9(nn.Module):
 
         vel = vel.reshape(bs, n_nodes, -1)
 
-        if torch.any(torch.isnan(vel)):
-            print('Warning: detected nan, resetting EGNN output to zero.')
-            vel = torch.zeros_like(vel)
+        if not torch.isfinite(vel).all():
+            # Previous behavior zeroed the entire batch if *any* NaN appeared, which can
+            # collapse diversity (one bad sample spoils all) and destabilize RL training.
+            # Instead, replace only the non-finite entries.
+            if not hasattr(self, "_nan_warning_count"):
+                self._nan_warning_count = 0
+            if self._nan_warning_count < 5:
+                print("Warning: detected non-finite EGNN output; sanitizing to zero.")
+            elif self._nan_warning_count == 5:
+                print("Warning: detected non-finite EGNN output; further warnings suppressed.")
+            self._nan_warning_count += 1
+            vel = torch.nan_to_num(vel, nan=0.0, posinf=0.0, neginf=0.0)
 
         if node_mask is None:
             vel = remove_mean(vel)

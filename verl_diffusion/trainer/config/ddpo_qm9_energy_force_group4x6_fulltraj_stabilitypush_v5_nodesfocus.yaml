@@ -1,0 +1,22 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - _self_
+
+# v5: oversample hard (small) molecule sizes during RL rollouts to improve QM9 `check_stability`.
+#
+# Observation:
+# - The remaining instability is concentrated in small molecules (e.g., 12–17 atoms).
+# - The node-count prior is not learned by PPO, so we reweight it only during *training* rollouts
+#   to give PPO more coverage of these hard sizes.
+
+dataloader:
+  # Reweight the node-count categorical prior used during RL rollouts:
+  # prob[n] <- prob[n] * multiplier for n in [min, max], then renormalize.
+  nodes_dist_focus_min: 12
+  nodes_dist_focus_max: 17
+  nodes_dist_focus_multiplier: 2.0
+
+train:
+  # Consume the full rollout batch in one PPO step (fits in ~30GB VRAM on QM9).
+  train_micro_batch_size: 24
+

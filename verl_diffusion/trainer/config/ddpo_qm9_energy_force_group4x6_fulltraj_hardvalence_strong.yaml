@@ -1,0 +1,34 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate_sharp
+  - _self_
+
+# Attempt to close the remaining QM9 stability gap (while keeping RDKit validity×uniqueness high).
+#
+# Empirical failure mode (attempt_082, 10k samples):
+# - The dominant RDKit-valid-but-unstable cases are *under-bonded* by ~1 bond-order unit
+#   (median missing_total=1.0), and most are still a single connected fragment.
+#
+# This config makes a minimal, targeted change:
+# - Strengthen the *discrete* under-bond penalty (exactly aligned with `check_stability`)
+# - Disable soft-valence penalties (they can penalize already-stable molecules and add noise)
+
+dataloader:
+  # Allow longer training; wall-clock is still capped via `train.max_time_hours`.
+  epoches: 2000
+
+train:
+  # Stability improvements can be slow; allow more plateau time before early stopping.
+  early_stop_patience_minutes: 60
+  early_stop_min_delta: 0.0005
+  # Match the longer horizon.
+  scheduler:
+    total_steps: 400
+
+reward:
+  # Strongly discourage under-bonded valence (main stability failure mode).
+  valence_underbond_weight: 8.0
+  # Slightly increase molecule-level stability bonus (+w for stable / -w for unstable).
+  stability_weight: 6.0
+  # Disable soft penalties; keep only discrete stability-aligned terms.
+  valence_underbond_soft_weight: 0.0
+  valence_overbond_soft_weight: 0.0

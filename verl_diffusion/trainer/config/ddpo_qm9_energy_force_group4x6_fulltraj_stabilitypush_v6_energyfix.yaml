@@ -1,0 +1,21 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - _self_
+
+# v6: fix the MLFF energy transform when `energy_normalize_by_atoms=true`.
+#
+# UMA per-atom energies on QM9 are ~O(1e2–1e3) in magnitude (e.g. ~-600 ± 130).
+# Using the old total-energy transform (offset=10000, scale=1000) saturates at the clip value
+# and turns the energy channel into an (almost) constant penalty on stable molecules.
+#
+# This config recenters/rescales the transformed per-atom energy so the energy reward has
+# meaningful variation and does not implicitly favor unstable molecules via gating.
+
+reward:
+  # For per-atom energies ~[-1200, -400], center around 0 with reasonable dynamic range.
+  energy_transform_offset: 600.0
+  energy_transform_scale: 200.0
+
+train:
+  # Consume the full rollout batch in one PPO step (matches the best v2 stability run).
+  train_micro_batch_size: 24

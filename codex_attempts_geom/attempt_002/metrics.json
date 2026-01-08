@@ -1,0 +1,9 @@
+{
+  "description": "Force-only (wrapper interrupted before checkpoints)",
+  "start_time": "2026-01-08 11:37:15",
+  "duration_hours": 0.0009099999999999999,
+  "status": "early_stop",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_20260108_113710.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_20260108_113710_phase1_force"
+}
+

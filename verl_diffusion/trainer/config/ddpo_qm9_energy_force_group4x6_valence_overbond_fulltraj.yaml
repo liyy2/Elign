@@ -1,0 +1,32 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence_overbond
+  - _self_
+
+# QM9 stability gap follow-up:
+# - RDKit validity can be high while QM9 `check_stability` is low because RDKit can add implicit H,
+#   while `check_stability` requires explicit valence under the distance-based bond heuristic.
+# - Most "RDKit-valid but unstable" failures are **under-bonded** (missing C-H/N-H bonds).
+#
+# This config focuses on improving stability by:
+# 1) Disabling shared-prefix sampling so PPO updates the full diffusion trajectory (not only the last ~300 steps).
+# 2) Increasing the under-bond valence penalty to directly target the dominant failure mode.
+
+model:
+  share_initial_noise: false
+
+train:
+  # Alignment needs intermediate force traces; shaping is disabled here, so keep it off.
+  force_alignment_enabled: false
+  # Slightly lower LR when training on the full trajectory.
+  learning_rate: 3.0e-6
+
+reward:
+  # Stronger penalty for missing explicit valence bonds (main driver of RDKit-valid but unstable samples).
+  valence_underbond_weight: 3.0
+  # Keep over-bond penalty moderate; it mainly targets RDKit-invalid failures.
+  valence_overbond_weight: 1.0
+  shaping:
+    scheduler:
+      # Avoid any accidental prefix-skipping when `model.share_initial_noise=false`.
+      skip_prefix: 0
+

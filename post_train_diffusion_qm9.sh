@@ -25,11 +25,16 @@ CONDA_ENV="${CONDA_ENV:-edm}"
 WANDB_ENABLED="${WANDB_ENABLED:-0}"   # 1=enable wandb.init, 0=disable
 WANDB_PROJECT="${WANDB_PROJECT:-ddpo}"
 
-CONFIG_NAME="${CONFIG_NAME:-ddpo_config}"
+# Recommended default: the best configuration found so far in this tuning loop.
+CONFIG_NAME="${CONFIG_NAME:-ddpo_qm9_energy_force_group4x6}"
 
 # Starting checkpoint for the diffusion policy (EDM)
 MODEL_CONFIG="${MODEL_CONFIG:-./pretrained/edm/edm_qm9/args.pickle}"
 MODEL_WEIGHTS="${MODEL_WEIGHTS:-./pretrained/edm/edm_qm9/generative_model_ema.npy}"
+
+# Optional: resume a DDPO checkpoint (full optimizer/model state).
+# NOTE: `checkpoint_path` is ignored unless `resume=true`.
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 
 # QM9 smiles pickle used by the novelty filter (must exist even if filtering/penalty is disabled)
 SMILES_PATH="${SMILES_PATH:-qm9/temp/qm9_smiles.pickle}"
@@ -61,15 +66,18 @@ sanitize_for_name() {
 # ----------------------------
 LEARNING_RATE="${LEARNING_RATE:-4e-6}"
 CLIP_RANGE="${CLIP_RANGE:-2e-3}"
-TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-4}"
+# Matches `ddpo_qm9_energy_force_group4x6.yaml`
+TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-8}"
 EPOCH_PER_ROLLOUT="${EPOCH_PER_ROLLOUT:-1}"
-KL_PENALTY_WEIGHT="${KL_PENALTY_WEIGHT:-0.04}"
+# Matches `ddpo_qm9_energy_force_group4x6.yaml`
+KL_PENALTY_WEIGHT="${KL_PENALTY_WEIGHT:-0.08}"
 
 # ----------------------------
 # Diffusion rollout settings
 # ----------------------------
-SAMPLE_GROUP_SIZE="${SAMPLE_GROUP_SIZE:-1}"
-EACH_PROMPT_SAMPLE="${EACH_PROMPT_SAMPLE:-24}"
+# Best-performing split: 4 prompts × 6 samples each = 24 rollouts/iter.
+SAMPLE_GROUP_SIZE="${SAMPLE_GROUP_SIZE:-4}"
+EACH_PROMPT_SAMPLE="${EACH_PROMPT_SAMPLE:-6}"
 TIME_STEP="${TIME_STEP:-1000}"
 SHARE_INITIAL_NOISE="${SHARE_INITIAL_NOISE:-true}"
 FORCE_ALIGNMENT_ENABLED="${FORCE_ALIGNMENT_ENABLED:-false}"
@@ -78,15 +86,22 @@ FORCE_ALIGNMENT_ENABLED="${FORCE_ALIGNMENT_ENABLED:-false}"
 # Reward configuration
 # ----------------------------
 USE_ENERGY="${USE_ENERGY:-true}"
-MLFF_MODEL="${MLFF_MODEL:-uma-m-1p1}"
-MLFF_BATCH_SIZE="${MLFF_BATCH_SIZE:-8}"
+# Default to UMA-S for stability. UMA-M can be enabled via `MLFF_MODEL=uma-m-1p1`,
+# but in our quick tests it was much more sensitive to PPO hyperparameters.
+MLFF_MODEL="${MLFF_MODEL:-uma-s-1p1}"
+MLFF_BATCH_SIZE="${MLFF_BATCH_SIZE:-32}"
 FORCE_AGGREGATION="${FORCE_AGGREGATION:-rms}"
-STABILITY_WEIGHT="${STABILITY_WEIGHT:-0}"
+STABILITY_WEIGHT="${STABILITY_WEIGHT:-2.0}"
+ENERGY_ONLY_IF_STABLE="${ENERGY_ONLY_IF_STABLE:-true}"
+ENERGY_ADV_WEIGHT="${ENERGY_ADV_WEIGHT:-0.05}"
+# Clip per-atom force magnitudes above this threshold before aggregating (0/empty disables).
+FORCE_CLIP_THRESHOLD="${FORCE_CLIP_THRESHOLD:-2.0}"
 
 # Shaping settings
 SKIP_PREFIX="${SKIP_PREFIX:-700}"
-REWARD_SHAPING_ENABLED="${REWARD_SHAPING_ENABLED:-true}"
-SHAPING_ONLY_ENERGY="${SHAPING_ONLY_ENERGY:-true}"
+# Shaping is noisier and was not needed for the best run so far.
+REWARD_SHAPING_ENABLED="${REWARD_SHAPING_ENABLED:-false}"
+SHAPING_ONLY_ENERGY="${SHAPING_ONLY_ENERGY:-false}"
 TERMINAL_WEIGHT="${TERMINAL_WEIGHT:-5.0}"
 
 # ----------------------------
@@ -94,6 +109,10 @@ TERMINAL_WEIGHT="${TERMINAL_WEIGHT:-5.0}"
 # ----------------------------
 ENABLE_NOVELTY_PENALTY="${ENABLE_NOVELTY_PENALTY:-false}"
 NOVELTY_PENALTY_SCALE="${NOVELTY_PENALTY_SCALE:-0.5}"
+ENABLE_FILTERING="${ENABLE_FILTERING:-true}"
+INVALID_PENALTY_SCALE="${INVALID_PENALTY_SCALE:-2.0}"
+# Penalize duplicate SMILES within a rollout batch (anti-collapse; 0 disables).
+DUPLICATE_PENALTY_SCALE="${DUPLICATE_PENALTY_SCALE:-0.0}"
 
 # ----------------------------
 # Scheduler configuration
@@ -140,6 +159,11 @@ else
   WANDB_FLAGS=("wandb.enabled=false")
 fi
 
+declare -a RESUME_FLAGS=()
+if [[ -n "${CHECKPOINT_PATH}" ]]; then
+  RESUME_FLAGS=("resume=true" "checkpoint_path=${CHECKPOINT_PATH}")
+fi
+
 # Launch training (Hydra)
 if [[ "${USE_TORCHRUN}" == "1" ]]; then
   LAUNCHER=(torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}")
@@ -151,6 +175,7 @@ fi
   --config-name "${CONFIG_NAME}" \
   "${WANDB_FLAGS[@]}" \
   save_path="${SAVE_PATH}" \
+  "${RESUME_FLAGS[@]}" \
   model.config="${MODEL_CONFIG}" \
   model.model_path="${MODEL_WEIGHTS}" \
   dataloader.smiles_path="${SMILES_PATH}" \
@@ -168,9 +193,15 @@ fi
   reward.mlff_model="${MLFF_MODEL}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \
   reward.force_aggregation="${FORCE_AGGREGATION}" \
+  reward.force_clip_threshold="${FORCE_CLIP_THRESHOLD}" \
   reward.stability_weight="${STABILITY_WEIGHT}" \
+  reward.energy_only_if_stable="${ENERGY_ONLY_IF_STABLE}" \
+  reward.energy_adv_weight="${ENERGY_ADV_WEIGHT}" \
+  filters.enable_filtering="${ENABLE_FILTERING}" \
   filters.enable_penalty="${ENABLE_NOVELTY_PENALTY}" \
   filters.penalty_scale="${NOVELTY_PENALTY_SCALE}" \
+  filters.invalid_penalty_scale="${INVALID_PENALTY_SCALE}" \
+  filters.duplicate_penalty_scale="${DUPLICATE_PENALTY_SCALE}" \
   train.scheduler.name="${SCHEDULER_NAME}" \
   train.scheduler.warmup_steps="${SCHEDULER_WARMUP_STEPS}" \
   train.scheduler.total_steps="${SCHEDULER_TOTAL_STEPS}" \

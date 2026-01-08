@@ -1,0 +1,54 @@
+defaults:
+  - ddpo_config
+  - _self_
+
+# QM9 post-training config tuned for RDKit validity × uniqueness.
+#
+# Key idea (vs sample_group_size=1, each_prompt_sample=24):
+# - Use multiple prompts per batch and fewer samples per prompt to reduce within-group
+#   correlation while keeping GRPO-style group normalization effective.
+
+dataloader:
+  # 4 prompts × 6 samples each = 24 rollouts per iteration
+  sample_group_size: 4
+  each_prompt_sample: 6
+  micro_batch_size: 24
+  epoches: 200
+
+filters:
+  enable_filtering: true
+  enable_penalty: false
+  penalty_scale: 0.0
+  invalid_penalty_scale: 2.0
+
+model:
+  # Used only for shared-prefix sampling in the rollout worker (training speed).
+  share_initial_noise: true
+
+train:
+  learning_rate: 4.0e-6
+  clip_range: 2.0e-3
+  kl_penalty_weight: 0.08
+  train_micro_batch_size: 8
+  max_time_hours: 6
+  early_stop_metric: validity_x_uniqueness
+  early_stop_mode: max
+  early_stop_patience_minutes: 20
+  early_stop_min_delta: 0.001
+
+reward:
+  mlff_model: uma-s-1p1
+  force_clip_threshold: 2.0
+  use_energy: true
+  energy_only_if_stable: true
+  stability_weight: 2.0
+  energy_adv_weight: 0.05
+  energy_transform_clip: 5.0
+  shaping:
+    enabled: false
+    scheduler:
+      skip_prefix: 700
+
+best_checkpoint_metric: validity_x_uniqueness
+best_checkpoint_mode: max
+

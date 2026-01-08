@@ -1,0 +1,16 @@
+{
+  "description": "Energy+force (older weights; interrupted)",
+  "start_time": "2026-01-08 12:18:09",
+  "duration_hours": 0.040390015277777774,
+  "status": "early_stop",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_energy_20260108_121806.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_energy_20260108_121806",
+  "best_epoch": 15,
+  "reward": -3.407701253890991,
+  "atom_stability": 0.8037022948265076,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 0.9921875,
+  "rdkit_uniqueness": 0.6062992125984252,
+  "validity_x_uniqueness": 0.6015625
+}
+

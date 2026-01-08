@@ -122,9 +122,37 @@ def make_absolute(path_value: Optional[str], base_dir: Path) -> Optional[Path]:
     if not path_value:
         return None
     path = Path(path_value)
-    if not path.is_absolute():
-        path = (base_dir / path).resolve()
-    return path
+    if path.is_absolute():
+        return path
+    # Prefer paths relative to the current working directory (friendlier when passing
+    # `pretrained/...` or `outputs/...`), and fall back to interpreting them relative
+    # to the run directory for backwards compatibility.
+    cwd_candidate = (Path.cwd() / path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (base_dir / path).resolve()
+
+
+def make_output_path(path_value: Optional[str], run_dir: Path) -> Optional[Path]:
+    """Resolve output paths without relying on existence checks.
+
+    For outputs we often want to create new files, so the existence-based fallback in
+    `make_absolute()` can accidentally nest paths under `run_dir` when callers pass a
+    repo-relative path like `outputs/verl/.../eval.pt`.
+
+    Rule:
+    - Absolute paths are kept as-is.
+    - Bare filenames (no parent dirs) are interpreted as relative to `run_dir` (convenient).
+    - Paths with parent dirs are interpreted as relative to CWD.
+    """
+    if not path_value:
+        return None
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    if path.parent != Path("."):
+        return (Path.cwd() / path).resolve()
+    return (run_dir / path).resolve()
 
 
 def load_edm_config(args_pickle: Path) -> Any:
@@ -191,8 +219,25 @@ def load_model_weights(model: EDMModel, checkpoint_path: Path, device: torch.dev
         state = checkpoint["model_state_dict"]
     else:
         state = checkpoint
+    if not isinstance(state, dict):
+        raise ValueError(f"Unsupported checkpoint format at {checkpoint_path} (expected a state_dict dict).")
+
     state = sanitize_state_dict(state)
-    missing, unexpected = model.load_state_dict(state, strict=False)
+
+    # Pretrained EDM checkpoints are stored as the underlying flow state_dict
+    # (keys like 'dynamics.*'), whereas VERL/DDPO checkpoints save the full
+    # EDMModel state_dict (keys like 'model.dynamics.*'). Detect and load both.
+    keys = list(state.keys())
+    is_flow_state_dict = not any(k.startswith("model.") for k in keys) and any(
+        k.startswith("dynamics.") or k.startswith("gamma.") or k.startswith("buffer") for k in keys
+    )
+    if is_flow_state_dict:
+        flow = getattr(model, "model", None)
+        if flow is None:
+            raise ValueError("EDMModel is missing the underlying `model` (flow) attribute.")
+        missing, unexpected = flow.load_state_dict(state, strict=False)
+    else:
+        missing, unexpected = model.load_state_dict(state, strict=False)
     if missing:
         print(f"[WARN] Missing keys while loading checkpoint: {missing}")
     if unexpected:
@@ -293,7 +338,7 @@ def main() -> None:
 
     checkpoint_path = infer_checkpoint_path(run_dir, args.checkpoint)
     output_path = (
-        make_absolute(args.output, run_dir)
+        make_output_path(args.output, run_dir)
         if args.output
         else run_dir / "eval_rollouts.pt"
     )

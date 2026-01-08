@@ -11,7 +11,7 @@ import yaml
 import numpy as np
 from typing import Dict
 from verl_diffusion.trainer.base import BaseTrainer
-from verl_diffusion.protocol import DataProto
+from verl_diffusion.protocol import DataProto, TensorDict
 
 
 class DDPOTrainer(BaseTrainer):
@@ -83,16 +83,6 @@ class DDPOTrainer(BaseTrainer):
         shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
         self.terminal_adv_weight = float(shaping_cfg.get("terminal_weight", 1.5))
 
-        # Initialize learning rate scheduler if configured
-        scheduler_cfg = (self.config.get("train") or {}).get("scheduler")
-        if isinstance(scheduler_cfg, dict) and scheduler_cfg.get("name"):
-            steps_per_epoch = getattr(self.dataloader, "num_batches", None)
-            total_training_steps = scheduler_cfg.get("total_steps")
-            if total_training_steps is None and isinstance(steps_per_epoch, int) and steps_per_epoch > 0:
-                total_training_steps = steps_per_epoch * self.epoches
-            if total_training_steps is not None:
-                self.actor.setup_scheduler(int(total_training_steps))
-
         # Initialize Ray for parallel processing (optional).
         ray_cfg = self.config.get("ray", {})
         ray_enabled = False
@@ -154,9 +144,27 @@ class DDPOTrainer(BaseTrainer):
             except queue.Empty:
                 # Queue is empty, continue waiting
                 continue
-            except Exception as e:
+            except Exception as exc:
                 if self.is_main_process:
-                    print(f"Error in reward calculation: {e}")
+                    print(f"Error in reward calculation: {exc}")
+                try:
+                    batch_size = int(sample.batch.batch_size[0]) if sample.batch is not None else 0
+                except Exception:
+                    batch_size = 0
+                if batch_size > 0:
+                    fallback = {
+                        "rewards": torch.full((batch_size,), -5.0),
+                        "stability": torch.zeros(batch_size),
+                    }
+                    if sample.batch is not None and "timesteps" in sample.batch.keys():
+                        timesteps = sample.batch["timesteps"]
+                        if isinstance(timesteps, torch.Tensor) and timesteps.ndim == 2:
+                            rewards_ts = torch.zeros((batch_size, timesteps.size(1)))
+                            rewards_ts[:, -1] = fallback["rewards"]
+                            fallback["rewards_ts"] = rewards_ts
+                    self.reward_results.append(
+                        DataProto(batch=TensorDict(fallback, batch_size=[batch_size]), meta_info=sample.meta_info.copy())
+                    )
                 self.samples_queue.task_done()
 
     def _sync_metrics(self, metrics):
@@ -256,8 +264,18 @@ class DDPOTrainer(BaseTrainer):
             if reward_thread.is_alive():
                 reward_thread.join(timeout=5)
             
-            return []
+            return None
     def compute_advantage(self, samples):
+        """Compute GRPO-style advantages.
+
+        - Samples are grouped by `group_index` (same prompt, multiple rollouts).
+        - If reward shaping is enabled, PPO should consume per-timestep rewards (`rewards_ts`) and we
+          normalize/clip advantages per timestep.
+        - When both `force_rewards_ts` and `energy_rewards_ts` exist, we normalize them *separately*
+          within each group and then mix the normalized advantages via `force_adv_weight` and
+          `energy_adv_weight`. This is the main knob to reduce force dominance without relying on
+          raw reward scaling (which cancels under normalization).
+        """
         group_index = samples.batch["group_index"]
         clip_value = self.config["train"].get(
             "clip_advantage_value",
@@ -310,13 +328,16 @@ class DDPOTrainer(BaseTrainer):
                         # Normalize force rewards
                         grp_force = force_rewards_ts[gmask]  # [B_g, S]
                         mean_force = grp_force.mean(dim=0, keepdim=True)  # [1, S]
-                        std_force = grp_force.std(dim=0, keepdim=True)
+                        # NOTE: use population std to avoid NaNs when a group collapses to size 1
+                        # (e.g., due to filtering/dedup). `torch.std` defaults to unbiased=True,
+                        # which returns NaN for B_g==1.
+                        std_force = grp_force.std(dim=0, keepdim=True, unbiased=False)
                         force_advantages_ts[gmask] = (grp_force - mean_force) / (std_force + 1e-8)
 
                         # Normalize energy rewards
                         grp_energy = energy_rewards_ts[gmask]  # [B_g, S]
                         mean_energy = grp_energy.mean(dim=0, keepdim=True)  # [1, S]
-                        std_energy = grp_energy.std(dim=0, keepdim=True)
+                        std_energy = grp_energy.std(dim=0, keepdim=True, unbiased=False)
                         energy_advantages_ts[gmask] = (grp_energy - mean_energy) / (std_energy + 1e-8)
 
                 # Combine normalized force and energy advantages
@@ -347,7 +368,7 @@ class DDPOTrainer(BaseTrainer):
                     if gmask.any():
                         grp = rewards_ts[gmask]  # [B_g, S]
                         mean = grp.mean(dim=0, keepdim=True)  # [1, S]
-                        std = grp.std(dim=0, keepdim=True)
+                        std = grp.std(dim=0, keepdim=True, unbiased=False)
                         advantages_ts[gmask] = (grp - mean) / (std + 1e-8)
 
             # Apply terminal weighting to per-step advantages before clipping/summing
@@ -385,13 +406,13 @@ class DDPOTrainer(BaseTrainer):
                     # Normalize force rewards
                     group_force = force_rewards[group_mask]
                     force_mean = group_force.mean()
-                    force_std = group_force.std()
+                    force_std = group_force.std(unbiased=False)
                     force_advantages[group_mask] = (group_force - force_mean) / (force_std + 1e-8)
 
                     # Normalize energy rewards
                     group_energy = energy_rewards[group_mask]
                     energy_mean = group_energy.mean()
-                    energy_std = group_energy.std()
+                    energy_std = group_energy.std(unbiased=False)
                     energy_advantages[group_mask] = (group_energy - energy_mean) / (energy_std + 1e-8)
 
             # Combine normalized advantages
@@ -408,7 +429,7 @@ class DDPOTrainer(BaseTrainer):
                 group_mask = group_index == group_id
                 group_rewards = rewards[group_mask]
                 group_mean = group_rewards.mean()
-                group_std = group_rewards.std()
+                group_std = group_rewards.std(unbiased=False)
                 normalized_rewards[group_mask] = (group_rewards - group_mean) / (group_std + 1e-8)
 
         samples.batch["advantages"] = torch.clamp(normalized_rewards, -clip_value, clip_value)
@@ -418,13 +439,26 @@ class DDPOTrainer(BaseTrainer):
         """Save model checkpoint and config"""
         if not self.is_main_process:
             return
+
+        def atomic_torch_save(obj, path: str) -> None:
+            tmp_path = f"{path}.tmp"
+            torch.save(obj, tmp_path)
+            os.replace(tmp_path, path)
+
+        def atomic_write_yaml(obj, path: str) -> None:
+            tmp_path = f"{path}.tmp"
+            if isinstance(obj, dict):
+                with open(tmp_path, "w") as f:
+                    yaml.safe_dump(obj, f)
+                    f.flush()
+                    os.fsync(f.fileno())
+            else:
+                obj.to_yaml(tmp_path)
+            os.replace(tmp_path, path)
+
         # Save config
-        config_path = os.path.join(self.save_path, 'config.yaml')
-        if isinstance(self.config, dict):
-            with open(config_path, 'w') as f:
-                yaml.dump(self.config, f)
-        else:
-            self.config.to_yaml(config_path)
+        config_path = os.path.join(self.save_path, "config.yaml")
+        atomic_write_yaml(self.config, config_path)
         
         # Save checkpoint
         checkpoint = {
@@ -432,14 +466,20 @@ class DDPOTrainer(BaseTrainer):
             'model_state_dict': self.model.state_dict(),
             'actor_state_dict': self.actor.model.state_dict(),
             'optimizer_state_dict': self.actor.optimizer.state_dict(),
-            'metrics': metrics
+            'metrics': metrics,
         }
+        lr_scheduler = getattr(self.actor, "lr_scheduler", None)
+        if lr_scheduler is not None:
+            try:
+                checkpoint["scheduler_state_dict"] = lr_scheduler.state_dict()
+            except Exception:
+                checkpoint["scheduler_state_dict"] = None
         
         # Save latest checkpoint
-        torch.save(checkpoint, os.path.join(self.save_path, 'checkpoint_latest.pth'))
+        atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_latest.pth"))
         
         # Save epoch checkpoint
-        torch.save(checkpoint, os.path.join(self.save_path, f'checkpoint_epoch_{epoch}.pth'))
+        atomic_torch_save(checkpoint, os.path.join(self.save_path, f"checkpoint_epoch_{epoch}.pth"))
         
         # Save best checkpoint if metrics are provided
         if metrics is not None:
@@ -452,8 +492,11 @@ class DDPOTrainer(BaseTrainer):
                 )
                 if is_better:
                     self.best_metric_value = metric_value
-                    torch.save(self.model.state_dict(), os.path.join(self.save_path, 'generative_model_ema.npy'))
-                    torch.save(checkpoint, os.path.join(self.save_path, 'checkpoint_best.pth'))
+                    atomic_torch_save(
+                        self.model.state_dict(),
+                        os.path.join(self.save_path, "generative_model_ema.npy"),
+                    )
+                    atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_best.pth"))
             else:
                 print(f"Warning: Metric '{self.best_checkpoint_metric}' not found in metrics. "
                       "Skipping best-checkpoint update.")
@@ -467,6 +510,7 @@ class DDPOTrainer(BaseTrainer):
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.actor.model.load_state_dict(checkpoint['actor_state_dict'])
         self.actor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self._apply_train_hparams_to_optimizer()
         
         if 'metrics' in checkpoint:
             metric_value = checkpoint['metrics'].get(self.best_checkpoint_metric)
@@ -474,8 +518,52 @@ class DDPOTrainer(BaseTrainer):
                 self.best_metric_value = metric_value
             else:
                 self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
-        
-        return checkpoint.get('epoch', 0)
+
+        return checkpoint
+
+    def _apply_train_hparams_to_optimizer(self) -> None:
+        """Ensure optimizer hyperparameters reflect the current config.
+
+        When resuming, PyTorch restores optimizer param group settings (including LR) from the
+        checkpoint. That is desired for an exact resume, but it also means CLI/config overrides
+        (e.g. lowering LR for a fine-tune) would silently have no effect. To make hyperparameter
+        sweeps sane, we re-apply the current `train.*` optimizer knobs after loading a checkpoint.
+        """
+        train_cfg = self.config.get("train") if isinstance(self.config, dict) else {}
+        if not isinstance(train_cfg, dict):
+            return
+
+        optimizer = getattr(self.actor, "optimizer", None)
+        if optimizer is None:
+            return
+
+        def _maybe_float(value, default=None):
+            if value is None:
+                return default
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        lr = _maybe_float(train_cfg.get("learning_rate"))
+        beta1 = _maybe_float(train_cfg.get("adam_beta1"))
+        beta2 = _maybe_float(train_cfg.get("adam_beta2"))
+        weight_decay = _maybe_float(train_cfg.get("adam_weight_decay"))
+        eps = _maybe_float(train_cfg.get("adam_epsilon"))
+
+        for group in optimizer.param_groups:
+            if lr is not None:
+                group["lr"] = lr
+            if beta1 is not None or beta2 is not None:
+                existing_betas = group.get("betas", (0.9, 0.999))
+                group["betas"] = (
+                    beta1 if beta1 is not None else existing_betas[0],
+                    beta2 if beta2 is not None else existing_betas[1],
+                )
+            if weight_decay is not None:
+                group["weight_decay"] = weight_decay
+            if eps is not None:
+                group["eps"] = eps
 
     def fit(self):
         """
@@ -484,153 +572,373 @@ class DDPOTrainer(BaseTrainer):
         Overrides BaseTrainer.fit() method
         """
         try:
-            all_results = []
             start_epoch = 0
             global_batch_idx = 0
+            loaded_checkpoint = None
+            start_time = time.monotonic()
+            train_cfg = self.config.get("train") if isinstance(self.config, dict) else {}
+            if not isinstance(train_cfg, dict):
+                train_cfg = {}
+
+            max_time_hours = train_cfg.get("max_time_hours")
+            max_time_seconds = None
+            if max_time_hours is not None:
+                try:
+                    max_time_seconds = float(max_time_hours) * 3600.0
+                except (TypeError, ValueError):
+                    max_time_seconds = None
+
+            early_stop_metric = train_cfg.get("early_stop_metric")
+            early_stop_mode = str(train_cfg.get("early_stop_mode", "max")).lower()
+            if early_stop_mode not in {"max", "min"}:
+                early_stop_mode = "max"
+            early_stop_patience_minutes = train_cfg.get("early_stop_patience_minutes")
+            early_stop_patience_seconds = None
+            if early_stop_patience_minutes is not None:
+                try:
+                    early_stop_patience_seconds = float(early_stop_patience_minutes) * 60.0
+                except (TypeError, ValueError):
+                    early_stop_patience_seconds = None
+            try:
+                early_stop_min_delta = float(train_cfg.get("early_stop_min_delta", 0.0))
+            except (TypeError, ValueError):
+                early_stop_min_delta = 0.0
+
+            best_early_stop_value = None
+            last_improvement_time = start_time
             # Load checkpoint if resuming
             if self.config.get('resume', False) and self.config.get('checkpoint_path'):
-                start_epoch = self.load_checkpoint(self.config['checkpoint_path'])
+                loaded_checkpoint = self.load_checkpoint(self.config['checkpoint_path'])
+                last_epoch = loaded_checkpoint.get('epoch', 0)
+                start_epoch = int(last_epoch) + 1
                 if self.is_main_process:
                     print(f"Resuming training from epoch {start_epoch}")
+
+            # Initialize learning rate scheduler if configured.
+            # IMPORTANT: do this after loading a checkpoint so we don't reset LR when resuming.
+            scheduler_cfg = (self.config.get("train") or {}).get("scheduler")
+            if isinstance(scheduler_cfg, dict) and scheduler_cfg.get("name"):
+                total_training_steps = scheduler_cfg.get("total_steps")
+                if total_training_steps is None:
+                    total_training_steps = self.epoches
+                if total_training_steps is not None:
+                    scheduler_state = None
+                    if loaded_checkpoint is not None:
+                        scheduler_state = loaded_checkpoint.get("scheduler_state_dict")
+                    if loaded_checkpoint is None or scheduler_state is not None:
+                        self.actor.setup_scheduler(int(total_training_steps))
+                        if scheduler_state is not None and getattr(self.actor, "lr_scheduler", None) is not None:
+                            try:
+                                self.actor.lr_scheduler.load_state_dict(scheduler_state)
+                            except Exception as exc:
+                                if self.is_main_process:
+                                    print(f"Warning: failed to restore LR scheduler state: {exc}")
+                    elif self.is_main_process:
+                        print(
+                            "Warning: resume checkpoint has no scheduler_state_dict; "
+                            "skipping LR scheduler to avoid LR resets."
+                        )
+            global_batch_idx = start_epoch
+            prompt_iter = iter(self.dataloader)
+            if start_epoch > 0:
+                for _ in range(start_epoch):
+                    try:
+                        next(prompt_iter)
+                    except StopIteration:
+                        break
+
+            metrics = None
+            last_epoch = None
+            save_interval = int(self.config.get("save_interval", 10))
+            if save_interval <= 0:
+                save_interval = 10
+
             for epoch in range(start_epoch, self.epoches):
-                # Process each batch from the dataloader and update model after each batch
-                for batch_idx, prompts in enumerate(self.dataloader):
-                    # Process the batch
-                    samples = self.process_batch(batch_idx, prompts)
-                    samples, filter_ratio, novelty_penalty_ratio = self.filters.filter(samples)
-                    samples = self.compute_advantage(samples)
-                    metrics = self.actor.update_policy(samples, epoch_callback=None)
-                    metrics["epoch"] = epoch + 1
-                    # `reward` is the mean of the final scalar signal used for policy updates,
-                    # i.e. the force and energy components after weighting plus any shaping bonus.
-                    # `force_reward_mean` logs the unweighted force term, while
-                    # `weighted_force_reward_mean` reflects that same term after its configured weight.
-                    metrics["reward"] = samples.batch["rewards"].mean().item()
-                    metrics["filter_ratio"] = filter_ratio
-                    metrics["novelty_penalty_ratio"] = novelty_penalty_ratio
-                    metrics["molecule_stability"] = samples.batch['stability'].mean().item()
-                    
-                    # Collect force and energy reward statistics if available
-                    if "force_rewards" in samples.batch:
-                        metrics["force_reward_mean"] = samples.batch["force_rewards"].mean().item()
-                        metrics["force_reward_std"] = samples.batch["force_rewards"].std().item()
-                        metrics["force_reward_min"] = samples.batch["force_rewards"].min().item()
-                        metrics["force_reward_max"] = samples.batch["force_rewards"].max().item()
-                    
-                    if "energy_rewards" in samples.batch:
-                        metrics["energy_reward_mean"] = samples.batch["energy_rewards"].mean().item()
-                        metrics["energy_reward_std"] = samples.batch["energy_rewards"].std().item()
-                        metrics["energy_reward_min"] = samples.batch["energy_rewards"].min().item()
-                        metrics["energy_reward_max"] = samples.batch["energy_rewards"].max().item()
-                    
-                    if "weighted_force_rewards" in samples.batch:
-                        metrics["weighted_force_reward_mean"] = samples.batch["weighted_force_rewards"].mean().item()
-                    
-                    if "weighted_energy_rewards" in samples.batch:
-                        metrics["weighted_energy_reward_mean"] = samples.batch["weighted_energy_rewards"].mean().item()
-                    
-                    # Collect advantage statistics (GRPO normalized rewards)
-                    if "force_advantages" in samples.batch:
-                        metrics["force_advantage_mean"] = samples.batch["force_advantages"].mean().item()
-                        metrics["force_advantage_std"] = samples.batch["force_advantages"].std().item()
-                    
-                    if "energy_advantages" in samples.batch:
-                        metrics["energy_advantage_mean"] = samples.batch["energy_advantages"].mean().item()
-                        metrics["energy_advantage_std"] = samples.batch["energy_advantages"].std().item()
-                    
-                    if "advantages" in samples.batch:
-                        metrics["advantage_mean"] = samples.batch["advantages"].mean().item()
-                        metrics["advantage_std"] = samples.batch["advantages"].std().item()
+                try:
+                    prompts = next(prompt_iter)
+                except StopIteration:
+                    break
 
-                    metrics = self._sync_metrics(metrics)
+                last_epoch = epoch
 
-                    # Save checkpoint periodically
-                    if (batch_idx + 1) % self.config.get('save_interval', 10) == 0:
-                        self.save_checkpoint(batch_idx, metrics)
-                    global_batch_idx += 1
-                    # Log metrics to wandb if enabled
-                    if self.wandb_enabled:
-                        # Combine all metrics into a single log call
-                        log_dict = {
-                            "train/reward": metrics["reward"],
-                            "train/filter_ratio": metrics["filter_ratio"],
-                            "train/novelty_penalty_ratio": metrics["novelty_penalty_ratio"],
-                            "train/molecule_stability": metrics["molecule_stability"],
-                            "train/epoch": metrics["epoch"],
-                            "train/step": global_batch_idx
-                        }
-                        if "ForceAlignPenalty" in metrics:
-                            log_dict["train/force_alignment_penalty"] = metrics["ForceAlignPenalty"]
-                        if "ForceAlignCosine" in metrics:
-                            log_dict["train/force_alignment_cosine"] = metrics["ForceAlignCosine"]
-                        if "lr" in metrics:
-                            log_dict["train/lr"] = metrics["lr"]
-                        if "PolicyEpochs" in metrics:
-                            log_dict["train/policy_epochs"] = metrics["PolicyEpochs"]
-
-                        # Add force reward statistics
-                        if "force_reward_mean" in metrics:
-                            log_dict["train/force_reward_mean"] = metrics["force_reward_mean"]
-                            log_dict["train/force_reward_std"] = metrics["force_reward_std"]
-                            log_dict["train/force_reward_min"] = metrics["force_reward_min"]
-                            log_dict["train/force_reward_max"] = metrics["force_reward_max"]
-                        
-                        # Add energy reward statistics
-                        if "energy_reward_mean" in metrics:
-                            log_dict["train/energy_reward_mean"] = metrics["energy_reward_mean"]
-                            log_dict["train/energy_reward_std"] = metrics["energy_reward_std"]
-                            log_dict["train/energy_reward_min"] = metrics["energy_reward_min"]
-                            log_dict["train/energy_reward_max"] = metrics["energy_reward_max"]
-                        
-                        # Add weighted reward statistics
-                        if "weighted_force_reward_mean" in metrics:
-                            log_dict["train/weighted_force_reward_mean"] = metrics["weighted_force_reward_mean"]
-                        
-                        if "weighted_energy_reward_mean" in metrics:
-                            log_dict["train/weighted_energy_reward_mean"] = metrics["weighted_energy_reward_mean"]
-                        
-                        # Add advantage statistics (GRPO normalized rewards)
-                        if "force_advantage_mean" in metrics:
-                            log_dict["train/force_advantage_mean"] = metrics["force_advantage_mean"]
-                            log_dict["train/force_advantage_std"] = metrics["force_advantage_std"]
-                        
-                        if "energy_advantage_mean" in metrics:
-                            log_dict["train/energy_advantage_mean"] = metrics["energy_advantage_mean"]
-                            log_dict["train/energy_advantage_std"] = metrics["energy_advantage_std"]
-                        
-                        if "advantage_mean" in metrics:
-                            log_dict["train/advantage_mean"] = metrics["advantage_mean"]
-                            log_dict["train/advantage_std"] = metrics["advantage_std"]
-                        
-                        # Add any additional metrics from actor update
-                        for k, v in metrics.items():
-                            if k not in ["reward", "filter_ratio", "novelty_penalty_ratio", "molecule_stability",
-                                        "force_reward_mean", "force_reward_std", "force_reward_min", "force_reward_max",
-                                        "energy_reward_mean", "energy_reward_std", "energy_reward_min", "energy_reward_max",
-                                        "weighted_force_reward_mean", "weighted_energy_reward_mean",
-                                        "force_advantage_mean", "force_advantage_std",
-                                        "energy_advantage_mean", "energy_advantage_std",
-                                        "advantage_mean", "advantage_std"]:
-                                log_dict[f"train/{k}"] = v
-                        wandb.log(log_dict, step=global_batch_idx)
-                    
+                samples = self.process_batch(epoch, prompts)
+                if not isinstance(samples, DataProto) or len(samples) == 0:
                     if self.is_main_process:
-                        print(metrics)
-                
-                # Save checkpoint at the end of each epoch
-                self.save_checkpoint(epoch, metrics)
+                        print(f"Skipping epoch {epoch} because batch processing failed or returned empty samples.")
+                    continue
+                rdkit_validity = None
+                rdkit_uniqueness = None
+                if self.filters is not None:
+                    filter_out = self.filters.filter(samples)
+                    if isinstance(filter_out, (list, tuple)) and len(filter_out) == 5:
+                        samples, filter_ratio, novelty_penalty_ratio, rdkit_validity, rdkit_uniqueness = filter_out
+                    elif isinstance(filter_out, (list, tuple)) and len(filter_out) == 4:
+                        samples, filter_ratio, novelty_penalty_ratio, rdkit_validity = filter_out
+                    else:
+                        samples, filter_ratio, novelty_penalty_ratio = filter_out
+                else:
+                    filter_ratio, novelty_penalty_ratio = 1.0, 1.0
+                if len(samples) == 0:
+                    if self.is_main_process:
+                        print(f"Skipping epoch {epoch} because filtering removed all samples.")
+                    continue
+                samples = self.compute_advantage(samples)
+                metrics = self.actor.update_policy(samples, epoch_callback=None)
+                metrics["epoch"] = epoch + 1
+                # `reward` is the mean of the final scalar signal used for policy updates,
+                # i.e. the force and energy components after weighting plus any shaping bonus.
+                # `force_reward_mean` logs the unweighted force term, while
+                # `weighted_force_reward_mean` reflects that same term after its configured weight.
+                metrics["reward"] = samples.batch["rewards"].mean().item()
+                metrics["filter_ratio"] = filter_ratio
+                metrics["novelty_penalty_ratio"] = novelty_penalty_ratio
+                metrics["molecule_stability"] = samples.batch['stability'].mean().item()
+                if "atom_stability" in samples.batch:
+                    metrics["atom_stability"] = samples.batch["atom_stability"].mean().item()
+                if "valence_underbond" in samples.batch:
+                    metrics["valence_underbond"] = samples.batch["valence_underbond"].mean().item()
+                if "valence_overbond" in samples.batch:
+                    metrics["valence_overbond"] = samples.batch["valence_overbond"].mean().item()
+                if "valence_underbond_soft" in samples.batch:
+                    metrics["valence_underbond_soft"] = samples.batch["valence_underbond_soft"].mean().item()
+                if "valence_overbond_soft" in samples.batch:
+                    metrics["valence_overbond_soft"] = samples.batch["valence_overbond_soft"].mean().item()
+                if rdkit_validity is not None:
+                    metrics["rdkit_validity"] = float(rdkit_validity)
+                if rdkit_uniqueness is not None:
+                    metrics["rdkit_uniqueness"] = float(rdkit_uniqueness)
+                if "rdkit_valid_mask" in samples.batch and "stability" in samples.batch:
+                    rdkit_valid_mask = samples.batch["rdkit_valid_mask"].to(samples.batch["stability"].device)
+                    valid_denom = rdkit_valid_mask.sum().item()
+                    if valid_denom > 0:
+                        stable_valid = (samples.batch["stability"] * rdkit_valid_mask).sum().item() / valid_denom
+                        metrics["stability_given_rdkit_valid"] = stable_valid
+                if rdkit_validity is not None and rdkit_uniqueness is not None:
+                    metrics["validity_x_uniqueness"] = float(rdkit_validity) * float(rdkit_uniqueness)
+                    metrics["validity_x_uniqueness_x_stability"] = (
+                        metrics["validity_x_uniqueness"] * metrics["molecule_stability"]
+                    )
+
+                # Collect force and energy reward statistics if available
+                if "force_rewards" in samples.batch:
+                    metrics["force_reward_mean"] = samples.batch["force_rewards"].mean().item()
+                    metrics["force_reward_std"] = samples.batch["force_rewards"].std().item()
+                    metrics["force_reward_min"] = samples.batch["force_rewards"].min().item()
+                    metrics["force_reward_max"] = samples.batch["force_rewards"].max().item()
+
+                if "energy_rewards" in samples.batch:
+                    metrics["energy_reward_mean"] = samples.batch["energy_rewards"].mean().item()
+                    metrics["energy_reward_std"] = samples.batch["energy_rewards"].std().item()
+                    metrics["energy_reward_min"] = samples.batch["energy_rewards"].min().item()
+                    metrics["energy_reward_max"] = samples.batch["energy_rewards"].max().item()
+
+                if "weighted_force_rewards" in samples.batch:
+                    metrics["weighted_force_reward_mean"] = samples.batch["weighted_force_rewards"].mean().item()
+
+                if "weighted_energy_rewards" in samples.batch:
+                    metrics["weighted_energy_reward_mean"] = samples.batch["weighted_energy_rewards"].mean().item()
+
+                # Collect advantage statistics (GRPO normalized rewards)
+                if "force_advantages" in samples.batch:
+                    metrics["force_advantage_mean"] = samples.batch["force_advantages"].mean().item()
+                    metrics["force_advantage_std"] = samples.batch["force_advantages"].std().item()
+
+                if "energy_advantages" in samples.batch:
+                    metrics["energy_advantage_mean"] = samples.batch["energy_advantages"].mean().item()
+                    metrics["energy_advantage_std"] = samples.batch["energy_advantages"].std().item()
+
+                if "advantages" in samples.batch:
+                    metrics["advantage_mean"] = samples.batch["advantages"].mean().item()
+                    metrics["advantage_std"] = samples.batch["advantages"].std().item()
+
+                metrics = self._sync_metrics(metrics)
+
+                # Save checkpoints.
+                #
+                # - Always persist a best checkpoint immediately when the tracked metric improves.
+                #   This avoids missing short-lived spikes in noisy RL metrics (e.g., validity×uniqueness).
+                # - Also persist periodic "latest" checkpoints for recovery and monitoring.
+                metric_value = metrics.get(self.best_checkpoint_metric) if isinstance(metrics, dict) else None
+                saved_this_epoch = False
+                if metric_value is not None:
+                    try:
+                        metric_value_f = float(metric_value)
+                    except (TypeError, ValueError):
+                        metric_value_f = None
+                    if metric_value_f is not None:
+                        is_better = (
+                            metric_value_f > self.best_metric_value
+                            if self.best_checkpoint_mode == "max"
+                            else metric_value_f < self.best_metric_value
+                        )
+                        if is_better:
+                            self.save_checkpoint(epoch, metrics)
+                            saved_this_epoch = True
+                if not saved_this_epoch and (epoch + 1) % save_interval == 0:
+                    self.save_checkpoint(epoch, metrics)
+
+                global_batch_idx += 1
+                # Log metrics to wandb if enabled
+                if self.wandb_enabled:
+                    # Combine all metrics into a single log call
+                    log_dict = {
+                        "train/reward": metrics["reward"],
+                        "train/filter_ratio": metrics["filter_ratio"],
+                        "train/novelty_penalty_ratio": metrics["novelty_penalty_ratio"],
+                        "train/molecule_stability": metrics["molecule_stability"],
+                        "train/epoch": metrics["epoch"],
+                        "train/step": global_batch_idx,
+                    }
+                    if "atom_stability" in metrics:
+                        log_dict["train/atom_stability"] = metrics["atom_stability"]
+                    if "valence_underbond" in metrics:
+                        log_dict["train/valence_underbond"] = metrics["valence_underbond"]
+                    if "valence_overbond" in metrics:
+                        log_dict["train/valence_overbond"] = metrics["valence_overbond"]
+                    if "valence_underbond_soft" in metrics:
+                        log_dict["train/valence_underbond_soft"] = metrics["valence_underbond_soft"]
+                    if "valence_overbond_soft" in metrics:
+                        log_dict["train/valence_overbond_soft"] = metrics["valence_overbond_soft"]
+                    if "rdkit_validity" in metrics:
+                        log_dict["train/rdkit_validity"] = metrics["rdkit_validity"]
+                    if "rdkit_uniqueness" in metrics:
+                        log_dict["train/rdkit_uniqueness"] = metrics["rdkit_uniqueness"]
+                    if "stability_given_rdkit_valid" in metrics:
+                        log_dict["train/stability_given_rdkit_valid"] = metrics["stability_given_rdkit_valid"]
+                    if "validity_x_uniqueness" in metrics:
+                        log_dict["train/validity_x_uniqueness"] = metrics["validity_x_uniqueness"]
+                    if "validity_x_uniqueness_x_stability" in metrics:
+                        log_dict["train/validity_x_uniqueness_x_stability"] = metrics[
+                            "validity_x_uniqueness_x_stability"
+                        ]
+                    if "ForceAlignPenalty" in metrics:
+                        log_dict["train/force_alignment_penalty"] = metrics["ForceAlignPenalty"]
+                    if "ForceAlignCosine" in metrics:
+                        log_dict["train/force_alignment_cosine"] = metrics["ForceAlignCosine"]
+                    if "lr" in metrics:
+                        log_dict["train/lr"] = metrics["lr"]
+                    if "PolicyEpochs" in metrics:
+                        log_dict["train/policy_epochs"] = metrics["PolicyEpochs"]
+
+                    # Add force reward statistics
+                    if "force_reward_mean" in metrics:
+                        log_dict["train/force_reward_mean"] = metrics["force_reward_mean"]
+                        log_dict["train/force_reward_std"] = metrics["force_reward_std"]
+                        log_dict["train/force_reward_min"] = metrics["force_reward_min"]
+                        log_dict["train/force_reward_max"] = metrics["force_reward_max"]
+
+                    # Add energy reward statistics
+                    if "energy_reward_mean" in metrics:
+                        log_dict["train/energy_reward_mean"] = metrics["energy_reward_mean"]
+                        log_dict["train/energy_reward_std"] = metrics["energy_reward_std"]
+                        log_dict["train/energy_reward_min"] = metrics["energy_reward_min"]
+                        log_dict["train/energy_reward_max"] = metrics["energy_reward_max"]
+
+                    # Add weighted reward statistics
+                    if "weighted_force_reward_mean" in metrics:
+                        log_dict["train/weighted_force_reward_mean"] = metrics["weighted_force_reward_mean"]
+
+                    if "weighted_energy_reward_mean" in metrics:
+                        log_dict["train/weighted_energy_reward_mean"] = metrics["weighted_energy_reward_mean"]
+
+                    # Add advantage statistics (GRPO normalized rewards)
+                    if "force_advantage_mean" in metrics:
+                        log_dict["train/force_advantage_mean"] = metrics["force_advantage_mean"]
+                        log_dict["train/force_advantage_std"] = metrics["force_advantage_std"]
+
+                    if "energy_advantage_mean" in metrics:
+                        log_dict["train/energy_advantage_mean"] = metrics["energy_advantage_mean"]
+                        log_dict["train/energy_advantage_std"] = metrics["energy_advantage_std"]
+
+                    if "advantage_mean" in metrics:
+                        log_dict["train/advantage_mean"] = metrics["advantage_mean"]
+                        log_dict["train/advantage_std"] = metrics["advantage_std"]
+
+                    # Add any additional metrics from actor update
+                    for k, v in metrics.items():
+                        if k not in [
+                            "reward",
+                            "filter_ratio",
+                            "novelty_penalty_ratio",
+                            "molecule_stability",
+                            "atom_stability",
+                            "valence_underbond",
+                            "valence_overbond",
+                            "valence_underbond_soft",
+                            "valence_overbond_soft",
+                            "rdkit_validity",
+                            "rdkit_uniqueness",
+                            "validity_x_uniqueness",
+                            "validity_x_uniqueness_x_stability",
+                            "force_reward_mean",
+                            "force_reward_std",
+                            "force_reward_min",
+                            "force_reward_max",
+                            "energy_reward_mean",
+                            "energy_reward_std",
+                            "energy_reward_min",
+                            "energy_reward_max",
+                            "weighted_force_reward_mean",
+                            "weighted_energy_reward_mean",
+                            "force_advantage_mean",
+                            "force_advantage_std",
+                            "energy_advantage_mean",
+                            "energy_advantage_std",
+                            "advantage_mean",
+                            "advantage_std",
+                        ]:
+                            log_dict[f"train/{k}"] = v
+                    wandb.log(log_dict, step=global_batch_idx)
+
                 if self.is_main_process:
-                    print(f"Saved checkpoint at epoch {epoch}")
-                
-                # Save final checkpoint
-                self.save_checkpoint(len(self.dataloader), metrics)
+                    print(metrics)
+
+                now = time.monotonic()
+                if max_time_seconds is not None and (now - start_time) >= max_time_seconds:
+                    if self.is_main_process:
+                        elapsed_hours = (now - start_time) / 3600.0
+                        print(f"Reached train.max_time_hours ({elapsed_hours:.2f}h); stopping training.")
+                    break
+
+                if early_stop_metric:
+                    metric_value = metrics.get(early_stop_metric) if isinstance(metrics, dict) else None
+                    if metric_value is not None:
+                        if best_early_stop_value is None:
+                            best_early_stop_value = metric_value
+                            last_improvement_time = now
+                        else:
+                            is_better = (
+                                metric_value > best_early_stop_value + early_stop_min_delta
+                                if early_stop_mode == "max"
+                                else metric_value < best_early_stop_value - early_stop_min_delta
+                            )
+                            if is_better:
+                                best_early_stop_value = metric_value
+                                last_improvement_time = now
+                            elif (
+                                early_stop_patience_seconds is not None
+                                and (now - last_improvement_time) >= early_stop_patience_seconds
+                            ):
+                                if self.is_main_process:
+                                    elapsed_minutes = (now - last_improvement_time) / 60.0
+                                    print(
+                                        f"Early stopping: '{early_stop_metric}' has not improved for "
+                                        f"{elapsed_minutes:.1f} min (best={best_early_stop_value:.4f})."
+                                    )
+                                break
+
+            # Save final checkpoint.
+            if metrics is not None and last_epoch is not None:
+                self.save_checkpoint(last_epoch, metrics)
+                if self.is_main_process:
+                    print(f"Saved checkpoint at epoch {last_epoch}")
             
         except KeyboardInterrupt:
             if self.is_main_process:
                 print("Training interrupted by user")
             # Save checkpoint on interruption
-            if 'metrics' in locals():
-                self.save_checkpoint(batch_idx, metrics)
+            if metrics is not None and last_epoch is not None:
+                self.save_checkpoint(last_epoch, metrics)
 
         self._export_lr_history()
         return self.model

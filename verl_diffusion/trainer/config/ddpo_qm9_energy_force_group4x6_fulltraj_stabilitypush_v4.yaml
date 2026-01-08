@@ -1,0 +1,25 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - _self_
+
+# v4: prioritize eliminating the RDKit-invalid / over-bond tail.
+#
+# Why:
+# - In the best v2 runs, ~4% of samples are RDKit-invalid and also QM9-unstable.
+#   Fixing these alone would lift stability_rate by ~0.04 (e.g., 0.90 -> 0.94) without touching
+#   the harder RDKit-valid-but-unstable under-bond cases.
+#
+# Strategy:
+# - Keep the proven v2 stability shaping (force_only_if_stable + soft valence).
+# - Increase explicit penalties against RDKit-invalid molecules and over-bonded valence.
+
+filters:
+  invalid_penalty_scale: 6.0
+
+reward:
+  # Keep hard force gate; avoid reintroducing the low-force exploit.
+  force_only_if_stable: true
+
+  # Stronger penalties for the RDKit-invalid failure mode (often C=5 / N=4 / O=3).
+  valence_overbond_weight: 6.0
+  valence_overbond_soft_weight: 8.0

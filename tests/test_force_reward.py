@@ -23,6 +23,7 @@ class _StubForceComputer:
 
 def _make_minimal_qm9_like_dataset_info():
     return {
+        "name": "qm9",
         "atom_decoder": ["H", "C", "N", "O", "F"],
         "normalize_factors": [1.0],
     }
@@ -135,6 +136,40 @@ class TestUMAForceReward(unittest.TestCase):
         self.assertTrue(torch.allclose(out.batch["force_rewards"], torch.tensor([expected_reward]), atol=1e-6))
         self.assertTrue(torch.allclose(out.batch["weighted_force_rewards"], torch.tensor([expected_reward]), atol=1e-6))
 
+    def test_force_reward_gated_to_stable(self):
+        dataset_info = _make_minimal_qm9_like_dataset_info()
+        max_n_nodes = 4
+        positions = torch.zeros(1, max_n_nodes, 3)
+        categorical = torch.zeros(1, max_n_nodes, len(dataset_info["atom_decoder"]))
+        categorical[0, 0, 0] = 1.0
+        categorical[0, 1, 1] = 1.0
+        nodesxsample = torch.tensor([2], dtype=torch.long)
+
+        forces = torch.zeros(1, max_n_nodes, 3)
+        forces[0, 0] = torch.tensor([1.0, 0.0, 0.0])
+        forces[0, 1] = torch.tensor([0.0, 2.0, 0.0])
+
+        rewarder = UMAForceReward(
+            dataset_info=dataset_info,
+            device="cpu",
+            mlff_device="cpu",
+            force_computer=_StubForceComputer(forces),
+            use_energy=False,
+            stability_weight=0.0,
+            force_only_if_stable=True,
+            force_aggregation="rms",
+            shaping={"enabled": False, "terminal_weight": 1.0},
+        )
+
+        sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
+        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(0.0,)):
+            out = rewarder.calculate_rewards(sample)
+
+        self.assertTrue(torch.allclose(out.batch["stability"], torch.tensor([0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["rewards"], torch.tensor([0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["force_rewards"], torch.tensor([0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["weighted_force_rewards"], torch.tensor([0.0]), atol=1e-6))
+
     def test_calculate_rewards_terminal_with_energy_and_stability_bonus(self):
         dataset_info = _make_minimal_qm9_like_dataset_info()
         max_n_nodes = 3
@@ -178,6 +213,79 @@ class TestUMAForceReward(unittest.TestCase):
         self.assertTrue(torch.allclose(out.batch["energy_rewards"], torch.tensor([-4.0]), atol=1e-6))
         self.assertTrue(torch.allclose(out.batch["weighted_energy_rewards"], torch.tensor([-8.0]), atol=1e-6))
         self.assertTrue(torch.allclose(out.batch["rewards"], torch.tensor([-9.5]), atol=1e-6))
+
+    def test_valence_underbond_penalty_applied(self):
+        dataset_info = _make_minimal_qm9_like_dataset_info()
+        max_n_nodes = 2
+        # C-H single bond at 1.0 Å -> carbon has bond order 1, missing 3 to reach valence 4.
+        positions = torch.tensor([[[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]]])
+        categorical = torch.zeros(1, max_n_nodes, len(dataset_info["atom_decoder"]))
+        categorical[0, 0, 1] = 1.0  # C
+        categorical[0, 1, 0] = 1.0  # H
+        nodesxsample = torch.tensor([2], dtype=torch.long)
+
+        forces = torch.zeros(1, max_n_nodes, 3)
+        rewarder = UMAForceReward(
+            dataset_info=dataset_info,
+            device="cpu",
+            mlff_device="cpu",
+            force_computer=_StubForceComputer(forces),
+            use_energy=False,
+            stability_weight=0.0,
+            atom_stability_weight=0.0,
+            valence_underbond_weight=0.5,
+            valence_overbond_weight=0.0,
+            force_aggregation="rms",
+            shaping={"enabled": False, "terminal_weight": 1.0},
+        )
+
+        sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
+        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(1.0, 2, 2)):
+            out = rewarder.calculate_rewards(sample)
+
+        self.assertTrue(torch.allclose(out.batch["valence_underbond"], torch.tensor([3.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_overbond"], torch.tensor([0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_underbond_rewards"], torch.tensor([-1.5]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_overbond_rewards"], torch.tensor([0.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["rewards"], torch.tensor([-1.5]), atol=1e-6))
+
+    def test_valence_overbond_penalty_applied(self):
+        dataset_info = _make_minimal_qm9_like_dataset_info()
+        max_n_nodes = 3
+        # Central carbon has a triple bond to carbon (1.2 Å) and a double bond to oxygen (1.2 Å).
+        # Bond order sum for the first carbon: 3 + 2 = 5 -> overbond by 1.
+        # Second carbon has bond order 3 -> underbond by 1.
+        positions = torch.tensor([[[0.0, 0.0, 0.0], [1.2, 0.0, 0.0], [0.0, 1.2, 0.0]]])
+        categorical = torch.zeros(1, max_n_nodes, len(dataset_info["atom_decoder"]))
+        categorical[0, 0, 1] = 1.0  # C
+        categorical[0, 1, 1] = 1.0  # C
+        categorical[0, 2, 3] = 1.0  # O
+        nodesxsample = torch.tensor([3], dtype=torch.long)
+
+        forces = torch.zeros(1, max_n_nodes, 3)
+        rewarder = UMAForceReward(
+            dataset_info=dataset_info,
+            device="cpu",
+            mlff_device="cpu",
+            force_computer=_StubForceComputer(forces),
+            use_energy=False,
+            stability_weight=0.0,
+            atom_stability_weight=0.0,
+            valence_underbond_weight=1.0,
+            valence_overbond_weight=2.0,
+            force_aggregation="rms",
+            shaping={"enabled": False, "terminal_weight": 1.0},
+        )
+
+        sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
+        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(0.0, 0, 3)):
+            out = rewarder.calculate_rewards(sample)
+
+        self.assertTrue(torch.allclose(out.batch["valence_underbond"], torch.tensor([1.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_overbond"], torch.tensor([1.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_underbond_rewards"], torch.tensor([-1.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["valence_overbond_rewards"], torch.tensor([-2.0]), atol=1e-6))
+        self.assertTrue(torch.allclose(out.batch["rewards"], torch.tensor([-3.0]), atol=1e-6))
 
 
 if __name__ == "__main__":

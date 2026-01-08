@@ -1,0 +1,35 @@
+defaults:
+  - ddpo_config
+  - _self_
+
+# Tuned QM9 post-training config:
+# - Force-only reward + explicit stability bonus
+# - Novelty penalty + per-batch de-dup filtering enabled
+# - Smaller rollout/training batches for faster iteration
+
+dataloader:
+  sample_group_size: 1
+  each_prompt_sample: 24
+  micro_batch_size: 24
+  epoches: 200
+
+filters:
+  enable_filtering: true
+  enable_penalty: true
+  penalty_scale: 0.5
+
+train:
+  learning_rate: 4.0e-6
+  clip_range: 2.0e-3
+  kl_penalty_weight: 0.04
+  train_micro_batch_size: 4
+
+reward:
+  mlff_model: uma-s-1p1
+  use_energy: false
+  stability_weight: 2.0
+  shaping:
+    mlff_batch_size: 8
+    terminal_weight: 5
+    scheduler:
+      skip_prefix: 700

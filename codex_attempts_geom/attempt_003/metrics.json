@@ -1,0 +1,16 @@
+{
+  "description": "Force-only (wrapper interrupted; no checkpoints)",
+  "start_time": "2026-01-08 11:38:03",
+  "duration_hours": 0.1283992075,
+  "status": "early_stop",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_20260108_113759.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_20260108_113759_phase1_force",
+  "best_epoch": 1,
+  "reward": -3.149233341217041,
+  "atom_stability": 0.8345489501953125,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 1.0,
+  "rdkit_uniqueness": 0.734375,
+  "validity_x_uniqueness": 0.734375
+}
+

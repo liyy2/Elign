@@ -1,17 +1,14 @@
 import logging
 import os
-import queue
-import threading
-import time
 from typing import Optional, Union
 
-from .base import BaseReward
-os.environ["OMP_NUM_THREADS"] = "18"
 import numpy as np
 import torch
-import ray
 from tqdm import tqdm as tq
 
+from .base import BaseReward
+
+os.environ.setdefault("OMP_NUM_THREADS", "18")
 
 def _is_main_process() -> bool:
     """Return True if current worker is considered global rank zero."""
@@ -24,14 +21,17 @@ def _is_main_process() -> bool:
                 return value == "0"
     return True
 
-try:
-    from xtb.ase.calculator import XTB
-except ModuleNotFoundError:
-    if _is_main_process():
-        print('Not importing xtb.')
-from ase import Atoms
-from verl_diffusion.utils.math import kl_divergence_normal, rmsd
+
+def _tqdm_enabled() -> bool:
+    """Enable tqdm progress bars only when explicitly requested.
+
+    Set `VERL_TQDM=1` to turn them on.
+    """
+    value = os.environ.get("VERL_TQDM", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
 from edm_source.qm9.analyze import check_stability
+from edm_source.qm9 import bond_analyze as qm9_bond_analyze
 
 from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
 from edm_source.mlff_modules.mlff_utils import get_mlff_predictor
@@ -70,186 +70,26 @@ def _resolve_mlff_device(device_like, default_device):
             return "cpu"
     raise ValueError(f"Unsupported MLFF device specification: {device_like}")
 
-
-@ray.remote(num_cpus=8)
-def calcuate_xtb_force(mol, calc, dataset_info, atom_encoder):
-    pos = mol[0].tolist()
-    atom_type = mol[1].tolist()
-    validity_results = check_stability(np.array(pos), atom_type, dataset_info)
-    atom_type = [atom_encoder[atom] for atom in atom_type]
-    atoms = Atoms(symbols=atom_type, positions=pos)
-    atoms.calc = calc
-    try:
-        forces = atoms.get_forces()
-        mean_abs_forces = rmsd(forces)
-    except:
-        mean_abs_forces = 5.0
-    return -1 * mean_abs_forces, float(validity_results[0])
-
-
-
-class ForceReward(BaseReward):
-    def __init__(self, dataset_info:dict, condition:bool=False):
-        super().__init__()
-        self.is_main_process = _is_main_process()
-        self.calc = XTB(method="GFN2-xTB")
-        self.dataset_info = dataset_info
-        self.atom_encoder = self.dataset_info['atom_decoder']
-        self.condition = condition
-        self.input_queue = queue.Queue(maxsize=512)
-        self.output_queue = queue.Queue()
-        self.running = False
-        self.thread = None
-        
-    def start_async(self):
-        """Start asynchronous reward calculation thread"""
-        if self.running:
-            return
-            
-        self.running = True
-        self.thread = threading.Thread(
-            target=self._async_reward_loop,
-            daemon=True
-        )
-        self.thread.start()
-        
-    def stop_async(self):
-        """Stop the asynchronous reward calculation thread"""
-        self.running = False
-        if self.thread is not None:
-            self.thread.join(timeout=10)
-            self.thread = None
-    
-    def _async_reward_loop(self):
-        """Continuously calculate rewards for samples in the input queue"""
-        while self.running:
-            try:
-                # Try to get a sample from the input queue
-                sample = self.input_queue.get(timeout=0.1)
-                
-                # Calculate rewards for this sample
-                result = self.calculate_rewards(sample)
-                
-                # Put the results in the output queue
-                self.output_queue.put((sample, result))
-                
-                # Mark task as done
-                self.input_queue.task_done()
-            except queue.Empty:
-                # No samples available, sleep briefly
-                time.sleep(0.01)
-            except Exception as e:
-                # Log any other exceptions
-                if self.is_main_process:
-                    print(f"Error in async reward calculation: {e}")
-                
-    def submit_batch(self, samples):
-        """
-        Submit a batch of samples for reward calculation
-        
-        Args:
-            samples: List of samples to calculate rewards for
-            
-        Returns:
-            List of reward results
-        """
-        results = []
-        result = self.calculate_rewards(samples)
-        results.append(result)
-        return results
-                
-    def submit_sample(self, sample):
-        """
-        Submit a sample for asynchronous reward calculation
-        
-        Args:
-            sample: The sample to calculate rewards for
-        
-        Returns:
-            bool: True if the sample was submitted, False if the queue is full
-        """
-        try:
-            self.input_queue.put_nowait(sample)
-            return True
-        except queue.Full:
-            return False
-            
-    def get_next_result(self, timeout=None):
-        """
-        Get the next reward calculation result from the output queue
-        
-        Args:
-            timeout: Maximum time to wait for a result
-            
-        Returns:
-            Tuple of (sample, result) or None if timeout occurs
-        """
-        try:
-            return self.output_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
-    
-    def process_data(self, samples:DataProto) -> list:
-        """
-        Process the DataProto object to prepare it for force calculation.
-
-        Args:
-            samples (DataProto): A DataProto object containing the data to process.
-            
-        Returns:
-            list: A list of processed molecule tuples (position, atom_type)
-        """
-        
-        one_hot = samples.batch["categorical"]
-        x = samples.batch['x']
-        nodesxsample = samples.batch["nodesxsample"]
-        node_mask = torch.zeros(x.shape[0], self.dataset_info['max_n_nodes'])
-        
-        for i in range(x.shape[0]):
-            node_mask[i, 0:nodesxsample[i]] = 1
-        n_samples = len(x)
-        processed_list = []
-        
-        for i in range(n_samples):
-            atom_type = one_hot[i].argmax(1).cpu().detach()
-            pos = x[i].cpu().detach()
-            atom_type = atom_type[0:int(nodesxsample[i])]
-            pos = pos[0:int(nodesxsample[i])]
-            if self.condition:
-                processed_list.append((pos, atom_type, samples.batch["context"][i][0].cpu().detach()))
-            else:
-                processed_list.append((pos, atom_type))
-        return processed_list
-        
-    def calculate_rewards(self, data: DataProto) -> DataProto:
-        """
-        Calculate the force reward for a given DataProto object.
-
-        Args:
-            data (DataProto): A DataProto object containing the data to calculate the reward for.
-            
-        Returns:
-            DataProto: A DataProto object containing the original data and rewards
-        """
-        processed_list = self.process_data(data)
-        rewards = []
-        molecule_stable = []
-        futures = [calcuate_xtb_force.remote(mol, self.calc, self.dataset_info, self.atom_encoder) for mol in processed_list]
-        outputs_list = ray.get(futures)
-        
-        for i in outputs_list:
-            rewards.append(i[0])
-            molecule_stable.append(i[1])
-            
-        result = {}
-        result['rewards'] = torch.tensor(rewards)
-        result['stability'] = torch.tensor(molecule_stable)
-        
-        return DataProto(batch=TensorDict(result, batch_size=[len(rewards)]), meta_info=data.meta_info.copy())
-
-
 class UMAForceReward(BaseReward):
-    """Reward module that scores molecules with UMA MLFF forces and supports intermediate reward shaping."""
+    """Reward module for post-training that scores molecules using UMA MLFF forces (+ optional energies).
+
+    The reward has three pieces:
+
+    1) Force term (always): encourages locally relaxed structures.
+       - Compute per-atom forces via UMA and aggregate to a scalar magnitude per molecule
+         (RMS or max). Reward is the negative magnitude.
+
+    2) Energy term (optional): encourages low energy *only* when the structure is physically reasonable.
+       - Energy is transformed as: `(E + offset) / scale` with optional clipping.
+       - Reward is the negative transformed energy (i.e. minimize energy).
+       - Energy can be gated to stable terminal states to avoid out-of-distribution energy exploits.
+
+    3) Stability bonus (optional): adds +w for stable molecules and -w for unstable molecules.
+       - This is molecule-level on purpose: partially-invalid molecules should not get a positive bonus.
+
+    If reward shaping is enabled and latents are provided, we also compute potential-based shaping deltas
+    across a scheduled subset of diffusion steps; PPO then uses the per-timestep reward trace (`rewards_ts`).
+    """
 
     def __init__(
         self,
@@ -264,28 +104,41 @@ class UMAForceReward(BaseReward):
         mlff_device: Optional[Union[str, torch.device]] = None,
         shaping: Optional[dict] = None,
         use_energy: bool = False,
+        energy_only_if_stable: bool = False,
+        force_only_if_stable: bool = False,
         force_weight: float = 1.0,
         energy_weight: float = 1.0,
         stability_weight: float = 0.0,
+        atom_stability_weight: float = 0.0,
+        valence_underbond_weight: float = 0.0,
+        valence_overbond_weight: float = 0.0,
+        valence_underbond_soft_weight: float = 0.0,
+        valence_overbond_soft_weight: float = 0.0,
+        valence_soft_temperature: float = 0.02,
         force_aggregation: str = "rms",
         energy_transform_offset: float = 10000.0,
         energy_transform_scale: float = 1000.0,
+        energy_transform_clip: Optional[float] = None,
+        energy_normalize_by_atoms: bool = False,
     ):
         super().__init__()
         self.is_main_process = _is_main_process()
         self.dataset_info = dataset_info
         self.condition = condition
-        self.input_queue = queue.Queue(maxsize=512)
-        self.output_queue = queue.Queue()
-        self.running = False
-        self.thread = None
 
         if device is None:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            # Prefer an explicit CUDA index so torch.cuda.set_device works reliably.
+            self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         elif isinstance(device, torch.device):
-            self.device = device
+            if device.type == "cuda" and device.index is None:
+                self.device = torch.device("cuda:0")
+            else:
+                self.device = device
         else:
-            self.device = torch.device(device)
+            device_str = str(device)
+            if device_str.lower() == "cuda":
+                device_str = "cuda:0"
+            self.device = torch.device(device_str)
         self.mlff_device = _resolve_mlff_device(mlff_device, "cuda" if self.device.type == "cuda" else "cpu")
         if position_scale is None:
             norm_values = self.dataset_info.get("normalize_factors")
@@ -294,26 +147,50 @@ class UMAForceReward(BaseReward):
             else:
                 position_scale = 1.0
         self.position_scale = position_scale
-        self.force_clip_threshold = force_clip_threshold
+        self.force_clip_threshold = None if force_clip_threshold is None else float(force_clip_threshold)
         
         # Energy reward configuration
         self.use_energy = use_energy
+        self.energy_only_if_stable = bool(energy_only_if_stable)
+        # Optional gate: only grant the *force* objective to stable molecules.
+        # This prevents a common exploit where an unstable structure has very low predicted forces
+        # (e.g., stretched/missing bonds) and therefore receives a high force reward.
+        self.force_only_if_stable = bool(force_only_if_stable)
         self.force_weight = force_weight
         self.energy_weight = energy_weight
         self.stability_weight = stability_weight
+        self.atom_stability_weight = float(atom_stability_weight or 0.0)
+        # Optional: penalize missing valence bonds (under-bonded atoms).
+        # This targets the common \"RDKit-valid but QM9-unstable\" failure mode where
+        # RDKit fills missing bonds with implicit H, but `check_stability` expects explicit valence.
+        self.valence_underbond_weight = float(valence_underbond_weight or 0.0)
+        # Optional: penalize over-bonded atoms (too many inferred bond orders for their valence).
+        # This complements the under-bond penalty: over-bonded atoms often show up as RDKit
+        # sanitization errors (e.g., carbon with valence 5).
+        self.valence_overbond_weight = float(valence_overbond_weight or 0.0)
+        # Optional: smooth (sigmoid) valence penalty that provides a *continuous* signal when
+        # atoms are close to the bond-length thresholds but haven't crossed them yet. This is
+        # especially helpful for the common QM9 failure mode where a single H is slightly too far
+        # away to count as bonded, making the discrete under-bond penalty very sparse.
+        self.valence_underbond_soft_weight = float(valence_underbond_soft_weight or 0.0)
+        self.valence_overbond_soft_weight = float(valence_overbond_soft_weight or 0.0)
+        self.valence_soft_temperature = float(valence_soft_temperature)
+        if self.valence_soft_temperature <= 0.0:
+            raise ValueError("valence_soft_temperature must be > 0")
         force_aggregation = (force_aggregation or "rms").lower()
         if force_aggregation not in {"rms", "max"}:
             raise ValueError(f"Unsupported force aggregation '{force_aggregation}'. Use 'rms' or 'max'.")
         self.force_aggregation = force_aggregation
         self.energy_transform_offset = energy_transform_offset
         self.energy_transform_scale = energy_transform_scale
+        self.energy_transform_clip = None if energy_transform_clip is None else float(energy_transform_clip)
+        self.energy_normalize_by_atoms = bool(energy_normalize_by_atoms)
         
 
         # Reward shaping config
         # Scheduler allows switching between uniform and adaptive sampling of diffusion steps.
         self.shaping_cfg = shaping or {}
         self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
-        self.shaping_method = self.shaping_cfg.get("method", "potential")
         self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Option to shape only with energy while keeping force+energy terminals intact.
@@ -344,7 +221,14 @@ class UMAForceReward(BaseReward):
             include_terminal=include_terminal,
         )
         self.shaping_skip_prefix = self.reward_scheduler.skip_prefix
-        self.terminal_reward_weight = max(0.0, float(self.shaping_cfg.get("terminal_weight", 1.5)))
+
+        # `terminal_weight` exists to re-emphasize the terminal reward relative to shaping deltas.
+        # When shaping is disabled (terminal-only reward), keep this at 1.0 to avoid confusion
+        # and unintended reward rescaling.
+        if self.shaping_enabled:
+            self.terminal_reward_weight = max(0.0, float(self.shaping_cfg.get("terminal_weight", 1.5)))
+        else:
+            self.terminal_reward_weight = 1.0
 
 
         if force_computer is not None:
@@ -366,51 +250,6 @@ class UMAForceReward(BaseReward):
             else:
                 self.force_computer = None
                 logger.warning("UMAForceReward: MLFF predictor not loaded, rewards will default to zero.")
-
-    def start_async(self):
-        if self.running:
-            return
-
-        self.running = True
-        self.thread = threading.Thread(target=self._async_reward_loop, daemon=True)
-        self.thread.start()
-
-    def stop_async(self):
-        self.running = False
-        if self.thread is not None:
-            self.thread.join(timeout=10)
-            self.thread = None
-
-    def _async_reward_loop(self):
-        while self.running:
-            try:
-                sample = self.input_queue.get(timeout=0.1)
-                result = self.calculate_rewards(sample)
-                self.output_queue.put((sample, result))
-                self.input_queue.task_done()
-            except queue.Empty:
-                time.sleep(0.01)
-            except Exception as exc:  # pragma: no cover - safeguard
-                logger.error(f"UMAForceReward async error: {exc}")
-
-    def submit_batch(self, samples):
-        results = []
-        result = self.calculate_rewards(samples)
-        results.append(result)
-        return results
-
-    def submit_sample(self, sample):
-        try:
-            self.input_queue.put_nowait(sample)
-            return True
-        except queue.Full:
-            return False
-
-    def get_next_result(self, timeout=None):
-        try:
-            return self.output_queue.get(timeout=timeout)
-        except queue.Empty:
-            return None
 
     def process_data(self, samples: DataProto) -> dict:
         positions = samples.batch["x"].detach()
@@ -445,6 +284,14 @@ class UMAForceReward(BaseReward):
             forces = forces.unsqueeze(0)
         if node_mask.dim() == 1:
             node_mask = node_mask.unsqueeze(0)
+
+        # Optional force clipping.
+        # This is mainly a "don't over-penalize tail outliers" knob that can help exploration/diversity.
+        if self.force_clip_threshold is not None:
+            magnitudes = torch.norm(forces, dim=-1, keepdim=True)
+            scale = torch.clamp(self.force_clip_threshold / (magnitudes + 1e-12), max=1.0)
+            forces = forces * scale
+
         if node_mask.dim() == 3:
             mask = node_mask[..., 0] > 0.5
         else:
@@ -482,8 +329,12 @@ class UMAForceReward(BaseReward):
         force_rewards = torch.zeros(batch_size, device=self.device)
         energy_rewards = torch.zeros(batch_size, device=self.device)
         stability_flags = torch.zeros(batch_size, device=self.device)
+        atom_stability = torch.zeros(batch_size, device=self.device)
+        valence_underbond = torch.zeros(batch_size, device=self.device)
+        valence_overbond = torch.zeros(batch_size, device=self.device)
+        valence_underbond_soft = torch.zeros(batch_size, device=self.device)
+        valence_overbond_soft = torch.zeros(batch_size, device=self.device)
         result = {}
-        shaped_sum_tensor = None
         rewards_ts = None
         force_rewards_ts = None
         energy_rewards_ts = None
@@ -609,7 +460,15 @@ class UMAForceReward(BaseReward):
 
             if self.use_energy and flat_energy is not None:
                 energies_bt = flat_energy.view(B, selected_count)
+                if self.energy_normalize_by_atoms:
+                    atom_counts = (node_mask_b[..., 0] > 0.5).sum(dim=1).clamp(min=1).to(energies_bt.dtype)
+                    energies_bt = energies_bt / atom_counts.unsqueeze(1)
                 transformed_energies = (energies_bt + self.energy_transform_offset) / self.energy_transform_scale
+                if self.energy_transform_clip is not None:
+                    transformed_energies = transformed_energies.clamp(
+                        min=-self.energy_transform_clip, max=self.energy_transform_clip
+                    )
+                # Energy reward always minimizes energy (negative sign).
                 F_energy.index_copy_(1, schedule_indices, -transformed_energies)
 
             if alignment_active and force_vectors_flat is not None:
@@ -625,24 +484,10 @@ class UMAForceReward(BaseReward):
 
             shaped_force = torch.zeros_like(F_force)
             shaped_energy = torch.zeros_like(F_force)
-            # Historical context of the shaping pipeline:
-            # 1. Prior to commit 6b9e5d7 the code wrote the terminal potential into
-            #    ``shaped_force`` before accumulating the transition deltas. Summing
-            #    the tensor therefore produced ``(F_last - F_first) + F_last`` and the
-            #    terminal reward path added another ``F_last`` on top. The trainer was
-            #    effectively optimizing ``(terminal_weight + 1)·F_last - F_first``
-            #    instead of the intended potential difference.
-            # 2. Commit 6b9e5d7 removed the terminal write so the shaped sum collapsed
-            #    to ``F_last - F_first``. However, it also left the terminal column in
-            #    ``force_rewards_ts`` and ``energy_rewards_ts`` at zero, so
-            #    ``ddpo_trainer.compute_advantage`` no longer observed the terminal
-            #    reward sample whenever shaping was enabled.
-            # 3. The current revision keeps the transition-only shaping tensors for
-            #    summation while restoring the terminal entries in the per-timestep
-            #    traces. This preserves the unbiased ``F_last - F_first`` shaping
-            #    signal and ensures the PPO advantage calculation still consumes the
-            #    terminal metric exactly once.
-            # Vectorized potential-shaping over the scheduled indices, accounting for stride length.
+            # Potential shaping on a scheduled subset of diffusion steps:
+            #   delta(t_k) = gamma^Δt * F(t_{k+1}) - F(t_k)
+            # We store these deltas in the per-timestep traces and separately overwrite the
+            # terminal column with the terminal reward so PPO sees it exactly once.
             selected_count = int(schedule_indices.numel())
             if selected_count > 0:
                 last_idx = schedule_indices[-1]
@@ -668,14 +513,6 @@ class UMAForceReward(BaseReward):
                         )
                         shaped_force.index_copy_(1, idx_current, shaped_vals)
 
-                        # Only accumulate force-based shaping when enabled.
-                        shaped_force_sum = (self.force_weight * shaped_vals).sum(dim=1)
-                        shaped_sum_tensor = (
-                            shaped_force_sum
-                            if shaped_sum_tensor is None
-                            else shaped_sum_tensor + shaped_force_sum
-                        )
-
                     if self.use_energy and F_energy is not None:
                         energy_current = torch.index_select(F_energy, 1, idx_current)
                         energy_next = torch.index_select(F_energy, 1, idx_next)
@@ -683,15 +520,6 @@ class UMAForceReward(BaseReward):
                             gamma_factor.unsqueeze(0) * energy_next - energy_current
                         )
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
-
-                        shaped_energy_sum = (
-                            self.energy_weight * shaped_energy_vals
-                        ).sum(dim=1)
-                        shaped_sum_tensor = (
-                            shaped_energy_sum
-                            if shaped_sum_tensor is None
-                            else shaped_sum_tensor + shaped_energy_sum
-                        )
 
             weighted_shaped_force = self.force_weight * shaped_force
             weighted_shaped_energy = (
@@ -734,20 +562,39 @@ class UMAForceReward(BaseReward):
         else:
             # Final-state path only (single MLFF call)
             if self.force_computer is not None:
-                if self.use_energy:
-                    forces, energies = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-                else:
-                    forces = self.force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-                    energies = torch.zeros(z.shape[0], device=self.device)
+                # Chunk terminal MLFF evaluation to avoid OOM on large GEOM batches.
+                total = int(z.shape[0])
+                chunk = total
+                if self.mlff_batch_size > 0:
+                    chunk = max(1, min(int(self.mlff_batch_size), total))
+
+                forces = torch.zeros((total, z.shape[1], 3), device=self.device, dtype=z.dtype)
+                energies = torch.zeros(total, device=self.device, dtype=z.dtype)
+                for start in range(0, total, chunk):
+                    end = min(total, start + chunk)
+                    z_chunk = z[start:end]
+                    node_chunk = node_mask[start:end]
+                    if self.use_energy:
+                        forces_chunk, energies_chunk = self.force_computer.compute_mlff_forces(
+                            z_chunk, node_chunk, self.dataset_info
+                        )
+                        forces[start:end] = forces_chunk
+                        energies[start:end] = energies_chunk.view(-1)
+                    else:
+                        forces_chunk = self.force_computer.compute_mlff_forces(
+                            z_chunk, node_chunk, self.dataset_info
+                        )
+                        forces[start:end] = forces_chunk
             else:
                 forces = torch.zeros_like(z[:, :, :3], device=self.device)
                 energies = torch.zeros(z.shape[0], device=self.device)
 
+            tqdm_enabled = _tqdm_enabled()
             for batch_idx in tq(
                 range(batch_size),
                 desc="UMAForce terminal reward",
                 leave=False,
-                disable=batch_size <= 1,
+                disable=(batch_size <= 1) or (not self.is_main_process) or (not tqdm_enabled),
                 dynamic_ncols=True,
             ):
                 valid_mask = node_mask[batch_idx, :, 0] > 0
@@ -760,15 +607,24 @@ class UMAForceReward(BaseReward):
                 force_rewards[batch_idx] = -aggregated_force
                 if self.use_energy:
                     energy = energies[batch_idx]
+                    if self.energy_normalize_by_atoms:
+                        num_atoms = valid_mask.sum().clamp(min=1).to(dtype=energy.dtype)
+                        energy = energy / num_atoms
                     transformed_energy = (energy + self.energy_transform_offset) / self.energy_transform_scale
+                    if self.energy_transform_clip is not None:
+                        transformed_energy = transformed_energy.clamp(
+                            min=-self.energy_transform_clip, max=self.energy_transform_clip
+                        )
+                    # Energy reward always minimizes energy (negative sign).
                     energy_rewards[batch_idx] = -transformed_energy
 
         # Compute stability flags once
+        tqdm_enabled = _tqdm_enabled()
         for batch_idx in tq(
             range(batch_size),
             desc="UMAForce stability",
             leave=False,
-            disable=batch_size <= 1,
+            disable=(batch_size <= 1) or (not self.is_main_process) or (not tqdm_enabled),
             dynamic_ncols=True,
         ):
             valid_mask = node_mask[batch_idx, :, 0] > 0
@@ -782,17 +638,245 @@ class UMAForceReward(BaseReward):
                     atom_type_indices.detach().cpu().tolist(),
                     self.dataset_info,
                 )
-                stability_flags[batch_idx] = float(validity_results[0])
+                is_stable = float(validity_results[0])
+                stability_flags[batch_idx] = is_stable
+                if isinstance(validity_results, (list, tuple)) and len(validity_results) >= 3:
+                    stable_atoms = float(validity_results[1])
+                    total_atoms = float(validity_results[2])
+                    if total_atoms > 0:
+                        atom_stability[batch_idx] = stable_atoms / total_atoms
+                    else:
+                        atom_stability[batch_idx] = is_stable
+                else:
+                    atom_stability[batch_idx] = is_stable
             except Exception:
                 stability_flags[batch_idx] = 0.0
+                atom_stability[batch_idx] = 0.0
+
+            # Under-bonded valence penalty (optional).
+            #
+            # Why this exists:
+            # - RDKit validity allows radicals by assigning implicit H when a heavy atom has fewer
+            #   explicit bonds (e.g., C with 3 instead of 4). `check_stability` marks these as
+            #   unstable because it expects explicit valence for all atoms in the sample.
+            # - A per-atom graded penalty on *missing* bond order gives a stronger, more specific
+            #   signal than a binary stable/unstable flag.
+            if self.valence_underbond_weight != 0.0 or self.valence_overbond_weight != 0.0:
+                try:
+                    atom_types_list = atom_type_indices.detach().cpu().tolist()
+                    pos_np = positions_valid.detach().cpu().numpy()
+                    atom_decoder = self.dataset_info["atom_decoder"]
+                    n_atoms = int(pos_np.shape[0])
+                    nr_bonds = np.zeros(n_atoms, dtype="int")
+
+                    for i in range(n_atoms):
+                        for j in range(i + 1, n_atoms):
+                            dist = float(np.linalg.norm(pos_np[i] - pos_np[j]))
+                            atom1 = atom_decoder[atom_types_list[i]]
+                            atom2 = atom_decoder[atom_types_list[j]]
+                            if self.dataset_info["name"].startswith("qm9"):
+                                order = qm9_bond_analyze.get_bond_order(atom1, atom2, dist)
+                            elif self.dataset_info["name"] == "geom":
+                                pair = sorted((atom_types_list[i], atom_types_list[j]))
+                                order = qm9_bond_analyze.geom_predictor(
+                                    (atom_decoder[pair[0]], atom_decoder[pair[1]]), dist
+                                )
+                            else:
+                                order = 0
+                            nr_bonds[i] += order
+                            nr_bonds[j] += order
+
+                    missing_bonds = 0
+                    excess_bonds = 0
+                    for atom_type_i, bonds_i in zip(atom_types_list, nr_bonds):
+                        symbol = atom_decoder[atom_type_i]
+                        allowed = qm9_bond_analyze.allowed_bonds.get(symbol)
+                        if allowed is None:
+                            continue
+                        if isinstance(allowed, int):
+                            missing_bonds += max(int(allowed) - int(bonds_i), 0)
+                            excess_bonds += max(int(bonds_i) - int(allowed), 0)
+                        else:
+                            if bonds_i in allowed:
+                                continue
+                            allowed_sorted = sorted(int(x) for x in allowed)
+                            lower = max((v for v in allowed_sorted if v < bonds_i), default=None)
+                            upper = min((v for v in allowed_sorted if v > bonds_i), default=None)
+                            if lower is None and upper is not None:
+                                missing_bonds += max(int(upper) - int(bonds_i), 0)
+                            elif upper is None and lower is not None:
+                                excess_bonds += max(int(bonds_i) - int(lower), 0)
+                            elif lower is not None and upper is not None:
+                                # Between two allowed values (e.g., N can be 3 or 5).
+                                #
+                                # We want a graded penalty that nudges toward the *easier* fix.
+                                # In particular, N=4 is common in unstable samples and can be
+                                # fixed either by removing one bond (->3) or adding one (->5).
+                                # Choose the direction that yields the smaller *weighted* penalty
+                                # given the configured under/over weights.
+                                missing_delta = int(upper) - int(bonds_i)  # >0
+                                excess_delta = int(bonds_i) - int(lower)  # >0
+                                under_w = abs(float(self.valence_underbond_weight))
+                                over_w = abs(float(self.valence_overbond_weight))
+                                if under_w == 0.0:
+                                    excess_bonds += excess_delta
+                                elif over_w == 0.0:
+                                    missing_bonds += missing_delta
+                                elif (excess_delta * over_w) <= (missing_delta * under_w):
+                                    excess_bonds += excess_delta
+                                else:
+                                    missing_bonds += missing_delta
+
+                    valence_underbond[batch_idx] = float(missing_bonds)
+                    valence_overbond[batch_idx] = float(excess_bonds)
+                except Exception:
+                    valence_underbond[batch_idx] = 0.0
+                    valence_overbond[batch_idx] = 0.0
+
+            # Smooth valence penalty (optional).
+            # Uses the same bond-length tables as `get_bond_order`, but replaces the hard thresholds
+            # with sigmoids. This provides a graded signal even when a pair is just outside the
+            # cutoff that would otherwise flip bond order from 1->0.
+            if (
+                (self.valence_underbond_soft_weight != 0.0 or self.valence_overbond_soft_weight != 0.0)
+                and str(self.dataset_info.get("name", "")).startswith("qm9")
+            ):
+                try:
+                    atom_types_list = atom_type_indices.detach().cpu().tolist()
+                    pos_np = positions_valid.detach().cpu().numpy()
+                    atom_decoder = self.dataset_info["atom_decoder"]
+                    n_atoms = int(pos_np.shape[0])
+                    soft_valence = np.zeros(n_atoms, dtype=np.float32)
+
+                    temp = float(self.valence_soft_temperature)
+                    bonds1 = qm9_bond_analyze.bonds1
+                    bonds2 = qm9_bond_analyze.bonds2
+                    bonds3 = qm9_bond_analyze.bonds3
+                    thr1_margin = float(qm9_bond_analyze.margin1) / 100.0
+                    thr2_margin = float(qm9_bond_analyze.margin2) / 100.0
+                    thr3_margin = float(qm9_bond_analyze.margin3) / 100.0
+
+                    def sigmoid(x: float) -> float:
+                        x = float(np.clip(x, -60.0, 60.0))
+                        return 1.0 / (1.0 + float(np.exp(-x)))
+
+                    for i in range(n_atoms):
+                        atom1 = atom_decoder[atom_types_list[i]]
+                        for j in range(i + 1, n_atoms):
+                            atom2 = atom_decoder[atom_types_list[j]]
+                            if atom1 not in bonds1 or atom2 not in bonds1[atom1]:
+                                continue
+                            dist = float(np.linalg.norm(pos_np[i] - pos_np[j]))
+                            thr1 = float(bonds1[atom1][atom2]) / 100.0 + thr1_margin
+                            order = sigmoid((thr1 - dist) / temp)
+                            if atom1 in bonds2 and atom2 in bonds2[atom1]:
+                                thr2 = float(bonds2[atom1][atom2]) / 100.0 + thr2_margin
+                                order += sigmoid((thr2 - dist) / temp)
+                                if atom1 in bonds3 and atom2 in bonds3[atom1]:
+                                    thr3 = float(bonds3[atom1][atom2]) / 100.0 + thr3_margin
+                                    order += sigmoid((thr3 - dist) / temp)
+                            soft_valence[i] += order
+                            soft_valence[j] += order
+
+                    soft_missing = 0.0
+                    soft_excess = 0.0
+                    for atom_type_i, bonds_i in zip(atom_types_list, soft_valence):
+                        symbol = atom_decoder[atom_type_i]
+                        allowed = qm9_bond_analyze.allowed_bonds.get(symbol)
+                        if allowed is None:
+                            continue
+                        if isinstance(allowed, int):
+                            soft_missing += max(float(allowed) - float(bonds_i), 0.0)
+                            soft_excess += max(float(bonds_i) - float(allowed), 0.0)
+                        else:
+                            allowed_sorted = sorted(float(x) for x in allowed)
+                            best_cost = None
+                            best_missing = 0.0
+                            best_excess = 0.0
+                            for candidate in allowed_sorted:
+                                missing = max(candidate - float(bonds_i), 0.0)
+                                excess = max(float(bonds_i) - candidate, 0.0)
+                                cost = missing + excess
+                                if best_cost is None or cost < best_cost:
+                                    best_cost = cost
+                                    best_missing = missing
+                                    best_excess = excess
+                            soft_missing += best_missing
+                            soft_excess += best_excess
+
+                    valence_underbond_soft[batch_idx] = float(soft_missing)
+                    valence_overbond_soft[batch_idx] = float(soft_excess)
+                except Exception:
+                    valence_underbond_soft[batch_idx] = 0.0
+                    valence_overbond_soft[batch_idx] = 0.0
 
         if self.stability_weight != 0.0:
+            # Molecule-level: +w if stable, -w if unstable.
             stability_signal = stability_flags.mul(2.0).sub(1.0).clamp(min=-1.0, max=1.0)
-            stability_bonus = self.stability_weight * stability_signal
+            stability_bonus_molecule = self.stability_weight * stability_signal
         else:
-            stability_bonus = torch.zeros_like(stability_flags)
+            stability_bonus_molecule = torch.zeros_like(stability_flags)
+
+        # Atom-level shaping: penalize the fraction of atoms that violate the simple valence rules.
+        #
+        # Why this exists:
+        # - `check_stability` is binary at the molecule level. Under GRPO/DDPO group normalization,
+        #   if a whole prompt group is unstable, the binary term becomes a constant and provides
+        #   no within-group learning signal.
+        # - `atom_stability` provides a *graded* notion of how close a sample is to full stability,
+        #   which helps the policy make incremental progress (e.g., fixing a few stray H atoms).
+        if self.atom_stability_weight != 0.0:
+            atom_instability = (1.0 - atom_stability).clamp(min=0.0, max=1.0)
+            atom_stability_bonus = -self.atom_stability_weight * atom_instability
+        else:
+            atom_stability_bonus = torch.zeros_like(atom_stability)
+
+        if self.valence_underbond_weight != 0.0:
+            valence_underbond_bonus = -self.valence_underbond_weight * valence_underbond
+        else:
+            valence_underbond_bonus = torch.zeros_like(valence_underbond)
+
+        if self.valence_overbond_weight != 0.0:
+            valence_overbond_bonus = -self.valence_overbond_weight * valence_overbond
+        else:
+            valence_overbond_bonus = torch.zeros_like(valence_overbond)
+
+        if self.valence_underbond_soft_weight != 0.0:
+            valence_underbond_soft_bonus = -self.valence_underbond_soft_weight * valence_underbond_soft
+        else:
+            valence_underbond_soft_bonus = torch.zeros_like(valence_underbond_soft)
+
+        if self.valence_overbond_soft_weight != 0.0:
+            valence_overbond_soft_bonus = -self.valence_overbond_soft_weight * valence_overbond_soft
+        else:
+            valence_overbond_soft_bonus = torch.zeros_like(valence_overbond_soft)
+
+        stability_bonus = (
+            stability_bonus_molecule
+            + atom_stability_bonus
+            + valence_underbond_bonus
+            + valence_overbond_bonus
+            + valence_underbond_soft_bonus
+            + valence_overbond_soft_bonus
+        )
+
+        if self.force_only_if_stable:
+            gate = stability_flags.to(dtype=force_rewards.dtype)
+            force_rewards = force_rewards * gate
+            if force_rewards_ts is not None:
+                force_rewards_ts = force_rewards_ts * gate.unsqueeze(1)
+            if rewards_ts is not None and not self.use_energy:
+                rewards_ts = rewards_ts * gate.unsqueeze(1)
 
         force_rewards = force_rewards + stability_bonus
+
+        if self.use_energy:
+            energy_gate = torch.ones_like(energy_rewards, device=self.device, dtype=energy_rewards.dtype)
+            if self.energy_only_if_stable:
+                energy_gate = energy_gate * stability_flags.to(dtype=energy_rewards.dtype)
+            energy_rewards = energy_rewards * energy_gate
+            if energy_rewards_ts is not None:
+                energy_rewards_ts = energy_rewards_ts * energy_gate.unsqueeze(1)
 
         weighted_force_rewards = self.force_weight * self.terminal_reward_weight * force_rewards
         weighted_energy_rewards = self.energy_weight * self.terminal_reward_weight * energy_rewards
@@ -805,8 +889,10 @@ class UMAForceReward(BaseReward):
             if force_rewards_ts is not None:
                 force_rewards_ts[:, last_idx] = force_rewards_ts[:, last_idx] + self.terminal_reward_weight * stability_bonus
 
-        if shaped_sum_tensor is not None:
-            total_rewards = rewards + shaped_sum_tensor
+        if rewards_ts is not None:
+            if self.use_energy and energy_rewards_ts is not None and force_rewards_ts is not None:
+                rewards_ts = self.force_weight * force_rewards_ts + self.energy_weight * energy_rewards_ts
+            total_rewards = rewards_ts.sum(dim=1)
         else:
             total_rewards = rewards
 
@@ -827,6 +913,17 @@ class UMAForceReward(BaseReward):
         result["weighted_force_rewards"] = weighted_force_rewards.detach().cpu()
         result["weighted_energy_rewards"] = weighted_energy_rewards.detach().cpu()
         result["stability"] = stability_flags.cpu()
+        result["atom_stability"] = atom_stability.detach().cpu()
+        result["stability_bonus_molecule"] = stability_bonus_molecule.detach().cpu()
+        result["stability_bonus_atom"] = atom_stability_bonus.detach().cpu()
+        result["valence_underbond"] = valence_underbond.detach().cpu()
+        result["valence_underbond_rewards"] = valence_underbond_bonus.detach().cpu()
+        result["valence_overbond"] = valence_overbond.detach().cpu()
+        result["valence_overbond_rewards"] = valence_overbond_bonus.detach().cpu()
+        result["valence_underbond_soft"] = valence_underbond_soft.detach().cpu()
+        result["valence_underbond_soft_rewards"] = valence_underbond_soft_bonus.detach().cpu()
+        result["valence_overbond_soft"] = valence_overbond_soft.detach().cpu()
+        result["valence_overbond_soft_rewards"] = valence_overbond_soft_bonus.detach().cpu()
         result["stability_rewards"] = stability_bonus.detach().cpu()
 
         if self.is_main_process:

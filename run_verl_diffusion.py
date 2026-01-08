@@ -8,6 +8,7 @@ import numpy as np
 import ray
 import torch
 import torch.distributed as dist
+from torch.distributions.categorical import Categorical
 from torch.nn.parallel import DistributedDataParallel as DDP
 from hydra import main as hydra_main
 from hydra.utils import to_absolute_path
@@ -93,7 +94,8 @@ def main(cfg: DictConfig) -> None:
     cfg.model.config = _make_absolute(cfg.model.get("config"))
     cfg.model.model_path = _make_absolute(cfg.model.get("model_path"))
     cfg.dataloader.smiles_path = _make_absolute(cfg.dataloader.get("smiles_path"))
-    cfg.dataloader.geom_data_file = _make_absolute(cfg.dataloader.get("geom_data_file"))
+    if "geom_data_file" in cfg.dataloader:
+        cfg.dataloader.geom_data_file = _make_absolute(cfg.dataloader.get("geom_data_file"))
     cfg.save_path = _make_absolute(cfg.get("save_path"))
     if "checkpoint_path" in cfg:
         cfg.checkpoint_path = _make_absolute(cfg.get("checkpoint_path"))
@@ -172,6 +174,44 @@ def main(cfg: DictConfig) -> None:
     flow, nodes_dist, prop_dist = get_model(
         edm_config, edm_config.device, dataset_info, dataloaders["train"]
     )
+
+    # Optional: reweight the node-count distribution used for RL rollouts.
+    #
+    # This does *not* change the pretrained EDM prior itself; it only changes how often the PPO
+    # loop samples certain molecule sizes. This is useful when some sizes are systematically
+    # harder for `check_stability` (e.g., small molecules) and need more training coverage.
+    if isinstance(dataloader_cfg, dict) and nodes_dist is not None:
+        focus_min = dataloader_cfg.get("nodes_dist_focus_min")
+        focus_max = dataloader_cfg.get("nodes_dist_focus_max")
+        focus_multiplier = dataloader_cfg.get("nodes_dist_focus_multiplier", 1.0)
+        try:
+            focus_multiplier = float(focus_multiplier) if focus_multiplier is not None else 1.0
+        except (TypeError, ValueError):
+            focus_multiplier = 1.0
+
+        if focus_min is not None and focus_max is not None and focus_multiplier != 1.0:
+            try:
+                focus_min = int(focus_min)
+                focus_max = int(focus_max)
+            except (TypeError, ValueError):
+                focus_min = None
+                focus_max = None
+
+        if focus_min is not None and focus_max is not None and focus_multiplier != 1.0:
+            if hasattr(nodes_dist, "prob") and hasattr(nodes_dist, "n_nodes") and hasattr(nodes_dist, "m"):
+                prob = nodes_dist.prob.detach().clone().to(dtype=torch.float64)
+                n_nodes = nodes_dist.n_nodes.detach().to(dtype=torch.long)
+                mask = (n_nodes >= focus_min) & (n_nodes <= focus_max)
+                if mask.any():
+                    prob[mask] = prob[mask] * focus_multiplier
+                    prob = prob / prob.sum().clamp(min=1e-12)
+                    nodes_dist.prob = prob.to(dtype=torch.float32)
+                    nodes_dist.m = Categorical(nodes_dist.prob)
+                    if is_main_process:
+                        print(
+                            f"Reweighted n_nodes prior for RL rollouts: "
+                            f"[{focus_min}, {focus_max}] x {focus_multiplier}"
+                        )
     flow.to(device)
 
     # Initialize EDM model
@@ -230,12 +270,22 @@ def main(cfg: DictConfig) -> None:
             mlff_device=mlff_device,
             shaping=reward_cfg.get("shaping", {}),
             use_energy=reward_cfg.get("use_energy", False),
+            energy_only_if_stable=reward_cfg.get("energy_only_if_stable", False),
+            force_only_if_stable=reward_cfg.get("force_only_if_stable", False),
             force_weight=reward_cfg.get("force_weight", 1.0),
             energy_weight=reward_cfg.get("energy_weight", 1.0),
             stability_weight=reward_cfg.get("stability_weight", 0.0),
+            atom_stability_weight=reward_cfg.get("atom_stability_weight", 0.0),
+            valence_underbond_weight=reward_cfg.get("valence_underbond_weight", 0.0),
+            valence_overbond_weight=reward_cfg.get("valence_overbond_weight", 0.0),
+            valence_underbond_soft_weight=reward_cfg.get("valence_underbond_soft_weight", 0.0),
+            valence_overbond_soft_weight=reward_cfg.get("valence_overbond_soft_weight", 0.0),
+            valence_soft_temperature=reward_cfg.get("valence_soft_temperature", 0.02),
             force_aggregation=reward_cfg.get("force_aggregation", "rms"),
             energy_transform_offset=reward_cfg.get("energy_transform_offset", 10000.0),
             energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
+            energy_transform_clip=reward_cfg.get("energy_transform_clip", None),
+            energy_normalize_by_atoms=reward_cfg.get("energy_normalize_by_atoms", False),
         )
     else:
         raise ValueError(f"Unsupported reward.type '{reward_type}'. Use 'uma' or 'dummy'.")
@@ -245,6 +295,8 @@ def main(cfg: DictConfig) -> None:
     filter_enable_filtering = filter_cfg.get("enable_filtering", False)
     filter_enable_penalty = filter_cfg.get("enable_penalty", False)
     filter_penalty_scale = filter_cfg.get("penalty_scale", 0.5)
+    filter_invalid_penalty_scale = filter_cfg.get("invalid_penalty_scale", 0.0)
+    filter_duplicate_penalty_scale = filter_cfg.get("duplicate_penalty_scale", 0.0)
     filters = Filter(
         dataset_info,
         config["dataloader"]["smiles_path"],
@@ -252,6 +304,8 @@ def main(cfg: DictConfig) -> None:
         filter_enable_filtering,
         filter_enable_penalty,
         filter_penalty_scale,
+        filter_invalid_penalty_scale,
+        filter_duplicate_penalty_scale,
     )
     actor = EDMActor(model, config)
 

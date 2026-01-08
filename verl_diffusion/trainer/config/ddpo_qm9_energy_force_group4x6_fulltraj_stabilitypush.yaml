@@ -1,0 +1,38 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate_sharp
+  - _self_
+
+# Push QM9 `check_stability` higher while keeping RDKit validity×uniqueness high.
+#
+# Motivation:
+# - The remaining gap is usually caused by a *small* number of atoms sitting just outside the
+#   distance-to-bond thresholds used by `check_stability` (often a single missing bond-order unit).
+# - Molecule-level stability is unforgiving: one bad atom makes the whole molecule unstable.
+#
+# Strategy:
+# - Increase the graded (atom-level) stability shaping so PPO gets signal for "almost stable" cases.
+# - Keep the soft-valence shaping enabled but slightly smoother so near-threshold bonds are nudged
+#   across the cutoff instead of requiring a discrete flip.
+
+filters:
+  # Stronger anti-collapse when we increase stability pressure.
+  duplicate_penalty_scale: 0.4
+
+train:
+  # Slightly longer patience for stability improvements.
+  early_stop_patience_minutes: 45
+  early_stop_min_delta: 0.0005
+
+reward:
+  # Stronger molecule-level push: +w for stable / -w for unstable.
+  stability_weight: 6.0
+  # Stronger graded penalty when only a few atoms violate valence rules.
+  atom_stability_weight: 80.0
+  # Keep discrete valence penalties aligned with `check_stability`.
+  valence_underbond_weight: 4.0
+  valence_overbond_weight: 2.0
+  # Softer (denser) shaping around the bond-length cutoffs.
+  valence_soft_temperature: 0.02
+  valence_underbond_soft_weight: 6.0
+  valence_overbond_soft_weight: 3.0
+

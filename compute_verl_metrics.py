@@ -6,6 +6,7 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+import numpy as np
 import torch
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -13,9 +14,10 @@ from tensordict import TensorDict
 import sys
 sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
 from edm_source.configs.datasets_config import get_dataset_info
+from edm_source.qm9.analyze import check_stability
 from verl_diffusion.protocol import DataProto
 from verl_diffusion.worker.reward.force import UMAForceReward
-from verl_diffusion.utils.rdkit_metrics import compute_rdkit_metrics
+from verl_diffusion.utils.rdkit_metrics import compute_rdkit_metrics, sample_largest_fragment_smiles
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,6 +69,53 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional path to torch.save the per-sample metric tensors.",
     )
+    parser.add_argument(
+        "--skip-mlff-metrics",
+        action="store_true",
+        help=(
+            "Skip UMA force/energy evaluation and compute only RDKit + stability metrics. "
+            "Useful for large sample sets (e.g., 10k molecules). Repair flags still work."
+        ),
+    )
+    parser.add_argument(
+        "--repair-invalid",
+        action="store_true",
+        help=(
+            "If set, run a small UMA-based relaxation loop on *RDKit-invalid* samples only "
+            "before computing metrics. This can recover molecules that are near-valid but "
+            "slightly distorted in geometry. Valid molecules are left untouched."
+        ),
+    )
+    parser.add_argument(
+        "--repair-unstable",
+        action="store_true",
+        help=(
+            "If set, run a small UMA-based relaxation loop on *QM9-unstable* samples only "
+            "(as defined by `edm_source.qm9.analyze.check_stability`) before computing metrics. "
+            "This can recover molecules that are near-stable but slightly distorted in geometry."
+        ),
+    )
+    parser.add_argument(
+        "--repair-add-h",
+        action="store_true",
+        help=(
+            "If set, convert RDKit-implicit hydrogens into explicit H atoms (with coordinates) "
+            "before computing stability. This targets the common gap where RDKit considers a graph "
+            "valid via implicit H, but `check_stability` expects explicit H atoms."
+        ),
+    )
+    parser.add_argument(
+        "--repair-steps",
+        type=int,
+        default=3,
+        help="Number of UMA force update steps to apply during repair (default: 3).",
+    )
+    parser.add_argument(
+        "--repair-alpha",
+        type=float,
+        default=0.01,
+        help="Step size for the UMA force update: pos <- pos + alpha * force (default: 0.01).",
+    )
     return parser.parse_args()
 
 
@@ -74,9 +123,36 @@ def make_absolute(path_value: Optional[str], base_dir: Path) -> Optional[Path]:
     if path_value is None:
         return None
     path = Path(path_value)
-    if not path.is_absolute():
-        path = (base_dir / path).resolve()
-    return path
+    if path.is_absolute():
+        return path
+    # Prefer CWD-relative paths (e.g., `pretrained/...`, `outputs/...`) and fall back
+    # to run-dir-relative resolution for older invocations.
+    cwd_candidate = (Path.cwd() / path).resolve()
+    if cwd_candidate.exists():
+        return cwd_candidate
+    return (base_dir / path).resolve()
+
+
+def make_output_path(path_value: Optional[str], run_dir: Path) -> Optional[Path]:
+    """Resolve output paths without relying on existence checks.
+
+    `make_absolute()` uses `Path.exists()` to decide between CWD-relative and run-dir-relative
+    resolution. For outputs, this can accidentally nest paths under `run_dir` when callers pass
+    repo-relative paths like `outputs/verl/.../metrics.json`.
+
+    Rule:
+    - Absolute paths are kept as-is.
+    - Bare filenames (no parent dirs) are interpreted as relative to `run_dir`.
+    - Paths with parent dirs are interpreted as relative to CWD.
+    """
+    if path_value is None:
+        return None
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    if path.parent != Path("."):
+        return (Path.cwd() / path).resolve()
+    return (run_dir / path).resolve()
 
 
 def load_edm_config(args_pickle: Path) -> Any:
@@ -128,6 +204,399 @@ def load_samples(samples_path: Path) -> Tuple[List[Dict[str, torch.Tensor]], Dic
     if not isinstance(samples, list) or not samples:
         raise ValueError(f"No samples found in {samples_path}")
     return samples, metadata
+
+
+def _collect_invalid_indices(
+    samples: List[Dict[str, Any]],
+    dataset_info: Dict[str, Any],
+) -> Tuple[List[Optional[str]], List[int]]:
+    smiles_list: List[Optional[str]] = []
+    invalid: List[int] = []
+    for idx, sample in enumerate(samples):
+        smiles = sample_largest_fragment_smiles(sample, dataset_info)
+        smiles_list.append(smiles)
+        if smiles is None:
+            invalid.append(idx)
+    return smiles_list, invalid
+
+
+def _repair_invalid_samples(
+    samples: List[Dict[str, Any]],
+    dataset_info: Dict[str, Any],
+    rewarder: UMAForceReward,
+    steps: int,
+    alpha: float,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Try to "repair" RDKit-invalid molecules via a few UMA force steps.
+
+    Motivation: RDKit validity failures are often caused by slightly incorrect bond distances/angles
+    rather than completely nonsensical chemistry. A tiny relaxation step using UMA forces can move
+    atoms into more physically plausible configurations.
+
+    Implementation details:
+    - Only RDKit-invalid samples are updated.
+    - Update rule: `pos <- pos + alpha * force` (force is -∇E, so this is a descent step).
+    - We reuse `rewarder.force_clip_threshold` (if set) to avoid huge updates from outliers.
+    - After each step, we re-check RDKit validity and stop updating molecules that became valid.
+    """
+    steps = int(max(0, steps))
+    alpha = float(alpha)
+    if steps == 0 or alpha == 0.0:
+        return {"enabled": False, "reason": "steps==0 or alpha==0"}
+
+    if rewarder.force_computer is None:
+        return {"enabled": False, "reason": "UMAForceReward.force_computer is None"}
+
+    smiles_list, invalid_indices = _collect_invalid_indices(samples, dataset_info)
+    invalid_before = len(invalid_indices)
+    fixed_per_step: List[int] = []
+
+    if invalid_before == 0:
+        return {
+            "enabled": True,
+            "steps": steps,
+            "alpha": alpha,
+            "invalid_before": 0,
+            "invalid_after": 0,
+            "fixed_total": 0,
+            "fixed_per_step": [],
+        }
+
+    device = rewarder.device
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    for _ in range(steps):
+        if not invalid_indices:
+            break
+
+        for start in range(0, len(invalid_indices), batch_size):
+            chunk_indices = invalid_indices[start : start + batch_size]
+            batch_samples = [samples[i] for i in chunk_indices]
+            data_proto = build_dataproto(batch_samples, dataset_info)
+            processed = rewarder.process_data(data_proto)
+
+            z = processed["z"].to(device)
+            node_mask = processed["node_mask"].to(device)
+            positions = processed["positions"].to(device)
+
+            output = rewarder.force_computer.compute_mlff_forces(z, node_mask, dataset_info)
+            forces = output[0] if isinstance(output, (tuple, list)) else output
+
+            if rewarder.force_clip_threshold is not None:
+                magnitudes = torch.norm(forces, dim=-1, keepdim=True)
+                scale = torch.clamp(rewarder.force_clip_threshold / (magnitudes + 1e-12), max=1.0)
+                forces = forces * scale
+
+            updated = (positions + alpha * forces * node_mask).detach().cpu()
+
+            for local_idx, sample_idx in enumerate(chunk_indices):
+                sample = samples[sample_idx]
+                num_atoms = int(sample.get("num_atoms", sample["atom_types"].shape[0]))
+                sample["positions"] = updated[local_idx, :num_atoms].clone()
+
+        new_invalid: List[int] = []
+        fixed_this_step = 0
+        for sample_idx in invalid_indices:
+            smiles = sample_largest_fragment_smiles(samples[sample_idx], dataset_info)
+            smiles_list[sample_idx] = smiles
+            if smiles is None:
+                new_invalid.append(sample_idx)
+            else:
+                fixed_this_step += 1
+
+        fixed_per_step.append(fixed_this_step)
+        invalid_indices = new_invalid
+
+    fixed_total = sum(fixed_per_step)
+    return {
+        "enabled": True,
+        "steps": steps,
+        "alpha": alpha,
+        "invalid_before": invalid_before,
+        "invalid_after": len(invalid_indices),
+        "fixed_total": fixed_total,
+        "fixed_per_step": fixed_per_step,
+    }
+
+
+def _collect_unstable_indices(
+    samples: List[Dict[str, Any]],
+    dataset_info: Dict[str, Any],
+) -> List[int]:
+    unstable: List[int] = []
+    for idx, sample in enumerate(samples):
+        positions = sample.get("positions")
+        atom_types = sample.get("atom_types")
+        if positions is None or atom_types is None:
+            continue
+        num_atoms = int(sample.get("num_atoms", atom_types.shape[0]))
+        pos_np = positions[:num_atoms].detach().cpu().numpy()
+        atom_list = atom_types[:num_atoms].detach().cpu().tolist()
+        try:
+            is_stable, _, _ = check_stability(pos_np, atom_list, dataset_info)
+        except Exception:
+            is_stable = False
+        if not is_stable:
+            unstable.append(idx)
+    return unstable
+
+
+def _repair_unstable_samples(
+    samples: List[Dict[str, Any]],
+    dataset_info: Dict[str, Any],
+    rewarder: UMAForceReward,
+    steps: int,
+    alpha: float,
+    batch_size: int,
+) -> Dict[str, Any]:
+    """Try to 'repair' QM9-unstable molecules via a few UMA force steps.
+
+    This is analogous to :func:`_repair_invalid_samples`, but uses `check_stability` instead of
+    RDKit sanitization to decide which molecules to update.
+
+    Note: This can only fix instability caused by *geometry* (bond-distance thresholds). If the
+    molecule is a true radical because of missing H/incorrect atom types, relaxation alone will
+    not make it stable under the strict QM9 valence rules.
+    """
+    steps = int(max(0, steps))
+    alpha = float(alpha)
+    if steps == 0 or alpha == 0.0:
+        return {"enabled": False, "reason": "steps==0 or alpha==0"}
+
+    if rewarder.force_computer is None:
+        return {"enabled": False, "reason": "UMAForceReward.force_computer is None"}
+
+    unstable_indices = _collect_unstable_indices(samples, dataset_info)
+    unstable_before = len(unstable_indices)
+    fixed_per_step: List[int] = []
+
+    if unstable_before == 0:
+        return {
+            "enabled": True,
+            "steps": steps,
+            "alpha": alpha,
+            "unstable_before": 0,
+            "unstable_after": 0,
+            "fixed_total": 0,
+            "fixed_per_step": [],
+        }
+
+    device = rewarder.device
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+
+    for _ in range(steps):
+        if not unstable_indices:
+            break
+
+        for start in range(0, len(unstable_indices), batch_size):
+            chunk_indices = unstable_indices[start : start + batch_size]
+            batch_samples = [samples[i] for i in chunk_indices]
+            data_proto = build_dataproto(batch_samples, dataset_info)
+            processed = rewarder.process_data(data_proto)
+
+            z = processed["z"].to(device)
+            node_mask = processed["node_mask"].to(device)
+            positions = processed["positions"].to(device)
+
+            output = rewarder.force_computer.compute_mlff_forces(z, node_mask, dataset_info)
+            forces = output[0] if isinstance(output, (tuple, list)) else output
+
+            if rewarder.force_clip_threshold is not None:
+                magnitudes = torch.norm(forces, dim=-1, keepdim=True)
+                scale = torch.clamp(rewarder.force_clip_threshold / (magnitudes + 1e-12), max=1.0)
+                forces = forces * scale
+
+            updated = (positions + alpha * forces * node_mask).detach().cpu()
+
+            for local_idx, sample_idx in enumerate(chunk_indices):
+                sample = samples[sample_idx]
+                num_atoms = int(sample.get("num_atoms", sample["atom_types"].shape[0]))
+                sample["positions"] = updated[local_idx, :num_atoms].clone()
+
+        new_unstable: List[int] = []
+        fixed_this_step = 0
+        for sample_idx in unstable_indices:
+            sample = samples[sample_idx]
+            num_atoms = int(sample.get("num_atoms", sample["atom_types"].shape[0]))
+            pos_np = sample["positions"][:num_atoms].detach().cpu().numpy()
+            atom_list = sample["atom_types"][:num_atoms].detach().cpu().tolist()
+            try:
+                is_stable, _, _ = check_stability(pos_np, atom_list, dataset_info)
+            except Exception:
+                is_stable = False
+            if is_stable:
+                fixed_this_step += 1
+            else:
+                new_unstable.append(sample_idx)
+
+        fixed_per_step.append(fixed_this_step)
+        unstable_indices = new_unstable
+
+    fixed_total = sum(fixed_per_step)
+    return {
+        "enabled": True,
+        "steps": steps,
+        "alpha": alpha,
+        "unstable_before": unstable_before,
+        "unstable_after": len(unstable_indices),
+        "fixed_total": fixed_total,
+        "fixed_per_step": fixed_per_step,
+    }
+
+
+def _repair_add_explicit_hydrogens(
+    samples: List[Dict[str, Any]],
+    dataset_info: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Add explicit hydrogens (with coordinates) to RDKit-sanitizable samples.
+
+    Why this is useful:
+    - RDKit validity allows *implicit* hydrogens: a carbon with 3 explicit bonds can still be valid,
+      because RDKit assumes 1 implicit H to satisfy valence.
+    - QM9 stability (`check_stability`) is evaluated on the explicit atom list. If those H atoms are
+      missing from the generated graph, the molecule is marked unstable (typically under-bonded C/N).
+
+    Implementation strategy:
+    - Rebuild an RDKit molecule from the generated positions + atom types.
+    - Attach the generated coordinates as a conformer.
+    - Run `Chem.AddHs(..., addCoords=True)` to materialize implicit H with reasonable coordinates.
+    - Write the new (positions, atom_types) back to the stored sample in-place.
+
+    Notes:
+    - Only samples that sanitize successfully are modified. This is intentionally conservative.
+    - We cap the total atom count to `dataset_info['max_n_nodes']` to avoid breaking downstream padding.
+    """
+    max_n_nodes = int(dataset_info.get("max_n_nodes", 0) or 0)
+    atom_decoder = dataset_info.get("atom_decoder", [])
+    sym2idx = {sym: idx for idx, sym in enumerate(atom_decoder)}
+    if "H" not in sym2idx:
+        return {
+            "enabled": False,
+            "reason": "Dataset atom_decoder does not include 'H' (remove_h=True?).",
+        }
+
+    try:
+        from rdkit import Chem
+        from rdkit.Geometry import Point3D
+        from edm_source.qm9.rdkit_functions import build_molecule
+    except Exception as exc:  # pragma: no cover - optional dependency
+        return {"enabled": False, "reason": f"RDKit unavailable: {exc}"}
+
+    num_total = len(samples)
+    num_sanitizable = 0
+    num_updated = 0
+    num_skipped_max_nodes = 0
+    num_skipped_unknown_atom = 0
+    num_sanitize_failed = 0
+    num_failed_other = 0
+    atoms_added_total = 0
+    h_added_total = 0
+    stable_before = 0
+    stable_after = 0
+
+    for sample in samples:
+        positions = sample.get("positions")
+        atom_types = sample.get("atom_types")
+        if positions is None or atom_types is None:
+            continue
+        if not isinstance(positions, torch.Tensor):
+            positions = torch.tensor(positions, dtype=torch.float32)
+        if not isinstance(atom_types, torch.Tensor):
+            atom_types = torch.tensor(atom_types, dtype=torch.long)
+
+        num_atoms = int(sample.get("num_atoms", min(positions.shape[0], atom_types.shape[0])))
+        num_atoms = max(0, min(num_atoms, int(min(positions.shape[0], atom_types.shape[0]))))
+        if num_atoms == 0:
+            continue
+
+        pos_np = positions[:num_atoms].detach().cpu().numpy()
+        at_list = atom_types[:num_atoms].detach().cpu().tolist()
+        num_h_before = sum(
+            1
+            for idx in at_list
+            if 0 <= int(idx) < len(atom_decoder) and atom_decoder[int(idx)] == "H"
+        )
+        try:
+            is_stable_before, _, _ = check_stability(pos_np, at_list, dataset_info)
+        except Exception:
+            is_stable_before = False
+
+        try:
+            mol = build_molecule(positions[:num_atoms], atom_types[:num_atoms], dataset_info)
+            mol = mol.GetMol() if hasattr(mol, "GetMol") else mol
+
+            conf = Chem.Conformer(num_atoms)
+            pos_list = positions[:num_atoms].detach().cpu().tolist()
+            for i, (x, y, z) in enumerate(pos_list):
+                conf.SetAtomPosition(i, Point3D(float(x), float(y), float(z)))
+            mol.AddConformer(conf, assignId=True)
+
+            # Only process molecules that RDKit considers chemically sane.
+            Chem.SanitizeMol(mol)
+            num_sanitizable += 1
+        except Exception:
+            num_sanitize_failed += 1
+            continue
+
+        try:
+            mol_h = Chem.AddHs(mol, addCoords=True)
+            conf_h = mol_h.GetConformer()
+
+            new_positions: List[List[float]] = []
+            new_atom_types: List[int] = []
+            num_h_after = 0
+            for i, atom in enumerate(mol_h.GetAtoms()):
+                symbol = atom.GetSymbol()
+                if symbol not in sym2idx:
+                    raise KeyError(symbol)
+                p = conf_h.GetAtomPosition(i)
+                new_positions.append([float(p.x), float(p.y), float(p.z)])
+                new_atom_types.append(int(sym2idx[symbol]))
+                if symbol == "H":
+                    num_h_after += 1
+
+            if max_n_nodes and len(new_atom_types) > max_n_nodes:
+                num_skipped_max_nodes += 1
+                continue
+
+            num_h_added = max(int(num_h_after) - int(num_h_before), 0)
+
+            try:
+                is_stable_after, _, _ = check_stability(np.array(new_positions), new_atom_types, dataset_info)
+            except Exception:
+                is_stable_after = False
+
+            sample["positions"] = torch.tensor(new_positions, dtype=torch.float32)
+            sample["atom_types"] = torch.tensor(new_atom_types, dtype=torch.long)
+            sample["num_atoms"] = int(len(new_atom_types))
+
+            num_updated += 1
+            atoms_added_total += int(len(new_atom_types) - num_atoms)
+            h_added_total += int(num_h_added)
+            stable_before += int(bool(is_stable_before))
+            stable_after += int(bool(is_stable_after))
+        except KeyError:
+            num_skipped_unknown_atom += 1
+        except Exception:
+            num_failed_other += 1
+
+    return {
+        "enabled": True,
+        "num_total": num_total,
+        "num_sanitizable": num_sanitizable,
+        "num_updated": num_updated,
+        "num_sanitize_failed": num_sanitize_failed,
+        "num_failed_other": num_failed_other,
+        "num_skipped_max_nodes": num_skipped_max_nodes,
+        "num_skipped_unknown_atom": num_skipped_unknown_atom,
+        "atoms_added_total": atoms_added_total,
+        "h_added_total": h_added_total,
+        "stable_before_updated": stable_before,
+        "stable_after_updated": stable_after,
+    }
 
 
 def build_dataproto(
@@ -239,12 +708,22 @@ def init_rewarder(
         mlff_device=device,
         shaping=shaping_override,
         use_energy=bool(reward_cfg.get("use_energy", False)),
+        energy_only_if_stable=bool(reward_cfg.get("energy_only_if_stable", False)),
+        force_only_if_stable=bool(reward_cfg.get("force_only_if_stable", False)),
         force_weight=float(reward_cfg.get("force_weight", 1.0)),
         energy_weight=float(reward_cfg.get("energy_weight", 1.0)),
         stability_weight=float(reward_cfg.get("stability_weight", 0.0)),
+        atom_stability_weight=float(reward_cfg.get("atom_stability_weight", 0.0)),
+        valence_underbond_weight=float(reward_cfg.get("valence_underbond_weight", 0.0)),
+        valence_overbond_weight=float(reward_cfg.get("valence_overbond_weight", 0.0)),
+        valence_underbond_soft_weight=float(reward_cfg.get("valence_underbond_soft_weight", 0.0)),
+        valence_overbond_soft_weight=float(reward_cfg.get("valence_overbond_soft_weight", 0.0)),
+        valence_soft_temperature=float(reward_cfg.get("valence_soft_temperature", 0.02)),
         force_aggregation=reward_cfg.get("force_aggregation", "rms"),
         energy_transform_offset=float(reward_cfg.get("energy_transform_offset", 10000.0)),
         energy_transform_scale=float(reward_cfg.get("energy_transform_scale", 1000.0)),
+        energy_transform_clip=reward_cfg.get("energy_transform_clip"),
+        energy_normalize_by_atoms=bool(reward_cfg.get("energy_normalize_by_atoms", False)),
     )
     return rewarder
 
@@ -285,6 +764,67 @@ def summarize_metrics(metric_store: Dict[str, List[torch.Tensor]]) -> Tuple[Dict
     return aggregate, flattened
 
 
+def summarize_stability(samples: List[Dict[str, Any]], dataset_info: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, torch.Tensor]]:
+    """Compute stability metrics without running UMA.
+
+    This matches the stability calculation inside UMAForceReward (uses `check_stability`).
+    """
+    stability_flags: List[float] = []
+    atom_stability_vals: List[float] = []
+    nodes_counts: List[int] = []
+
+    for sample in samples:
+        positions = sample.get("positions")
+        atom_types = sample.get("atom_types")
+        if positions is None or atom_types is None:
+            continue
+        if not isinstance(positions, torch.Tensor):
+            positions = torch.tensor(positions, dtype=torch.float32)
+        if not isinstance(atom_types, torch.Tensor):
+            atom_types = torch.tensor(atom_types, dtype=torch.long)
+
+        num_atoms = int(sample.get("num_atoms", min(positions.shape[0], atom_types.shape[0])))
+        num_atoms = max(0, min(num_atoms, int(min(positions.shape[0], atom_types.shape[0]))))
+        if num_atoms == 0:
+            continue
+
+        pos_np = positions[:num_atoms].detach().cpu().numpy()
+        at_list = atom_types[:num_atoms].detach().cpu().tolist()
+        try:
+            is_stable, stable_atoms, total_atoms = check_stability(pos_np, at_list, dataset_info)
+        except Exception:
+            is_stable, stable_atoms, total_atoms = False, 0, num_atoms
+
+        stability_flags.append(float(is_stable))
+        if total_atoms:
+            atom_stability_vals.append(float(stable_atoms) / float(total_atoms))
+        else:
+            atom_stability_vals.append(float(is_stable))
+        nodes_counts.append(num_atoms)
+
+    if stability_flags:
+        stability_tensor = torch.tensor(stability_flags, dtype=torch.float32)
+        atom_stability_tensor = torch.tensor(atom_stability_vals, dtype=torch.float32)
+        nodes_tensor = torch.tensor(nodes_counts, dtype=torch.long)
+    else:
+        stability_tensor = torch.zeros(0, dtype=torch.float32)
+        atom_stability_tensor = torch.zeros(0, dtype=torch.float32)
+        nodes_tensor = torch.zeros(0, dtype=torch.long)
+
+    summary = {
+        "num_samples": int(stability_tensor.numel()),
+        "stability_rate": float(stability_tensor.mean().item()) if stability_tensor.numel() else 0.0,
+        "atom_stability_mean": float(atom_stability_tensor.mean().item()) if atom_stability_tensor.numel() else 0.0,
+        "num_atoms_mean": float(nodes_tensor.float().mean().item()) if nodes_tensor.numel() else 0.0,
+    }
+    flattened = {
+        "stability": stability_tensor,
+        "atom_stability": atom_stability_tensor,
+        "num_atoms": nodes_tensor,
+    }
+    return summary, flattened
+
+
 def main() -> None:
     args = parse_args()
     cwd = Path(os.getcwd())
@@ -313,26 +853,94 @@ def main() -> None:
     dataset_info = get_dataset_info(edm_config.dataset, edm_config.remove_h)
 
     device = select_device(args.device)
-    rewarder = init_rewarder(dataset_info, reward_cfg, device)
+
+    needs_rewarder = (not bool(args.skip_mlff_metrics)) or bool(args.repair_invalid) or bool(args.repair_unstable)
+    rewarder = init_rewarder(dataset_info, reward_cfg, device) if needs_rewarder else None
 
     samples, sample_metadata = load_samples(samples_path)
-    batch_size = max(1, int(args.batch_size))
-    metric_store: Dict[str, List[torch.Tensor]] = {}
+    rdkit_metrics_raw: Optional[Dict[str, Any]] = None
+    repair_summary: Optional[Dict[str, Any]] = None
+    stability_repair_summary: Optional[Dict[str, Any]] = None
+    add_h_summary: Optional[Dict[str, Any]] = None
 
-    num_batches = math.ceil(len(samples) / batch_size)
-    for batch_idx in tqdm(range(num_batches), desc="Computing metrics", unit="batch"):
-        start = batch_idx * batch_size
-        end = min(len(samples), start + batch_size)
-        batch_samples = samples[start:end]
-        data_proto = build_dataproto(batch_samples, dataset_info)
-        result_proto = rewarder.calculate_rewards(data_proto)
-        append_metrics(metric_store, result_proto.batch)
+    if args.repair_invalid or args.repair_unstable or args.repair_add_h:
+        # Always compute "raw" RDKit metrics before we mutate any positions.
+        rdkit_metrics_raw = compute_rdkit_metrics(samples, dataset_info)
 
-    summary, flattened = summarize_metrics(metric_store)
+    if args.repair_invalid:
+        if rewarder is None:
+            raise RuntimeError("--repair-invalid requires UMAForceReward (disable --skip-mlff-metrics).")
+        repair_summary = _repair_invalid_samples(
+            samples=samples,
+            dataset_info=dataset_info,
+            rewarder=rewarder,
+            steps=int(args.repair_steps),
+            alpha=float(args.repair_alpha),
+            batch_size=max(1, int(args.batch_size)),
+        )
+
+    if args.repair_add_h:
+        add_h_summary = _repair_add_explicit_hydrogens(samples=samples, dataset_info=dataset_info)
+
+    if args.repair_unstable:
+        if rewarder is None:
+            raise RuntimeError("--repair-unstable requires UMAForceReward (disable --skip-mlff-metrics).")
+        stability_repair_summary = _repair_unstable_samples(
+            samples=samples,
+            dataset_info=dataset_info,
+            rewarder=rewarder,
+            steps=int(args.repair_steps),
+            alpha=float(args.repair_alpha),
+            batch_size=max(1, int(args.batch_size)),
+        )
+
+    if args.skip_mlff_metrics:
+        summary, flattened = summarize_stability(samples, dataset_info)
+    else:
+        if rewarder is None:
+            raise RuntimeError("Internal error: rewarder is required when --skip-mlff-metrics is false.")
+        batch_size = max(1, int(args.batch_size))
+        metric_store: Dict[str, List[torch.Tensor]] = {}
+
+        num_batches = math.ceil(len(samples) / batch_size)
+        for batch_idx in tqdm(range(num_batches), desc="Computing metrics", unit="batch"):
+            start = batch_idx * batch_size
+            end = min(len(samples), start + batch_size)
+            batch_samples = samples[start:end]
+            data_proto = build_dataproto(batch_samples, dataset_info)
+            result_proto = rewarder.calculate_rewards(data_proto)
+            append_metrics(metric_store, result_proto.batch)
+
+        summary, flattened = summarize_metrics(metric_store)
     rdkit_metrics = sample_metadata.get("rdkit_metrics") if sample_metadata else None
-    if not rdkit_metrics:
+    if args.repair_invalid or args.repair_unstable or args.repair_add_h:
+        # Always recompute after repair, even if eval_verl_rollout.py embedded RDKit metrics.
         rdkit_metrics = compute_rdkit_metrics(samples, dataset_info)
+    else:
+        # Always recompute RDKit metrics if they're missing or incomplete. Older eval payloads may
+        # contain only validity/uniqueness without novelty statistics.
+        if (
+            not rdkit_metrics
+            or not isinstance(rdkit_metrics, dict)
+            or "novelty_frac" not in rdkit_metrics
+            or "num_novel" not in rdkit_metrics
+        ):
+            rdkit_metrics = compute_rdkit_metrics(samples, dataset_info)
     summary["rdkit_metrics"] = rdkit_metrics
+    if isinstance(rdkit_metrics, dict) and "error" not in rdkit_metrics:
+        validity = float(rdkit_metrics.get("validity", 0.0) or 0.0)
+        uniqueness = float(rdkit_metrics.get("uniqueness", 0.0) or 0.0)
+        summary["validity_x_uniqueness"] = validity * uniqueness
+        stability_rate = float(summary.get("stability_rate", summary.get("stability", {}).get("mean", 0.0)) or 0.0)
+        summary["validity_x_uniqueness_x_stability"] = summary["validity_x_uniqueness"] * stability_rate
+    if rdkit_metrics_raw is not None:
+        summary["rdkit_metrics_raw"] = rdkit_metrics_raw
+    if repair_summary is not None:
+        summary["rdkit_repair"] = repair_summary
+    if add_h_summary is not None:
+        summary["add_explicit_h"] = add_h_summary
+    if stability_repair_summary is not None:
+        summary["stability_repair"] = stability_repair_summary
 
     print("UMA evaluation complete")
     print(f"Total samples: {summary.get('num_samples', 0)}")
@@ -365,18 +973,14 @@ def main() -> None:
                 print(f"{'rdkit_uniqueness':>25}: n/a (no valid molecules)")
 
     if args.output:
-        output_path = make_absolute(args.output, run_dir) if not Path(args.output).is_absolute() else Path(args.output)
+        output_path = make_output_path(args.output, run_dir)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with open(output_path, "w") as f:
             json.dump(summary, f, indent=2)
         print(f"Saved aggregate metrics to {output_path}")
 
     if args.save_raw:
-        raw_path = (
-            make_absolute(args.save_raw, run_dir)
-            if not Path(args.save_raw).is_absolute()
-            else Path(args.save_raw)
-        )
+        raw_path = make_output_path(args.save_raw, run_dir)
         raw_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(flattened, raw_path)
         print(f"Saved per-sample metrics to {raw_path}")

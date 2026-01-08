@@ -1,0 +1,16 @@
+{
+  "description": "Energy+force (gentle energy; interrupted)",
+  "start_time": "2026-01-08 12:21:30",
+  "duration_hours": 0.14155500944444444,
+  "status": "early_stop",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_energy2_20260108_122126.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_energy2_20260108_122126",
+  "best_epoch": 20,
+  "reward": -3.7983508110046387,
+  "atom_stability": 0.7260924577713013,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 0.9921875,
+  "rdkit_uniqueness": 0.889763779527559,
+  "validity_x_uniqueness": 0.8828125
+}
+

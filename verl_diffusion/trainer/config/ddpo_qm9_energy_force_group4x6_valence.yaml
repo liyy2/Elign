@@ -1,0 +1,31 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6
+  - _self_
+
+# Stability-focused QM9 post-training (energy + force).
+#
+# Adds an explicit under-bonded valence penalty to target the common gap:
+# RDKit-valid (implicit H allowed) but QM9-unstable (explicit valence required).
+
+train:
+  early_stop_metric: validity_x_uniqueness_x_stability
+  early_stop_mode: max
+  early_stop_patience_minutes: 30
+
+best_checkpoint_metric: validity_x_uniqueness_x_stability
+best_checkpoint_mode: max
+
+reward:
+  # Stronger preference for full valence stability.
+  stability_weight: 4.0
+  # Graded signal when only a few atoms violate stability.
+  atom_stability_weight: 20.0
+  # Penalize each missing bond order (e.g., C with 3 instead of 4 contributes 1).
+  valence_underbond_weight: 1.0
+  # Penalize the worst per-atom force to avoid \"hiding\" a bad atom in RMS.
+  force_aggregation: max
+  # Softer clipping to avoid a single outlier killing exploration.
+  force_clip_threshold: 5.0
+  # Reduce energy influence; keep it as a secondary tie-breaker among stable molecules.
+  energy_adv_weight: 0.02
+

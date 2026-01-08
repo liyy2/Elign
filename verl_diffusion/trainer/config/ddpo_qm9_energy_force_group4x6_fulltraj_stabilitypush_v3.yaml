@@ -1,0 +1,28 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - _self_
+
+# v3: PPO-side tuning on top of v2.
+#
+# Focus:
+# - Let PPO take slightly larger steps (advantage clip + KL weight).
+# - Penalize RDKit-invalid samples harder (these are often QM9-unstable too).
+
+train:
+  # Allow slightly larger advantage separation so rare unstable cases get a stronger update.
+  adv_clip_max: 10.0
+  # Use a single micro-batch for faster PPO updates (fits in 30GB VRAM on QM9).
+  train_micro_batch_size: 24
+  # Relax KL slightly to allow the policy to move away from the pretrained prior for stability fixes.
+  kl_penalty_weight: 0.06
+
+filters:
+  # Push harder on RDKit-invalid (often over-bonded) samples; these are unstable under QM9 too.
+  invalid_penalty_scale: 4.0
+
+reward:
+  force_only_if_stable: true
+
+  # Strengthen over-bond penalties (helps eliminate the invalid/over-bond tail).
+  valence_overbond_weight: 4.0
+  valence_overbond_soft_weight: 6.0

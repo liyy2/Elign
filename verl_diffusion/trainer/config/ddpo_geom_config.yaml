@@ -13,6 +13,7 @@ dataloader:
   sample_group_size: 4
   each_prompt_sample: 128
   micro_batch_size: 256
+  # Number of rollout/update iterations to run.
   epoches: 100
   # Optional: override GEOM conformation file path when conditioning is enabled.
   # geom_data_file: "/path/to/geom_drugs_30.npy"
@@ -72,9 +73,7 @@ reward:
   energy_transform_scale: 1000.0
   shaping:
     enabled: true
-    method: potential
     gamma: 1.0
-    weight: 1.0
     only_energy_reshape: false
     mlff_batch_size: 32
     terminal_weight: 5

@@ -1,0 +1,25 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6
+  - _self_
+
+# QM9 energy+force post-training config that explicitly prioritizes QM9 stability.
+#
+# Key change vs ddpo_qm9_energy_force_group4x6:
+# - Gate the *force* objective to stable molecules (`reward.force_only_if_stable=true`).
+#   This prevents unstable low-force geometries (e.g., stretched/missing bonds) from receiving
+#   a high force reward.
+# - Select checkpoints / early-stop on `validity_x_uniqueness_x_stability` to keep validity×uniqueness
+#   while explicitly driving `molecule_stability` up.
+
+reward:
+  force_only_if_stable: true
+
+train:
+  early_stop_metric: validity_x_uniqueness_x_stability
+  early_stop_mode: max
+  early_stop_patience_minutes: 20
+  early_stop_min_delta: 0.001
+
+best_checkpoint_metric: validity_x_uniqueness_x_stability
+best_checkpoint_mode: max
+

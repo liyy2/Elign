@@ -1,0 +1,29 @@
+defaults:
+  - ddpo_geom_force_vxu_suffix
+  - _self_
+
+# Phase 2: add UMA energies (per-atom normalized) on top of the force objective.
+# Keep energy weight small to avoid destabilizing validity/uniqueness early on.
+
+name: edm-geom-energy-force-vxu-suffix
+
+train:
+  # Slightly smaller LR once energy is enabled.
+  learning_rate: 0.000005
+
+reward:
+  use_energy: true
+  force_weight: 1.0
+  # Start gently; ramp this up in later experiments if V×U remains stable.
+  energy_weight: 0.05
+  # Mixing weight for GRPO advantages (independent from `energy_weight` magnitude).
+  energy_adv_weight: 0.02
+  # Avoid rewarding out-of-distribution energies on unstable structures.
+  energy_only_if_stable: true
+  energy_normalize_by_atoms: true
+  # Conservative per-atom energy transform (avoid saturation/explosions).
+  energy_transform_offset: 0.0
+  energy_transform_scale: 1000.0
+  energy_transform_clip: 10.0
+  shaping:
+    mlff_batch_size: 16

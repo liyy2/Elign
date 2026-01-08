@@ -1,0 +1,12 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_stronger
+  - _self_
+
+# Adds sigmoid-smoothed valence shaping on top of the discrete under/over-bond penalties.
+# This provides a dense learning signal when atoms are close to the bond-length thresholds.
+
+reward:
+  valence_underbond_soft_weight: 2.0
+  valence_overbond_soft_weight: 1.0
+  valence_soft_temperature: 0.03
+

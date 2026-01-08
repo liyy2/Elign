@@ -1,0 +1,32 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate_sharp
+  - _self_
+
+# Follow-up to attempt_082: increase within-prompt group size and make soft-valence shaping less sharp.
+#
+# Hypothesis:
+# - The remaining stability gap is dominated by "RDKit-valid but QM9-unstable" samples with ~1 missing
+#   bond-order unit. Many of these are not *extremely* close to the hard bond-length cutoff, so a
+#   very sharp sigmoid (temperature=0.01) provides little gradient. A smoother temperature should
+#   provide a denser signal to push distances across the bond thresholds.
+# - Using a larger GRPO group (12 samples per prompt) gives more within-group variation, which helps
+#   GRPO/DDPO exploit the stability/valence ranking signal instead of collapsing to near-constant
+#   advantages when groups are homogeneous.
+
+dataloader:
+  # 2 prompts × 12 samples each = 24 rollouts per iteration (same total batch size as 4×6).
+  sample_group_size: 2
+  each_prompt_sample: 12
+  micro_batch_size: 24
+  # Allow up to a 6h wall-clock budget before max_time_hours kicks in.
+  # (The base configs default to 200 updates, which often finishes far earlier.)
+  epoches: 2000
+
+train:
+  # Stability improvements can be incremental; allow a longer plateau before early stopping.
+  early_stop_patience_minutes: 60
+  early_stop_min_delta: 0.0005
+
+reward:
+  # Soften sigmoid smoothing around bond-order thresholds to provide gradient farther from cutoff.
+  valence_soft_temperature: 0.03

@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Callable, Dict, Optional
 from tqdm import tqdm as tq
 from collections import defaultdict
@@ -13,6 +14,17 @@ import torch
 from torch.nn.utils import clip_grad_norm_
 import numpy as np
 import torch.distributed as dist
+
+
+def _tqdm_enabled() -> bool:
+    """Enable tqdm progress bars only when explicitly requested.
+
+    Set `VERL_TQDM=1` to turn them on.
+    """
+    value = os.environ.get("VERL_TQDM", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 class EDMActor(BaseActor):
     def __init__(self, model, config, reference_model=None):
         """
@@ -176,6 +188,7 @@ class EDMActor(BaseActor):
             }
             return metric
         alignment_active = self.force_alignment_enabled and self.force_alignment_weight > 0.0
+        tqdm_enabled = _tqdm_enabled()
         grad_accum_steps = int(self.config["train"].get("gradient_accumulation_steps", 1) or 1)
         if grad_accum_steps <= 0:
             grad_accum_steps = 1
@@ -187,7 +200,7 @@ class EDMActor(BaseActor):
             desc="Training",
             unit="Batch",
             leave=False,
-            disable=not self.is_main_process,
+            disable=(not self.is_main_process) or (not tqdm_enabled),
         ):
             mus = sample.get("mus") if alignment_active else None # number of total samples \times number of active steps \times number of nodes \times dim (9)
             force_vectors = sample.get("force_vectors") if alignment_active else None
@@ -208,7 +221,7 @@ class EDMActor(BaseActor):
                 desc="Training Batch",
                 unit="timesteps",
                 leave=False,
-                disable=not self.is_main_process,
+                disable=(not self.is_main_process) or (not tqdm_enabled),
             ):
                 context = sample["context"] if self.condition else None
                 if "advantages_ts" in sample:
@@ -511,11 +524,28 @@ class EDMActor(BaseActor):
         if "advantages" in data.batch.keys():
             samples["advantages"] = data.batch["advantages"]
 
-        # Latent sequences contain z_T..z_0 and a final decoded x/h frame; exclude terminal for training
-        latents_full = data.batch["latents"][:, : self.num_timesteps + 1].clone()
-        next_latents_full = data.batch["latents"][:, 1 : self.num_timesteps + 1].clone()
-        timesteps_full = data.batch["timesteps"][:, : self.num_timesteps].clone()
-        logps_full = data.batch["logps"][:, : self.num_timesteps].clone()
+        # Latent sequences contain z_T..z_0 and a final decoded x/h frame; exclude the terminal
+        # decode transition for training. (We may also receive truncated trajectories when using
+        # shared-prefix suffix-only rollouts.)
+        latents_all = data.batch["latents"]
+        logps_all = data.batch["logps"]
+        timesteps_all = data.batch["timesteps"]
+
+        num_latent_frames = int(latents_all.size(1))
+        num_logp_frames = int(logps_all.size(1))
+
+        # Standard rollout format: latents has one more frame than logps (extra terminal latent),
+        # and logps contains one extra entry for the decode step p(x,h|z0).
+        has_decode_logp = (num_latent_frames >= num_logp_frames + 1) and (num_logp_frames >= 1)
+        diffusion_steps_available = num_logp_frames - 1 if has_decode_logp else num_logp_frames
+        diffusion_steps_available = max(0, diffusion_steps_available)
+        diffusion_steps_available = min(diffusion_steps_available, max(0, num_latent_frames - 1))
+        diffusion_steps = min(int(self.num_timesteps), int(diffusion_steps_available))
+
+        latents_full = latents_all[:, : diffusion_steps + 1].clone()
+        next_latents_full = latents_all[:, 1 : diffusion_steps + 1].clone()
+        timesteps_full = timesteps_all[:, :diffusion_steps].clone()
+        logps_full = logps_all[:, :diffusion_steps].clone()
 
         meta_skip_prefix = data.meta_info.get("skip_prefix", self.skip_prefix)
         try:
@@ -523,7 +553,7 @@ class EDMActor(BaseActor):
         except Exception:
             meta_skip_prefix = self.skip_prefix
         share_prefix = bool(data.meta_info.get("share_initial_noise", self.share_initial_noise))
-        start_idx = min(meta_skip_prefix if share_prefix else 0, self.num_timesteps)
+        start_idx = min(meta_skip_prefix if share_prefix else 0, diffusion_steps)
 
         if start_idx > 0:
             latents_full = latents_full[:, start_idx:]
@@ -538,7 +568,7 @@ class EDMActor(BaseActor):
         self.active_num_timesteps = logps_full.size(1)
         samples["nodesxsample"] = data.batch["nodesxsample"]
         if self.force_alignment_enabled and "mus" in data.batch.keys():
-            mus_full = data.batch["mus"][:, : self.num_timesteps + 1].clone()
+            mus_full = data.batch["mus"][:, : diffusion_steps + 1].clone()
             if start_idx > 0:
                 mus_full = mus_full[:, start_idx:]
             samples["mus"] = mus_full
@@ -563,7 +593,7 @@ class EDMActor(BaseActor):
         # Optional per-step advantages should align with latent steps only
         if "advantages_ts" in samples:
             adv_ts = samples["advantages_ts"]
-            adv_ts = adv_ts[:, : self.num_timesteps]
+            adv_ts = adv_ts[:, :diffusion_steps]
             if start_idx > 0:
                 adv_ts = adv_ts[:, start_idx:]
             samples["advantages_ts"] = adv_ts
@@ -584,7 +614,11 @@ class EDMActor(BaseActor):
 
             # Process complete batches
             if n_complete_batches > 0:
-                reshaped_values = [v.reshape(-1, self.train_micro_batch_size, *v.shape[1:]) for v in original_values]
+                prefix = n_complete_batches * self.train_micro_batch_size
+                reshaped_values = [
+                    v[:prefix].reshape(n_complete_batches, self.train_micro_batch_size, *v.shape[1:])
+                    for v in original_values
+                ]
                 transposed_values = zip(*reshaped_values)
                 samples_batched.extend([dict(zip(original_keys, row_values)) for row_values in transposed_values])
 

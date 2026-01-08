@@ -1,0 +1,16 @@
+{
+  "description": "Energy+force resume (allocator crash)",
+  "start_time": "2026-01-08 12:30:18",
+  "duration_hours": 0.9163666666666667,
+  "status": "failed",
+  "log_path": "outputs/verl/geom_vxu/geom_vxu_energy2_20260108_122126_resume.log",
+  "run_dir": "outputs/verl/geom_vxu/geom_vxu_energy2_20260108_122126",
+  "best_epoch": 28,
+  "reward": -3.767632246017456,
+  "atom_stability": 0.7239031195640564,
+  "molecule_stability": 0.0,
+  "rdkit_validity": 0.9921875,
+  "rdkit_uniqueness": 0.8818897637795275,
+  "validity_x_uniqueness": 0.875
+}
+

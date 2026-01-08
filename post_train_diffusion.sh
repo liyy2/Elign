@@ -23,37 +23,55 @@ sanitize_for_name() {
   echo "${value}"
 }
 
-# Optimization / training loop
+# Optional resume from a DDPO checkpoint.
+# NOTE: DDPOTrainer only loads `checkpoint_path` when `resume=true`.
+CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
+declare -a RESUME_FLAGS=()
+if [[ -n "${CHECKPOINT_PATH}" ]]; then
+  RESUME_FLAGS=("resume=true" "checkpoint_path=${CHECKPOINT_PATH}")
+fi
+
+# Optimization / training loop (defaults match `ddpo_qm9_energy_force_group4x6.yaml`)
 LEARNING_RATE="4e-6"
 CLIP_RANGE="2e-3"
-TRAIN_MICRO_BATCH_SIZE=4 # batch size for doing policy gradient, reduce if the training part is a bottleneck
+TRAIN_MICRO_BATCH_SIZE=8 # PPO micro-batch size during the update (reduce if OOM)
 EPOCH_PER_ROLLOUT=1
-KL_PENALTY_WEIGHT=0.04 # Flow-GRPO commonly uses beta≈0.04
+KL_PENALTY_WEIGHT=0.08
 # Diffusion rollout settings
-SAMPLE_GROUP_SIZE=1 # Number of groups
-EACH_PROMPT_SAMPLE=24 # Group Size in GRPO
+SAMPLE_GROUP_SIZE=4 # Number of prompts per batch
+EACH_PROMPT_SAMPLE=6 # Samples per prompt (group size); total rollouts = 24
 TIME_STEP=1000
 SHARE_INITIAL_NOISE=true
 FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=true
-MLFF_MODEL="uma-m-1p1"
-MLFF_BATCH_SIZE=8 # Batch size for calculating reward, reduce if the reward calculation is a bottleneck
+MLFF_MODEL="uma-s-1p1"
+MLFF_BATCH_SIZE=32 # Only used when shaping is enabled
 FORCE_AGGREGATION="rms"
-STABILITY_WEIGHT="0"
+FORCE_CLIP_THRESHOLD="2.0"
+STABILITY_WEIGHT="2.0"
+# Energy reward is easy to exploit on physically invalid geometries. Gate it on stability by default.
+ENERGY_ONLY_IF_STABLE=true
+ENERGY_ADV_WEIGHT="0.05"
 SKIP_PREFIX=700
-REWARD_SHAPING_ENABLED=true # Set to false to disable shaping and rely on terminal-only rewards
-# When shaping is enabled, set true to reshape only energy deltas (forces still used for terminals).
-SHAPING_ONLY_ENERGY=true
+REWARD_SHAPING_ENABLED=false # Prefer terminal-only rewards; shaping is noisier
+# When shaping is enabled, `true` reshapes only energy deltas (force only appears at terminal).
+# For stability, prefer `false` so both force + energy deltas contribute to advantages.
+SHAPING_ONLY_ENERGY=false
 
 # Note: when shaping is enabled, PPO advantages are computed from per-step
 # force/energy traces, so scalar rewards (and any novelty penalty applied to them)
 # only affect logs unless the penalty is injected into those traces.
 
 # Filtering configuration
+ENABLE_FILTERING=true
 ENABLE_NOVELTY_PENALTY=false
 NOVELTY_PENALTY_SCALE="0.5"
+# Optional: penalize RDKit-invalid molecules only (without pushing away from QM9).
+INVALID_PENALTY_SCALE="2.0"
+# Optional: penalize duplicate SMILES within a rollout batch (anti-collapse).
+DUPLICATE_PENALTY_SCALE="0.0"
 
 # Scheduler configuration
 SCHEDULER_NAME="cosine"
@@ -115,9 +133,11 @@ fi
 
 # Launch training
 torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py \
+  --config-name ddpo_qm9_energy_force_group4x6 \
   wandb.enabled=true \
   wandb.wandb_name="${RUN_NAME}" \
   save_path="${SAVE_PATH}" \
+  "${RESUME_FLAGS[@]}" \
   train.learning_rate="${LEARNING_RATE}" \
   train.clip_range="${CLIP_RANGE}" \
   train.kl_penalty_weight="${KL_PENALTY_WEIGHT}" \
@@ -130,14 +150,20 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   model.time_step="${TIME_STEP}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \
   reward.force_aggregation="${FORCE_AGGREGATION}" \
+  reward.force_clip_threshold="${FORCE_CLIP_THRESHOLD}" \
   reward.stability_weight="${STABILITY_WEIGHT}" \
+  reward.energy_only_if_stable="${ENERGY_ONLY_IF_STABLE}" \
+  reward.energy_adv_weight="${ENERGY_ADV_WEIGHT}" \
   train.scheduler.name="${SCHEDULER_NAME}" \
   train.scheduler.warmup_steps="${SCHEDULER_WARMUP_STEPS}" \
   train.scheduler.total_steps="${SCHEDULER_TOTAL_STEPS}" \
   train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}" \
+  filters.enable_filtering="${ENABLE_FILTERING}" \
   reward.use_energy="${USE_ENERGY}" \
   reward.mlff_model="${MLFF_MODEL}" \
   filters.enable_penalty="${ENABLE_NOVELTY_PENALTY}" \
   filters.penalty_scale="${NOVELTY_PENALTY_SCALE}" \
+  filters.invalid_penalty_scale="${INVALID_PENALTY_SCALE}" \
+  filters.duplicate_penalty_scale="${DUPLICATE_PENALTY_SCALE}" \
   "${SHAPING_FLAGS[@]}"
   
