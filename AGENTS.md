@@ -1,42 +1,51 @@
 # Repository Guidelines
 
+This repo contains ELIGN, a post-training method for equivariant diffusion models, and its FED-GRPO trainer.
+
 ## Project Structure & Module Organization
-- Root contains experiment scripts, logs, and docs. Core code lives under `e3_diffusion_for_molecules-main/`.
-- Key modules (paths are relative to `e3_diffusion_for_molecules-main/`):
-  - `equivariant_diffusion/` – diffusion model and sampling logic
-  - `egnn/` – EGNN layers and utilities
-  - `qm9/`, `data/`, `configs/` – datasets, loaders, and configs
-  - Entry points: `main_qm9.py`, `main_geom_drugs.py`, `eval_mlff_guided.py`
-- Outputs (checkpoints, samples) are written to `outputs/` unless overridden by flags.
+
+- `edm_source/` – diffusion backbone (EDM-style) and dataset utilities
+  - `edm_source/equivariant_diffusion/` – diffusion model and sampling logic
+  - `edm_source/egnn/` – EGNN layers and utilities
+  - `edm_source/qm9/` – QM9 dataset code and stability metrics
+  - Entry points: `edm_source/main_qm9.py`, `edm_source/main_geom_drugs.py`, `edm_source/eval_mlff_guided.py`
+- `elign/` – ELIGN post-training stack (FED-GRPO)
+  - `elign/trainer/fed_grpo_trainer.py` – trainer/advantage computation/checkpointing
+  - `elign/worker/actor/edm_actor.py` – PPO-style update + optional KL penalty
+  - `elign/worker/reward/force.py` – UMA force/energy reward + shaping
+  - `elign/worker/filter/filter.py` – RDKit-based filtering + penalties
+- Top-level scripts:
+  - `run_elign.py` – main ELIGN/FED-GRPO entrypoint (Hydra)
+  - `eval_elign_rollout.py` – sampling rollouts from a trained run directory
+  - `compute_elign_metrics.py` – RDKit/stability/MLFF metrics and optional repair
+
+Outputs (checkpoints, samples) should be written under `outputs/` (recommended) or a user-provided `save_path`.
 
 ## Build, Test, and Development Commands
+
 - Environment setup (recommended):
-  - `conda create -c conda-forge -n molecular-diffusion rdkit && conda activate molecular-diffusion`
-  - `pip install -r e3_diffusion_for_molecules-main/requirements.txt`
-- Train (QM9 example):
-  - `cd e3_diffusion_for_molecules-main && python main_qm9.py --exp_name edm_qm9 --n_epochs 3000 --diffusion_steps 1000`
-- Train (GEOM-Drugs example):
-  - `python main_geom_drugs.py --exp_name edm_geom_drugs --diffusion_steps 1000`
-- Evaluate with MLFF guidance:
-  - `python eval_mlff_guided.py --model_path outputs/edm_qm9 --n_samples 100`
+  - `conda create -n elign python=3.10 -c conda-forge rdkit && conda activate elign`
+  - `pip install -r requirements.txt`
+- Run unit tests:
+  - `pytest -q`
+- Train backbone (QM9):
+  - `python edm_source/main_qm9.py --exp_name edm_qm9 --n_epochs 3000 --diffusion_steps 1000`
+- Post-train with ELIGN (smoke test):
+  - `python run_elign.py --config-name fed_grpo_config reward.type=dummy wandb.enabled=false dataloader.epoches=1`
 
 ## Coding Style & Naming Conventions
+
 - Python 3.x, 4-space indentation, PEP 8.
-- Naming: `snake_case` for functions/variables, `PascalCase` for classes, `UPPER_CASE` for constants, module files `lower_snake_case.py`.
-- Keep functions small and pure where possible; prefer explicit args over globals.
-- If formatters are available, run: `black . && isort .` (optional but encouraged).
+- Naming: `snake_case` for functions/variables, `PascalCase` for classes, `UPPER_CASE` for constants.
+- Prefer explicit args over globals; keep functions small and testable.
 
 ## Testing Guidelines
-- Prefer `pytest` with tests under `tests/` named `test_*.py`.
-- Aim for coverage on utility functions, samplers, and data transforms.
-- Quick run: `pytest -q`. Add minimal fixtures for dataset stubs to avoid heavy downloads.
 
-## Commit & Pull Request Guidelines
-- Commits: concise, imperative subject (<=72 chars), e.g., `Add MLFF guidance flag to evaluator`.
-- Include context in body when changing behavior or configs.
-- PRs: clear description, motivation, reproduction steps, and sample command lines; link related issues; include before/after metrics or logs when relevant.
+- Prefer `pytest` with tests under `tests/` named `test_*.py`.
+- Keep tests lightweight (avoid heavy dataset downloads).
 
 ## Security & Configuration Tips
+
 - Do not commit credentials. Use `huggingface-cli login` or export `HF_TOKEN` at runtime.
-- Large artifacts: write to `outputs/` and avoid committing them.
-- Add any local `.env` or cache paths to `.gitignore`.
+- Write large artifacts to `outputs/` and avoid committing them.
+

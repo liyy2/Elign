@@ -169,6 +169,11 @@ eval/
 evaluation/
 results/
 
+# Local experiment scratchpads
+exp/
+codex_attempts*/
+.claude_resources.json
+
 # CUDA and GPU related
 *.cu
 *.cuh

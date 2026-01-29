@@ -19,20 +19,20 @@ set -euo pipefail
 #
 # Notes:
 # - No tokens are embedded. Set `WANDB_API_KEY`/`WANDB_MODE` and any HF credentials in your environment if needed.
-# - Adds repo paths to `PYTHONPATH` so imports work even if `run_verl_diffusion.py` has a stale hardcoded sys.path.
+# - Adds repo paths to `PYTHONPATH` so imports work even if `run_elign.py` has a stale hardcoded sys.path.
 
 CONDA_ENV="${CONDA_ENV:-edm}"
 WANDB_ENABLED="${WANDB_ENABLED:-0}"   # 1=enable wandb.init, 0=disable
-WANDB_PROJECT="${WANDB_PROJECT:-ddpo}"
+WANDB_PROJECT="${WANDB_PROJECT:-elign}"
 
 # Recommended default: the best configuration found so far in this tuning loop.
-CONFIG_NAME="${CONFIG_NAME:-ddpo_qm9_energy_force_group4x6}"
+CONFIG_NAME="${CONFIG_NAME:-fed_grpo_qm9_energy_force_group4x6}"
 
 # Starting checkpoint for the diffusion policy (EDM)
 MODEL_CONFIG="${MODEL_CONFIG:-./pretrained/edm/edm_qm9/args.pickle}"
 MODEL_WEIGHTS="${MODEL_WEIGHTS:-./pretrained/edm/edm_qm9/generative_model_ema.npy}"
 
-# Optional: resume a DDPO checkpoint (full optimizer/model state).
+# Optional: resume a FED-GRPO checkpoint (full optimizer/model state).
 # NOTE: `checkpoint_path` is ignored unless `resume=true`.
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 
@@ -66,10 +66,10 @@ sanitize_for_name() {
 # ----------------------------
 LEARNING_RATE="${LEARNING_RATE:-4e-6}"
 CLIP_RANGE="${CLIP_RANGE:-2e-3}"
-# Matches `ddpo_qm9_energy_force_group4x6.yaml`
+# Matches `fed_grpo_qm9_energy_force_group4x6.yaml`
 TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-8}"
 EPOCH_PER_ROLLOUT="${EPOCH_PER_ROLLOUT:-1}"
-# Matches `ddpo_qm9_energy_force_group4x6.yaml`
+# Matches `fed_grpo_qm9_energy_force_group4x6.yaml`
 KL_PENALTY_WEIGHT="${KL_PENALTY_WEIGHT:-0.08}"
 
 # ----------------------------
@@ -127,9 +127,9 @@ SCHEDULER_MIN_LR_RATIO="${SCHEDULER_MIN_LR_RATIO:-0.3}"
 # ----------------------------
 timestamp=$(date +"%Y%m%d_%H%M%S")
 MODEL_TAG=$(sanitize_for_name "${MLFF_MODEL}")
-RUN_NAME="verl_qm9_${MODEL_TAG}_lr_$(sanitize_for_name "${LEARNING_RATE}")_${timestamp}"
+RUN_NAME="elign_qm9_${MODEL_TAG}_lr_$(sanitize_for_name "${LEARNING_RATE}")_${timestamp}"
 
-SAVE_ROOT="${SAVE_ROOT:-${REPO_ROOT}/outputs/verl}"
+SAVE_ROOT="${SAVE_ROOT:-${REPO_ROOT}/outputs/elign/qm9}"
 SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
 mkdir -p "${SAVE_PATH}"
 
@@ -171,7 +171,7 @@ else
   LAUNCHER=(python -u)
 fi
 
-"${LAUNCHER[@]}" run_verl_diffusion.py \
+"${LAUNCHER[@]}" run_elign.py \
   --config-name "${CONFIG_NAME}" \
   "${WANDB_FLAGS[@]}" \
   save_path="${SAVE_PATH}" \

@@ -20,7 +20,7 @@ from typing import Dict
 
 import torch
 
-from verl_diffusion import DataProto
+from elign import DataProto
 
 __all__ = ["BasePPOActor"]
 

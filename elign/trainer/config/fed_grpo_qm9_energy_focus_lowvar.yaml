@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_lowvar
+  - fed_grpo_qm9_energy_lowvar
   - _self_
 
 # Energy-focused continuation config (QM9).
@@ -13,7 +13,7 @@ defaults:
 # - Use UMA per-element reference energies (atom_refs='omol') to compute a formation-energy-like
 #   proxy: (E - sum(atom_refs)) / n_atoms.
 # - Use a non-saturating transform for this proxy (offset=0, scale=1, wide clip).
-# - Increase GRPO/DDPO energy advantage weight vs. force to bias updates toward energy.
+# - Increase FED-GRPO energy advantage weight vs. force to bias updates toward energy.
 
 dataloader:
   # 4 prompts × 24 samples each = 96 rollouts per iteration (lower-variance GRPO stats).

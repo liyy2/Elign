@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6
+  - fed_grpo_qm9_energy_force_group4x6
   - _self_
 
 # Low-variance energy+force tuning:

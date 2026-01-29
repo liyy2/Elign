@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_valence_overbond
+  - fed_grpo_qm9_energy_force_group4x6_valence_overbond
   - _self_
 
 # Follow-up for the stability gap (QM9):

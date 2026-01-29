@@ -1,7 +1,7 @@
 defaults:
   - _self_
 
-name: edm
+name: elign
 seed: 42
 save_path: null
 resume: false
@@ -124,7 +124,7 @@ reward:
   valence_overbond_soft_weight: 0.0
   valence_soft_temperature: 0.02
   force_aggregation: rms # rms or max
-  # Weights applied to normalized GRPO advantages (DDPOTrainer), not to the raw rewards.
+  # Weights applied to normalized FED-GRPO advantages (FedGrpoTrainer), not to the raw rewards.
   force_adv_weight: 1.0
   energy_adv_weight: 0.1
   # Energy is transformed as: (E + offset) / scale, then optionally clipped, then negated (minimize energy).
@@ -154,8 +154,8 @@ reward:
 
 wandb:
   enabled: true
-  wandb_project: "ddpo"
-  wandb_name: "edm-ddp-run"
+  wandb_project: "elign"
+  wandb_name: "elign-fed-grpo-run"
 
 hydra:
   job:

@@ -30,7 +30,7 @@ from packaging import version
 from tensordict import TensorDict
 from torch.utils.data import DataLoader
 
-from verl_diffusion.utils.py_functional import union_two_dict
+from elign.utils.py_functional import union_two_dict
 
 __all__ = ["DataProto", "union_tensor_dict"]
 
@@ -708,61 +708,9 @@ class DataProto:
             meta_info=self.meta_info,
         )
 
-
-import ray
-
-
-@dataclass
-class DataProtoFuture:
-    """
-    DataProtoFuture aims to eliminate actual data fetching on driver. By doing so, the driver doesn't have to wait
-    for data so that asynchronous execution becomes possible.
-    DataProtoFuture contains a list of futures from another WorkerGroup of size world_size.
-    - collect_fn is a Callable that reduces the list of futures to a DataProto
-    - dispatch_fn is a Callable that partitions the DataProto into a list of DataProto of size world_size and then select
-
-    Potential issue: we can optimize dispatch_fn(collect_fn) such that only needed data is fetched on destination
-    - DataProtoFuture only supports directly passing from the output of a method to another input. You can't perform any
-    operation on the DataProtoFuture in driver.
-    """
-
-    collect_fn: Callable
-    futures: List[ray.ObjectRef]
-    dispatch_fn: Callable = None
-
-    @staticmethod
-    def concat(data: List[ray.ObjectRef]) -> "DataProtoFuture":
-        output = DataProtoFuture(collect_fn=DataProto.concat, futures=data)
-        return output
-
-    def chunk(self, chunks: int) -> List["DataProtoFuture"]:
-        from functools import partial
-
-        arg_future_lst = []
-        for i in range(chunks):
-            # note that we can't directly pass i and chunks
-            def dispatch_fn(x, i, chunks):
-                return x.chunk(chunks=chunks)[i]
-
-            arg_future = DataProtoFuture(
-                collect_fn=self.collect_fn, dispatch_fn=partial(dispatch_fn, i=i, chunks=chunks), futures=self.futures
-            )
-            arg_future_lst.append(arg_future)
-        return arg_future_lst
-
-    def get(self):
-        output = ray.get(self.futures)  # dp_size.
-        for o in output:
-            assert isinstance(o, DataProto)
-        output = self.collect_fn(output)  # select dp, concat
-        if self.dispatch_fn is not None:
-            output = self.dispatch_fn(output)  # split in batch dim, select using dp
-        return output
-
-
 import torch.distributed
 
-from verl_diffusion.utils.torch_functional import allgather_dict_tensors
+from elign.utils.torch_functional import allgather_dict_tensors
 
 
 def all_gather_data_proto(data: DataProto, process_group):

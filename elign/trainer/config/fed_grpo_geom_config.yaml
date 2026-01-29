@@ -1,7 +1,7 @@
 defaults:
   - _self_
 
-name: edm-geom
+name: elign-geom
 seed: 42
 save_path: null
 resume: false
@@ -89,8 +89,8 @@ reward:
 
 wandb:
   enabled: false
-  wandb_project: "ddpo"
-  wandb_name: "edm-geom-ddp"
+  wandb_project: "elign"
+  wandb_name: "elign-geom-fed-grpo"
 
 hydra:
   job:

@@ -96,7 +96,7 @@ def compute_rdkit_metrics(
     """Compute RDKit validity/uniqueness (+ novelty) statistics for rollout samples.
 
     Args:
-        samples: List of rollout sample dictionaries produced by eval_verl_rollout.py.
+        samples: List of rollout sample dictionaries produced by eval_elign_rollout.py.
         dataset_info: Dataset metadata used by BasicMolecularMetrics.
 
     Returns:

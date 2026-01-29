@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_config
+  - fed_grpo_config
   - _self_
 
 # Tuned QM9 post-training config:

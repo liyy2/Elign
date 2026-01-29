@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_valence
+  - fed_grpo_qm9_energy_force_group4x6_valence
   - _self_
 
 # Force-only stability run.

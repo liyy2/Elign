@@ -1,10 +1,10 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v6_energyfix
+  - fed_grpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v6_energyfix
   - _self_
 
 # v8: "DFT-push" variant.
 #
-# Goal: improve downstream DFT (PySCF) energy/force by making the UMA objectives better
+# Goal: improve downstream DFT energy/force by making the UMA objectives better
 # aligned with our downstream metrics:
 # - use RMS aggregation (closer to the oracle metric we report)
 # - keep the per-atom force clip moderate (avoid outliers dominating PPO)
@@ -14,4 +14,3 @@ reward:
   force_aggregation: rms
   force_clip_threshold: 3.0
   energy_adv_weight: 0.1
-

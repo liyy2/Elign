@@ -5,7 +5,11 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import sys
-sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
+REPO_ROOT = Path(__file__).resolve().parent
+EDM_SOURCE_ROOT = REPO_ROOT / "edm_source"
+for path in (str(REPO_ROOT), str(EDM_SOURCE_ROOT)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
 import torch
 from tqdm import tqdm
 from omegaconf import OmegaConf
@@ -14,18 +18,18 @@ from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
 from edm_source.qm9.models import get_model
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
-from verl_diffusion.dataloader.dataloader import EDMDataLoader
-from verl_diffusion.model.edm_model import EDMModel
-from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
-from verl_diffusion.utils.rdkit_metrics import compute_rdkit_metrics
+from elign.dataloader.dataloader import EDMDataLoader
+from elign.model.edm_model import EDMModel
+from elign.worker.rollout.edm_rollout import EDMRollout
+from elign.utils.rdkit_metrics import compute_rdkit_metrics
 
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Generate rollouts with a post-trained VERL diffusion checkpoint. "
-            "The script loads the original EDM args.pickle, restores the VERL fine-tuned weights, "
+            "Generate rollouts with a post-trained ELIGN diffusion checkpoint (FED-GRPO). "
+            "The script loads the original EDM args.pickle, restores the ELIGN fine-tuned weights, "
             "and samples a user-specified number of molecules."
         )
     )
@@ -34,7 +38,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         required=True,
         help=(
-            "Directory that stores the VERL training artifacts (expects config.yaml / args.pickle / checkpoints). "
+            "Directory that stores the ELIGN post-training artifacts (expects config.yaml / args.pickle / checkpoints). "
             "Used as the default base path for relative inputs and outputs."
         ),
     )
@@ -42,14 +46,17 @@ def parse_args() -> argparse.Namespace:
         "--args-pickle",
         type=str,
         default=None,
-        help="Path to the EDM args.pickle file. Defaults to <run-dir>/args.pickle.",
+        help=(
+            "Path to the EDM args.pickle file. If omitted, the script tries (1) <run-dir>/args.pickle, "
+            "then (2) <run-dir>/config.yaml -> model.config."
+        ),
     )
     parser.add_argument(
         "--checkpoint",
         type=str,
         default=None,
         help=(
-            "Path to the VERL checkpoint (.pth or .npy saved with torch.save). "
+            "Path to the ELIGN checkpoint (.pth or .npy saved with torch.save). "
             "Defaults to <run-dir>/checkpoint_latest.pth if present, otherwise checkpoint_best.pth."
         ),
     )
@@ -138,7 +145,7 @@ def make_output_path(path_value: Optional[str], run_dir: Path) -> Optional[Path]
 
     For outputs we often want to create new files, so the existence-based fallback in
     `make_absolute()` can accidentally nest paths under `run_dir` when callers pass a
-    repo-relative path like `outputs/verl/.../eval.pt`.
+    repo-relative path like `outputs/elign/.../eval.pt`.
 
     Rule:
     - Absolute paths are kept as-is.
@@ -225,7 +232,7 @@ def load_model_weights(model: EDMModel, checkpoint_path: Path, device: torch.dev
     state = sanitize_state_dict(state)
 
     # Pretrained EDM checkpoints are stored as the underlying flow state_dict
-    # (keys like 'dynamics.*'), whereas VERL/DDPO checkpoints save the full
+    # (keys like 'dynamics.*'), whereas ELIGN/FED-GRPO checkpoints save the full
     # EDMModel state_dict (keys like 'model.dynamics.*'). Detect and load both.
     keys = list(state.keys())
     is_flow_state_dict = not any(k.startswith("model.") for k in keys) and any(
@@ -325,15 +332,28 @@ def main() -> None:
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory '{run_dir}' does not exist.")
 
-    args_pickle_path = (
-        make_absolute(args.args_pickle, run_dir)
-        if args.args_pickle
-        else make_absolute("args.pickle", run_dir)
-    )
+    run_config = load_run_config(run_dir)
+
+    args_pickle_path: Optional[Path] = None
+    if args.args_pickle:
+        args_pickle_path = make_absolute(args.args_pickle, run_dir)
+    else:
+        candidate = make_absolute("args.pickle", run_dir)
+        if candidate is not None and candidate.exists():
+            args_pickle_path = candidate
+        elif isinstance(run_config, dict):
+            model_cfg = run_config.get("model")
+            if isinstance(model_cfg, dict) and model_cfg.get("config"):
+                inferred = make_absolute(str(model_cfg["config"]), run_dir)
+                if inferred is not None and inferred.exists():
+                    args_pickle_path = inferred
+
     if args_pickle_path is None or not args_pickle_path.exists():
         raise FileNotFoundError(
-            f"Could not locate args.pickle at '{args_pickle_path}'. "
-            "Pass --args-pickle explicitly or copy the EDM args to the run directory."
+            "Could not locate the EDM args.pickle.\n"
+            f"- Tried: {run_dir / 'args.pickle'}\n"
+            "- Tried: <run-dir>/config.yaml -> model.config\n"
+            "Fix: pass --args-pickle explicitly, or copy args.pickle into the run directory."
         )
 
     checkpoint_path = infer_checkpoint_path(run_dir, args.checkpoint)
@@ -344,7 +364,6 @@ def main() -> None:
     )
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    run_config = load_run_config(run_dir)
     sampling_config = prepare_sampling_config(run_config, args)
 
     edm_config = load_edm_config(args_pickle_path)

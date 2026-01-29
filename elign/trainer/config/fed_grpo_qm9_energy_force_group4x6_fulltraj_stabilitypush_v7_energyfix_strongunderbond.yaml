@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v6_energyfix
+  - fed_grpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v6_energyfix
   - _self_
 
 # v7: keep the corrected per-atom energy transform (v6) and push harder on the dominant

@@ -1,10 +1,10 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6
+  - fed_grpo_qm9_energy_force_group4x6
   - _self_
 
 # QM9 energy+force post-training config that explicitly prioritizes QM9 stability.
 #
-# Key change vs ddpo_qm9_energy_force_group4x6:
+# Key change vs fed_grpo_qm9_energy_force_group4x6:
 # - Gate the *force* objective to stable molecules (`reward.force_only_if_stable=true`).
 #   This prevents unstable low-force geometries (e.g., stretched/missing bonds) from receiving
 #   a high force reward.

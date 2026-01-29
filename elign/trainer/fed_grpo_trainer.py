@@ -3,21 +3,20 @@ import torch.distributed as dist
 import queue
 import time
 import threading
-import ray
 from tqdm import tqdm
 import wandb
 import os
 import yaml
 import numpy as np
 from typing import Dict
-from verl_diffusion.trainer.base import BaseTrainer
-from verl_diffusion.protocol import DataProto, TensorDict
+from elign.trainer.base import BaseTrainer
+from elign.protocol import DataProto, TensorDict
 
 
-class DDPOTrainer(BaseTrainer):
+class FedGrpoTrainer(BaseTrainer):
     def __init__(self, config, model, dataset_info, device, dataloader, rollout, rewarder, actor, filters=None):
         """
-        Initialize the DDPO Trainer
+        Initialize the FED-GRPO trainer.
         
         Args:
             config: Configuration dictionary
@@ -82,17 +81,6 @@ class DDPOTrainer(BaseTrainer):
         self.energy_adv_weight = float(reward_cfg.get("energy_adv_weight", reward_cfg.get("energy_weight", 1.0)))
         shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
         self.terminal_adv_weight = float(shaping_cfg.get("terminal_weight", 1.5))
-
-        # Initialize Ray for parallel processing (optional).
-        ray_cfg = self.config.get("ray", {})
-        ray_enabled = False
-        if isinstance(ray_cfg, dict):
-            ray_enabled = bool(ray_cfg.get("enabled", False))
-        elif ray_cfg:
-            ray_enabled = True
-
-        if ray_enabled and self.is_main_process and not ray.is_initialized():
-            ray.init()
 
         # Initialize wandb if enabled in config
         wandb_cfg = config.get("wandb")
@@ -284,6 +272,120 @@ class DDPOTrainer(BaseTrainer):
         force_adv_weight = getattr(self, "force_adv_weight", 1.0)
         energy_adv_weight = getattr(self, "energy_adv_weight", 1.0)
         terminal_weight_applied = False
+        reward_cfg = self.config.get("reward", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(reward_cfg, dict):
+            reward_cfg = {}
+        shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg.get("shaping"), dict) else {}
+        shaping_mode_raw = str(shaping_cfg.get("mode", "delta") or "delta").lower()
+        shaping_mode = (
+            "pbrs_return_to_go"
+            if shaping_mode_raw in {"pbrs", "return_to_go", "pbrs_return_to_go", "paper"}
+            else "delta"
+        )
+        shaping_gamma = float(shaping_cfg.get("gamma", 1.0) or 1.0)
+
+        # Paper-aligned PBRS mode (Algorithm 1 / Eq. 4):
+        # - rewarder provides energy potentials Ψ_t in `energy_rewards_ts` (plus terminal Ψ_0 in `energy_rewards`)
+        # - we compute per-step returns-to-go: G_t^(E) = γ^t Ψ_0 - Ψ_t
+        # - force reward is terminal-only (`force_rewards`) but its advantage is broadcast across t
+        if (
+            shaping_mode == "pbrs_return_to_go"
+            and "energy_rewards_ts" in samples.batch.keys()
+            and "timesteps" in samples.batch.keys()
+            and "force_rewards" in samples.batch.keys()
+            and "energy_rewards" in samples.batch.keys()
+        ):
+            device = group_index.device
+            energy_potentials = samples.batch["energy_rewards_ts"].to(device)  # [B, S_pot]
+            timesteps = samples.batch["timesteps"].to(device)  # [B, S_time]
+
+            # Align potential/timestep horizons (rollouts may include an extra decode frame).
+            horizon = min(int(energy_potentials.size(1)), int(timesteps.size(1)))
+            energy_potentials = energy_potentials[:, :horizon]
+            timesteps = timesteps[:, :horizon]
+
+            target_T = getattr(self, "num_timesteps", 0)
+            if target_T <= 0:
+                target_T = max(0, horizon - 1)
+
+            # We compute advantages for diffusion transitions only (exclude decode frame).
+            # Example: horizon=1001 (diffusion + decode), target_T=1000 transitions.
+            target_T = min(int(target_T), max(0, horizon - 1))
+            if target_T <= 0:
+                samples.batch["advantages"] = torch.zeros_like(samples.batch["force_rewards"])
+                return samples
+
+            # Terminal energy potential Ψ_0 is stored in the scalar energy reward (and will include penalties/gates).
+            psi0 = samples.batch["energy_rewards"].to(device).to(dtype=energy_potentials.dtype)
+            force_rewards = samples.batch["force_rewards"].to(device).to(dtype=energy_potentials.dtype)
+
+            g_energy = torch.zeros((energy_potentials.size(0), target_T), device=device, dtype=energy_potentials.dtype)
+
+            # Determine which indices have energy evaluations (scheduled MLFF calls).
+            schedule_indices = samples.meta_info.get("reward_schedule_indices") if isinstance(samples.meta_info, dict) else None
+            if isinstance(schedule_indices, (list, tuple)) and len(schedule_indices) > 0:
+                idx_list = [int(i) for i in schedule_indices if 0 <= int(i) < target_T]
+                idx = torch.tensor(idx_list, device=device, dtype=torch.long) if idx_list else None
+            else:
+                idx = None
+
+            if idx is None or idx.numel() == 0:
+                # Fallback: infer scheduled steps from non-zero potentials.
+                max_abs = energy_potentials[:, :target_T].abs().max(dim=0).values
+                idx = (max_abs > 1e-12).nonzero(as_tuple=False).view(-1)
+
+            if idx.numel() > 0:
+                psi_t = torch.index_select(energy_potentials[:, :target_T], 1, idx)
+                # timesteps are stored as s (where reverse step is t=s+1 -> s), so use t=s+1 for γ^t.
+                t_values = torch.index_select(timesteps[0, :target_T], 0, idx).to(dtype=energy_potentials.dtype) + 1.0
+                gamma_factor = torch.pow(torch.full_like(t_values, shaping_gamma), t_values)
+                returns = gamma_factor.unsqueeze(0) * psi0.unsqueeze(1) - psi_t
+                g_energy.index_copy_(1, idx, returns)
+
+            unique_groups = torch.unique(group_index)
+            force_adv = torch.zeros_like(force_rewards)
+            energy_adv_ts = torch.zeros_like(g_energy)
+            eps = 1e-8
+
+            for group_id in unique_groups:
+                gmask = group_index == group_id
+                if not gmask.any():
+                    continue
+                grp_force = force_rewards[gmask]
+                mean_force = grp_force.mean()
+                std_force = grp_force.std(unbiased=False)
+                force_adv[gmask] = (grp_force - mean_force) / (std_force + eps)
+
+                grp_energy = g_energy[gmask]  # [B_g, T]
+                mean_energy = grp_energy.mean(dim=0, keepdim=True)
+                std_energy = grp_energy.std(dim=0, keepdim=True, unbiased=False)
+                energy_adv_ts[gmask] = (grp_energy - mean_energy) / (std_energy + eps)
+
+            force_adv_ts = force_adv.unsqueeze(1).expand(-1, target_T)
+            weighted_force_adv_ts = force_adv_weight * force_adv_ts
+            weighted_energy_adv_ts = energy_adv_weight * energy_adv_ts
+            advantages_ts = weighted_force_adv_ts + weighted_energy_adv_ts
+
+            # Optional legacy terminal emphasis (not in the paper); keep off by default.
+            if advantages_ts.shape[1] > 0 and self.terminal_adv_weight != 1.0:
+                time_weights = torch.ones_like(advantages_ts)
+                time_weights[:, -1] = self.terminal_adv_weight
+                advantages_ts = advantages_ts * time_weights
+                weighted_force_adv_ts = weighted_force_adv_ts * time_weights
+                weighted_energy_adv_ts = weighted_energy_adv_ts * time_weights
+
+            samples.batch["force_advantages_ts"] = torch.clamp(
+                weighted_force_adv_ts, -clip_value, clip_value
+            )
+            samples.batch["energy_advantages_ts"] = torch.clamp(
+                weighted_energy_adv_ts, -clip_value, clip_value
+            )
+
+            advantages_ts = torch.clamp(advantages_ts, -clip_value, clip_value)
+            samples.batch["advantages_ts"] = advantages_ts
+            advantages = advantages_ts.sum(dim=1)
+            samples.batch["advantages"] = torch.clamp(advantages, -clip_value, clip_value)
+            return samples
 
         # Per-timestep rewards available (reward shaping)
         if "rewards_ts" in samples.batch.keys():
@@ -567,7 +669,7 @@ class DDPOTrainer(BaseTrainer):
 
     def fit(self):
         """
-        Training loop for DDPO - processes each dataloader batch and updates model parameters
+        Training loop for FED-GRPO - processes each dataloader batch and updates model parameters
         
         Overrides BaseTrainer.fit() method
         """
@@ -978,10 +1080,6 @@ class DDPOTrainer(BaseTrainer):
     
     def clean_up(self):
         """Clean up resources"""
-        # Shutdown Ray
-        if ray.is_initialized():
-            ray.shutdown()
-            
         # Finish wandb run if enabled
         if self.wandb_enabled:
             wandb.finish() 

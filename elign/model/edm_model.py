@@ -4,7 +4,7 @@ from .base import BaseModel
 from edm_source.qm9.models import get_model
 from edm_source.equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 from torch.nn import functional as F
-from verl_diffusion.utils.math import policy_step_logprob
+from elign.utils.math import policy_step_logprob
 
 class EDMModel(BaseModel, EnVariationalDiffusion):
     def __init__(self, model, config):
@@ -111,8 +111,9 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
 
         When ``share_initial_noise`` and ``skip_prefix`` are both provided, the
         method first rolls out a shared trajectory of length ``skip_prefix`` per
-        group and only samples fresh noise beyond that boundary. This mirrors the
-        grouped-sampling strategy described in DanceGRPO.
+        group and only samples fresh noise beyond that boundary. This implements
+        the shared-prefix branching used by Elign (paper Algorithm 1: cache the
+        prefix state and branch into K rollouts).
         """
         self.T = timestep
         if share_initial_noise and group_index is None:

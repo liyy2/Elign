@@ -4,8 +4,8 @@ from typing import Optional
 
 import torch
 
-from verl_diffusion.protocol import DataProto, TensorDict
-from verl_diffusion.worker.reward.base import BaseReward
+from elign.protocol import DataProto, TensorDict
+from elign.worker.reward.base import BaseReward
 
 
 class DummyReward(BaseReward):
@@ -43,4 +43,3 @@ class DummyReward(BaseReward):
             "stability_rewards": torch.zeros_like(rewards),
         }
         return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())
-

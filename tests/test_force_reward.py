@@ -4,8 +4,8 @@ from unittest import mock
 import torch
 from typing import Optional, Dict
 
-from verl_diffusion.protocol import DataProto, TensorDict
-from verl_diffusion.worker.reward.force import UMAForceReward, _resolve_mlff_device
+from elign.protocol import DataProto, TensorDict
+from elign.worker.reward.force import UMAForceReward, _resolve_mlff_device
 
 
 class _StubForceComputer:
@@ -127,7 +127,7 @@ class TestUMAForceReward(unittest.TestCase):
         )
 
         sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
-        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(1.0,)):
+        with mock.patch("elign.worker.reward.force.check_stability", return_value=(1.0,)):
             out = rewarder.calculate_rewards(sample)
 
         expected_force_metric = torch.sqrt(torch.tensor(2.5))
@@ -162,7 +162,7 @@ class TestUMAForceReward(unittest.TestCase):
         )
 
         sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
-        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(0.0,)):
+        with mock.patch("elign.worker.reward.force.check_stability", return_value=(0.0,)):
             out = rewarder.calculate_rewards(sample)
 
         self.assertTrue(torch.allclose(out.batch["stability"], torch.tensor([0.0]), atol=1e-6))
@@ -200,7 +200,7 @@ class TestUMAForceReward(unittest.TestCase):
         )
 
         sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
-        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(1.0,)):
+        with mock.patch("elign.worker.reward.force.check_stability", return_value=(1.0,)):
             out = rewarder.calculate_rewards(sample)
 
         # Force metric = max(norm([2,0,0]), norm([0,1,0])) = 2
@@ -240,7 +240,7 @@ class TestUMAForceReward(unittest.TestCase):
         )
 
         sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
-        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(1.0, 2, 2)):
+        with mock.patch("elign.worker.reward.force.check_stability", return_value=(1.0, 2, 2)):
             out = rewarder.calculate_rewards(sample)
 
         self.assertTrue(torch.allclose(out.batch["valence_underbond"], torch.tensor([3.0]), atol=1e-6))
@@ -278,7 +278,7 @@ class TestUMAForceReward(unittest.TestCase):
         )
 
         sample = _make_single_sample_dataproto(positions, categorical, nodesxsample)
-        with mock.patch("verl_diffusion.worker.reward.force.check_stability", return_value=(0.0, 0, 3)):
+        with mock.patch("elign.worker.reward.force.check_stability", return_value=(0.0, 0, 3)):
             out = rewarder.calculate_rewards(sample)
 
         self.assertTrue(torch.allclose(out.batch["valence_underbond"], torch.tensor([1.0]), atol=1e-6))

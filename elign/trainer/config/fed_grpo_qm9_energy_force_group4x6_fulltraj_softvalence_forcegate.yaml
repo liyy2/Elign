@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_softvalence
+  - fed_grpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_softvalence
   - _self_
 
 # Full-trajectory QM9 post-training (energy + force) with valence shaping and a force gate.

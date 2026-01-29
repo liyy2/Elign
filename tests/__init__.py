@@ -1,2 +1,1 @@
-"""Local smoke tests for the diffusion + VERL stack."""
-
+"""Local smoke tests for the diffusion + ELIGN (FED-GRPO) stack."""

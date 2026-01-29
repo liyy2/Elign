@@ -1,209 +1,180 @@
-# E3 Diffusion for Molecules with MLFF Guidance
+# ELIGN: Post-training Equivariant Diffusion Models with FED-GRPO
 
-This repository contains an E(3) Equivariant Diffusion Model for Molecule Generation in 3D, enhanced with Machine Learning Force Field (MLFF) guidance for physics-informed molecular generation.
+ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. It takes a pretrained equivariant diffusion backbone (EDM-style) and post-trains the diffusion **reverse process policy** using reinforcement learning with physics-inspired rewards (e.g., ML force fields).
 
-## Prerequisites
+The RL algorithm used in ELIGN is **FED-GRPO** (**F**orce and **E**nergy **D**isentangled **G**roup **R**elative **P**olicy **O**ptimization). FED-GRPO:
 
-### 1. Access to UMA via Hugging Face
+- samples **groups** of rollouts per prompt (`group_index`)
+- computes force and (optional) energy rewards from an ML force field
+- computes **group-relative advantages**, disentangling **force** and **energy** channels and mixing them with configurable weights
+- updates the diffusion policy with a **clipped policy-gradient objective** (PPO-style) plus optional KL regularization to a reference policy
 
-First, you need to have access to the UMA models via Hugging Face:
+This repo is organized into two main codebases:
 
-1. **Create a Hugging Face account** at [huggingface.co](https://huggingface.co)
-2. **Request access** to the UMA model repository
-3. **Generate a token** with appropriate permissions from your HF settings
-4. **Login** using one of the following methods:
-   ```bash
-   # Option 1: Interactive login
-   huggingface-cli login
-   
-   # Option 2: Set environment variable
-   export HF_TOKEN=your_token_here
-   ```
+- `edm_source/`: the equivariant diffusion backbone (training + MLFF-guided sampling utilities)
+- `elign/`: ELIGN post-training stack (rollout, reward, filtering, FED-GRPO trainer/actor)
 
-### 2. Install FAIRChem Package
+## Table of contents
 
-Install the package for MLFF predictor functionality:
-```bash
-# For rdkit environment (recommended)
-conda create -c conda-forge -n molecular-diffusion rdkit
-conda activate molecular-diffusion
+- [Installation](#installation)
+- [Quick start](#quick-start)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Citation](#citation)
+- [License](#license)
 
-# Install other requirements
-pip install -r e3_diffusion_for_molecules-main/requirements.txt
-```
+## Installation
+
+### 1) Create an environment
+
+Recommended (conda):
 
 ```bash
-cd fairchem_repo
-pip install -e packages/fairchem-core
+conda create -n elign python=3.10 -c conda-forge rdkit
+conda activate elign
+pip install -r requirements.txt
 ```
 
+Notes:
+- RDKit is easiest to install via conda. If you use pip, ensure an RDKit wheel exists for your platform.
+- GPU support depends on your PyTorch install; follow the official PyTorch instructions for your CUDA version.
 
+### 2) (Optional) Install an ML force field backend (UMA via FAIRChem)
 
-## Training a Diffusion Model
+ELIGN’s default reward (`UMAForceReward`) expects `fairchem`:
 
-You can train diffusion models on different molecular datasets:
+- Code path: `edm_source/mlff_modules/mlff_utils.py` imports `fairchem.core.pretrained_mlip`.
 
-### QM9 Dataset
-```bash
-cd e3_diffusion_for_molecules-main
-python main_qm9.py \
-    --n_epochs 3000 \
-    --exp_name edm_qm9 \
-    --n_stability_samples 1000 \
-    --diffusion_noise_schedule polynomial_2 \
-    --diffusion_noise_precision 1e-5 \
-    --diffusion_steps 1000 \
-    --diffusion_loss_type l2 \
-    --batch_size 64 \
-    --nf 256 \
-    --n_layers 9 \
-    --lr 1e-4 \
-    --normalize_factors [1,4,10] \
-    --test_epochs 20 \
-    --ema_decay 0.9999
-```
+Install a compatible FAIRChem package (or build from source) and ensure you can load the UMA predictor in Python.
 
-### GEOM-Drugs Dataset
-```bash
-python main_geom_drugs.py \
-    --n_epochs 3000 \
-    --exp_name edm_geom_drugs \
-    --n_stability_samples 500 \
-    --diffusion_noise_schedule polynomial_2 \
-    --diffusion_steps 1000 \
-    --diffusion_noise_precision 1e-5 \
-    --diffusion_loss_type l2 \
-    --batch_size 64 \
-    --nf 256 \
-    --n_layers 4 \
-    --lr 1e-4 \
-    --normalize_factors [1,4,10] \
-    --test_epochs 1 \
-    --ema_decay 0.9999 \
-    --normalization_factor 1 \
-    --model egnn_dynamics \
-    --visualize_every_batch 10000
-```
+### 3) (Optional) Hugging Face access
 
-### Conditional Generation
-Train a conditional diffusion model for property-specific generation:
-```bash
-python main_qm9.py \
-    --exp_name exp_cond_alpha \
-    --model egnn_dynamics \
-    --lr 1e-4 \
-    --nf 192 \
-    --n_layers 9 \
-    --save_model True \
-    --diffusion_steps 1000 \
-    --sin_embedding False \
-    --n_epochs 3000 \
-    --n_stability_samples 500 \
-    --diffusion_noise_schedule polynomial_2 \
-    --diffusion_noise_precision 1e-5 \
-    --dequantization deterministic \
-    --include_charges False \
-    --diffusion_loss_type l2 \
-    --batch_size 64 \
-    --normalize_factors [1,8,1] \
-    --conditioning alpha \
-    --dataset qm9_second_half
-```
-
-## Running Guidance with MLFF Experiments
-
-### Quick Start
-
-### Manual MLFF Guidance Evaluation
-Run physics-informed molecular generation with MLFF guidance:
+If your MLFF weights require authentication, use one of:
 
 ```bash
-# Basic usage
-python eval_mlff_guided.py --model_path outputs/edm_qm9
-
-# With custom parameters
-python eval_mlff_guided.py \
-    --model_path outputs/edm_qm9 \
-    --n_samples 100 \
-    --mlff_model uma-s-1p1 \
-    --guidance_scale 1.0 \
-    --guidance_steps 10
+huggingface-cli login
+# or
+export HF_TOKEN=...
 ```
 
-### Evaluation Notes
+## Quick start
 
-- RDKit uniqueness during training is computed on grouped rollouts that may share initial noise and skip a diffusion prefix (for example, `share_initial_noise: true`, `skip_prefix: 700`).
-- `eval_verl_rollout.py` defaults to `share_initial_noise=false` and `skip_prefix=0` unless you pass flags, which makes samples more independent and can push uniqueness to ~99%.
+### A) Train the diffusion backbone (EDM-style)
 
-## Key Features
+QM9 example (from repo root):
 
-- **Physics-informed sampling**: Uses MLFF forces to guide coordinate generation
-- **E(3) equivariant architecture**: Maintains rotational and translational equivariance
-- **Flexible guidance**: Adjustable guidance scale for different applications
-- **Multiple datasets**: Supports QM9 and GEOM datasets
-- **Conditional generation**: Generate molecules with specific properties
-
-
-## Project Structure
-
-```
-├── e3_diffusion_for_molecules-main/    # Main project directory
-│   ├── equivariant_diffusion/          # Core diffusion model code
-│   ├── egnn/                           # EGNN implementation
-│   ├── configs/                        # Configuration files
-│   ├── data/                           # Dataset utilities
-│   ├── qm9/                            # QM9-specific code
-│   ├── main_qm9.py                     # QM9 training script
-│   ├── main_geom_drugs.py              # GEOM training script
-│   ├── eval_mlff_guided.py             # MLFF guidance evaluation
-│   ├── mlff_guided_diffusion.py        # MLFF-guided training
-│   ├── quick_start_mlff.py             # Quick start script
-│   └── README_MLFF_GUIDANCE.md         # Detailed MLFF guidance docs
-├── fairchem/                           # FAIRChem integration
-├── uma_notebook.ipynb                  # UMA example notebook
-└── README.md                           # This file
+```bash
+python edm_source/main_qm9.py \
+  --exp_name edm_qm9 \
+  --n_epochs 3000 \
+  --diffusion_steps 1000
 ```
 
-Notes on Batch size:
+GEOM-Drugs example:
 
-```
-Pipeline Flow
-
-DataLoader (EDMDataLoader)
-├─ sample_group_size = G (default 4)                         config: verl_diffusion/trainer/config/ddpo_config.yaml:13
-├─ each_prompt_sample = R (default 128)                      config: verl_diffusion/trainer/config/ddpo_config.yaml:14
-├─ Total prompts per DataProto batch = P = G × R (512)       verl_diffusion/dataloader/dataloader.py:35-134
-└─ Outputs batch_size = [P], nodesxsample, group_index, etc.
-         │
-         ▼
-Rollout.generate_samples                                      verl_diffusion/worker/rollout/edm_rollout.py:100-127
-├─ micro_batch_size = M (default 512)                        config: verl_diffusion/trainer/config/ddpo_config.yaml:18
-├─ num_chunks = ceil(P / M); each chunk has B prompts
-├─ generate_minibatch runs the diffusion sampler on B prompts
-└─ Mapped tensors include latents[B, S, N, D], timesteps[B, S], ...
-         │
-         ▼
-Reward.calculate_rewards (UMA + MLFF)                        verl_diffusion/worker/reward/force.py:492-548
-├─ B from latents shape is the rollout chunk size (prompts in this pass)
-├─ Scheduler picks selected_count diffusion steps per prompt
-├─ Total MLFF evaluations = B × selected_count
-└─ Chunked further by mlff_batch_size = L (default 32)       config: verl_diffusion/trainer/config/ddpo_config.yaml:72
-         │
-         ▼
-Actor.update_policy                                          verl_diffusion/worker/actor/edm_actor.py:426-538
-├─ Receives reward-enriched batch of B prompts
-├─ train_micro_batch_size = T (default 512)                  config: verl_diffusion/trainer/config/ddpo_config.yaml:38
-├─ Splits batch into ceil(B / T) optimizer steps
-└─ Runs PPO-style update (with gradient_accumulation if needed)
+```bash
+python edm_source/main_geom_drugs.py \
+  --exp_name edm_geom_drugs \
+  --n_epochs 3000 \
+  --diffusion_steps 1000
 ```
 
-For example,
-post_train_diffusion.sh (lines 19-63) sets sample_group_size=1 and each_prompt_sample=24, so each dataloader emission holds P = 1 × 24 = 24 prompt trajectories on the GPU.
-No override for dataloader.micro_batch_size, so the default 512 from verl_diffusion/trainer/config/ddpo_config.yaml (line 15) stays active. Because P < 512, the sampler keeps the whole batch together: rollout chunk size B = 24.
-Reward scheduling uses the adaptive policy in verl_diffusion/worker/reward/scheduler.py (lines 17-107) with skip_prefix=700 (script override) and coarse_stride=10, fine_stride=2, threshold_fraction=0.25. For a 1000-step diffusion:
-coarse region: indices 700, 710, 720, 730, 740, 750
-fine region: indices 752 through 998 every 2 steps
-terminal step: 999 appended
-⇒ selected_count = 131 diffusion nodes per prompt.
-MLFF shaping in verl_diffusion/worker/reward/force.py (lines 492-544) therefore flattens B × selected_count = 24 × 131 = 3144 evaluations. With mlff_batch_size=16 (script override), the loop runs ceil(3144 / 16) = 197 UMA force calls.
-PPO training splits the same 24 samples via train_micro_batch_size=4 (post_train_diffusion.sh (line 27), consumed in verl_diffusion/worker/actor/edm_actor.py (lines 499-523)) into exactly 6 optimizer mini-batches per rollout epoch.
+See `edm_source/README.md` for more details on the backbone code.
+
+### B) Post-train with ELIGN (FED-GRPO)
+
+ELIGN post-training is configured with Hydra YAMLs under `elign/trainer/config/`.
+
+Minimal smoke test (no MLFF required):
+
+```bash
+python run_elign.py \
+  --config-name fed_grpo_config \
+  reward.type=dummy \
+  wandb.enabled=false \
+  dataloader.epoches=2 \
+  dataloader.sample_group_size=2 \
+  dataloader.each_prompt_sample=4 \
+  model.time_step=50
+```
+
+QM9 post-training with UMA rewards (requires FAIRChem/UMA):
+
+```bash
+torchrun --standalone --nproc_per_node=1 run_elign.py \
+  --config-name fed_grpo_qm9_energy_force_group4x6 \
+  save_path=outputs/elign/qm9/my_run \
+  wandb.enabled=false
+```
+
+### C) Evaluate a post-trained checkpoint
+
+1) Sample rollouts:
+
+```bash
+python eval_elign_rollout.py \
+  --run-dir outputs/elign/qm9/my_run \
+  --num-molecules 1024 \
+  --output outputs/elign/qm9/my_run/eval_rollouts.pt
+```
+
+2) Compute metrics (RDKit + stability + optional MLFF forces/energies):
+
+```bash
+python compute_elign_metrics.py \
+  --run-dir outputs/elign/qm9/my_run \
+  --samples outputs/elign/qm9/my_run/eval_rollouts.pt \
+  --output outputs/elign/qm9/my_run/eval_metrics.json
+```
+
+## Repository layout
+
+```
+.
+├── edm_source/                 # Equivariant diffusion backbone (EDM-style)
+│   ├── equivariant_diffusion/  # Diffusion model + samplers
+│   ├── egnn/                   # EGNN layers
+│   ├── qm9/                    # QM9 dataset + metrics
+│   └── mlff_modules/           # MLFF guidance utilities
+├── elign/                      # ELIGN post-training stack
+│   ├── dataloader/             # Grouped rollout batch construction
+│   ├── model/                  # EDM wrapper helpers (policy logprob, masks, ...)
+│   ├── trainer/                # FED-GRPO trainer + Hydra configs
+│   ├── worker/                 # rollout / reward / actor / filters
+│   └── utils/                  # RDKit metrics + tensor utilities
+├── pretrained/                 # Example pretrained EDM weights (optional)
+├── docs/                       # Extended documentation
+├── run_elign.py                # ELIGN + FED-GRPO entrypoint (Hydra)
+├── eval_elign_rollout.py       # Generate samples from a trained ELIGN policy
+└── compute_elign_metrics.py    # Compute metrics over sampled rollouts
+```
+
+## Documentation
+
+Start here:
+
+- `docs/installation.md`
+- `docs/elign_posttraining.md`
+- `docs/fed_grpo.md`
+- `docs/paper_code_map.md`
+- `docs/evaluation.md`
+- `docs/config_reference.md`
+
+Backbone docs (upstream EDM-style code):
+
+- `edm_source/README.md`
+- `edm_source/README_MLFF_GUIDANCE.md`
+
+## Citation
+
+If you use ELIGN/FED-GRPO in your work, please cite:
+
+- ELIGN (this repo)
+- the upstream EDM / E(3)-diffusion work (see `edm_source/LICENSE` and `edm_source/README.md`)
+
+A `CITATION.cff` file is provided in the repo root.
+
+## License
+
+- ELIGN post-training code (`elign/`) is released under Apache-2.0 (see `LICENSE`).
+- The diffusion backbone under `edm_source/` includes MIT-licensed components (see `edm_source/LICENSE`).

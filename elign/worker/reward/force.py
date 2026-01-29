@@ -25,9 +25,9 @@ def _is_main_process() -> bool:
 def _tqdm_enabled() -> bool:
     """Enable tqdm progress bars only when explicitly requested.
 
-    Set `VERL_TQDM=1` to turn them on.
+    Set `ELIGN_TQDM=1` to turn them on.
     """
-    value = os.environ.get("VERL_TQDM", "").strip().lower()
+    value = os.environ.get("ELIGN_TQDM", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 from edm_source.qm9.analyze import check_stability
@@ -36,7 +36,7 @@ from edm_source.qm9 import bond_analyze as qm9_bond_analyze
 from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
 from edm_source.mlff_modules.mlff_utils import get_mlff_predictor
 
-from verl_diffusion.protocol import DataProto, TensorDict
+from elign.protocol import DataProto, TensorDict
 from .scheduler import RewardScheduler
 
 
@@ -214,6 +214,15 @@ class UMAForceReward(BaseReward):
         self.shaping_cfg = shaping or {}
         self.shaping_enabled = bool(self.shaping_cfg.get("enabled", False))
         self.shaping_gamma = float(self.shaping_cfg.get("gamma", 1.0))
+        shaping_mode = str(self.shaping_cfg.get("mode", "delta") or "delta").lower()
+        if shaping_mode in {"pbrs", "return_to_go", "pbrs_return_to_go", "paper"}:
+            shaping_mode = "pbrs_return_to_go"
+        if shaping_mode not in {"delta", "pbrs_return_to_go"}:
+            raise ValueError(
+                f"Unsupported shaping.mode '{self.shaping_cfg.get('mode')}'. "
+                "Use 'delta' (legacy) or 'pbrs_return_to_go' (paper Eq. 4)."
+            )
+        self.shaping_mode = shaping_mode
         default_skip_prefix = int(self.shaping_cfg.get("skip_prefix", 0))
         # Option to shape only with energy while keeping force+energy terminals intact.
         self.shaping_energy_only = bool(self.shaping_cfg.get("only_energy_reshape", False))
@@ -399,6 +408,7 @@ class UMAForceReward(BaseReward):
     def calculate_rewards(self, data: DataProto) -> DataProto:
         if self.device.type == "cuda":
             torch.cuda.set_device(self.device)
+        meta_info = data.meta_info.copy()
         processed = self.process_data(data)
 
         z = processed["z"].to(self.device)
@@ -466,6 +476,7 @@ class UMAForceReward(BaseReward):
             )
             schedule_indices = schedule.indices.to(latents.device)
             interval_steps = schedule.intervals.to(latents.device)
+            meta_info["reward_schedule_indices"] = schedule_indices.detach().cpu().tolist()
             alignment_active = bool(data.meta_info.get("force_alignment_enabled", False))
             if alignment_active:
                 fine_mask_selected = schedule.fine_mask.to(latents.device)
@@ -570,18 +581,6 @@ class UMAForceReward(BaseReward):
             else:
                 force_vectors_selected = None
 
-            force_rewards = F_force[:, S - 1]
-            if self.use_energy:
-                energy_rewards = F_energy[:, S - 1]
-            else:
-                energy_rewards = torch.zeros_like(force_rewards)
-
-            shaped_force = torch.zeros_like(F_force)
-            shaped_energy = torch.zeros_like(F_force)
-            # Potential shaping on a scheduled subset of diffusion steps:
-            #   delta(t_k) = gamma^Δt * F(t_{k+1}) - F(t_k)
-            # We store these deltas in the per-timestep traces and separately overwrite the
-            # terminal column with the terminal reward so PPO sees it exactly once.
             selected_count = int(schedule_indices.numel())
             if selected_count > 0:
                 last_idx = schedule_indices[-1]
@@ -589,6 +588,25 @@ class UMAForceReward(BaseReward):
                 if self.use_energy and F_energy is not None:
                     terminal_energy_metric = F_energy[:, last_idx]
 
+            # Terminal rewards are always computed from the terminal z0 prediction (decode frame).
+            # In PBRS mode, intermediate *energy potentials* are returned separately and the trainer
+            # computes the return-to-go per Eq. (4) in the paper.
+            if terminal_force_metric is not None:
+                force_rewards = terminal_force_metric
+            else:
+                force_rewards = torch.zeros(batch_size, device=self.device)
+            if self.use_energy and terminal_energy_metric is not None:
+                energy_rewards = terminal_energy_metric
+            else:
+                energy_rewards = torch.zeros_like(force_rewards)
+
+            if self.shaping_mode == "delta":
+                shaped_force = torch.zeros_like(F_force)
+                shaped_energy = torch.zeros_like(F_force)
+                # Potential shaping on a scheduled subset of diffusion steps:
+                #   delta(t_k) = gamma^Δt * F(t_{k+1}) - F(t_k)
+                # We store these deltas in the per-timestep traces and separately overwrite the
+                # terminal column with the terminal reward so PPO sees it exactly once.
                 if selected_count > 1:
                     idx_current = schedule_indices[:-1]
                     idx_next = schedule_indices[1:]
@@ -602,46 +620,61 @@ class UMAForceReward(BaseReward):
                     if not self.shaping_energy_only:
                         force_current = torch.index_select(F_force, 1, idx_current)
                         force_next = torch.index_select(F_force, 1, idx_next)
-                        shaped_vals = (
-                            gamma_factor.unsqueeze(0) * force_next - force_current
-                        )
+                        shaped_vals = gamma_factor.unsqueeze(0) * force_next - force_current
                         shaped_force.index_copy_(1, idx_current, shaped_vals)
 
                     if self.use_energy and F_energy is not None:
                         energy_current = torch.index_select(F_energy, 1, idx_current)
                         energy_next = torch.index_select(F_energy, 1, idx_next)
-                        shaped_energy_vals = (
-                            gamma_factor.unsqueeze(0) * energy_next - energy_current
-                        )
+                        shaped_energy_vals = gamma_factor.unsqueeze(0) * energy_next - energy_current
                         shaped_energy.index_copy_(1, idx_current, shaped_energy_vals)
 
-            weighted_shaped_force = self.force_weight * shaped_force
-            weighted_shaped_energy = (
-                self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
-            )
+                weighted_shaped_force = self.force_weight * shaped_force
+                weighted_shaped_energy = (
+                    self.energy_weight * shaped_energy if self.use_energy else torch.zeros_like(shaped_force)
+                )
 
-            if last_idx is not None:
-                if terminal_force_metric is not None:
-                    terminal_force_weighted = self.force_weight * self.terminal_reward_weight * terminal_force_metric
+                if last_idx is not None:
+                    if terminal_force_metric is not None:
+                        terminal_force_weighted = (
+                            self.force_weight * self.terminal_reward_weight * terminal_force_metric
+                        )
+                    else:
+                        terminal_force_weighted = None
+                    if self.use_energy and terminal_energy_metric is not None:
+                        terminal_energy_weighted = (
+                            self.energy_weight * self.terminal_reward_weight * terminal_energy_metric
+                        )
+                    else:
+                        terminal_energy_weighted = None
+
+                rewards_ts = weighted_shaped_force + weighted_shaped_energy
+                force_rewards_ts = shaped_force.clone()
+                if self.use_energy:
+                    energy_rewards_ts = shaped_energy.clone()
+
+                if last_idx is not None:
+                    if terminal_force_metric is not None:
+                        rewards_ts[:, last_idx] = terminal_force_weighted
+                        force_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_force_metric
+                    if terminal_energy_metric is not None and energy_rewards_ts is not None:
+                        rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + terminal_energy_weighted
+                        energy_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_energy_metric
+            else:
+                # Paper-aligned PBRS mode:
+                # - Expose energy potentials Ψ_t = -E_ϕ(ẑ_{0|t}) over the scheduled indices (plus Ψ_0 at terminal).
+                # - Keep force reward terminal-only (no force PBRS).
+                #
+                # The trainer converts these into per-step returns-to-go:
+                #   G_t^(E) = γ^t Ψ_0 - Ψ_t   (Eq. 4 in the paper)
+                # and broadcasts the terminal force advantage across diffusion steps (Alg. 1).
+                rewards_ts = None
+                if last_idx is not None:
+                    force_rewards_ts = torch.zeros_like(F_force)
+                    force_rewards_ts[:, last_idx] = terminal_force_metric
                 else:
-                    terminal_force_weighted = None
-                if self.use_energy and terminal_energy_metric is not None:
-                    terminal_energy_weighted = self.energy_weight * self.terminal_reward_weight * terminal_energy_metric
-                else:
-                    terminal_energy_weighted = None
-
-            rewards_ts = weighted_shaped_force + weighted_shaped_energy
-            force_rewards_ts = shaped_force.clone()
-            if self.use_energy:
-                energy_rewards_ts = shaped_energy.clone()
-
-            if last_idx is not None:
-                if terminal_force_metric is not None:
-                    rewards_ts[:, last_idx] = terminal_force_weighted
-                    force_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_force_metric
-                if terminal_energy_metric is not None and energy_rewards_ts is not None:
-                    rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + terminal_energy_weighted
-                    energy_rewards_ts[:, last_idx] = self.terminal_reward_weight * terminal_energy_metric
+                    force_rewards_ts = None
+                energy_rewards_ts = F_energy if self.use_energy else None
 
             if alignment_active and force_vectors_selected is not None and fine_mask_selected is not None:
                 schedule_indices_cpu = (
@@ -916,7 +949,7 @@ class UMAForceReward(BaseReward):
         # Atom-level shaping: penalize the fraction of atoms that violate the simple valence rules.
         #
         # Why this exists:
-        # - `check_stability` is binary at the molecule level. Under GRPO/DDPO group normalization,
+        # - `check_stability` is binary at the molecule level. Under FED-GRPO group normalization,
         #   if a whole prompt group is unstable, the binary term becomes a constant and provides
         #   no within-group learning signal.
         # - `atom_stability` provides a *graded* notion of how close a sample is to full stability,
@@ -995,13 +1028,14 @@ class UMAForceReward(BaseReward):
         # Populate final fields
         if rewards_ts is not None:
             result["rewards_ts"] = rewards_ts.detach().cpu()
+        if force_rewards_ts is not None:
             result["force_rewards_ts"] = force_rewards_ts.detach().cpu()
-            if self.use_energy and energy_rewards_ts is not None:
-                result["energy_rewards_ts"] = energy_rewards_ts.detach().cpu()
-            if terminal_force_metric is not None:
-                result["force_terminal_metric"] = terminal_force_metric.detach().cpu()
-            if terminal_energy_metric is not None:
-                result["energy_terminal_metric"] = terminal_energy_metric.detach().cpu()
+        if self.use_energy and energy_rewards_ts is not None:
+            result["energy_rewards_ts"] = energy_rewards_ts.detach().cpu()
+        if terminal_force_metric is not None:
+            result["force_terminal_metric"] = terminal_force_metric.detach().cpu()
+        if terminal_energy_metric is not None:
+            result["energy_terminal_metric"] = terminal_energy_metric.detach().cpu()
 
         result["rewards"] = total_rewards.detach().cpu()
         result["force_rewards"] = force_rewards.detach().cpu()
@@ -1024,4 +1058,4 @@ class UMAForceReward(BaseReward):
 
         if self.is_main_process:
             print("Rewards calculated via UMAForceReward")
-        return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=data.meta_info.copy())
+        return DataProto(batch=TensorDict(result, batch_size=[batch_size]), meta_info=meta_info)

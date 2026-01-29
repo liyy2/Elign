@@ -1,0 +1,10 @@
+ELIGN: Post-training Equivariant Diffusion Models with FED-GRPO
+
+This repository includes third-party components under their respective licenses:
+
+- `edm_source/` contains MIT-licensed code originally developed by Emiel Hoogeboom,
+  Victor Garcia Satorras, and Clément Vignac. See `edm_source/LICENSE`.
+- Parts of the ELIGN post-training stack (`elign/`) include Apache-2.0 licensed components
+  derived from the VERL project (copyright 2024 Bytedance Ltd. and/or its affiliates),
+  with modifications for ELIGN/FED-GRPO.
+

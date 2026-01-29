@@ -1,11 +1,11 @@
 defaults:
-  - ddpo_geom_config
+  - fed_grpo_geom_config
   - _self_
 
-# GEOM RL (DDPO/GRPO) tuned for validity × uniqueness.
+# GEOM RL (FED-GRPO) tuned for validity × uniqueness.
 #
 # Key ideas:
-# - Use shared-prefix sampling (DanceGRPO-style) and train only on the suffix.
+# - Use shared-prefix sampling (paper Algorithm 1) and train only on the suffix.
 #   This dramatically reduces compute for large groups while keeping PPO updates focused
 #   on the low-noise steps that determine final chemistry.
 # - Optimize directly for RDKit validity and batch uniqueness via penalties + reward gating.

@@ -9,11 +9,11 @@ from typing import Any, Dict, List
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run eval_verl_rollout.py + compute_verl_metrics.py for multiple seeds and aggregate "
+            "Run eval_elign_rollout.py + compute_elign_metrics.py for multiple seeds and aggregate "
             "RDKit validity/uniqueness/novelty + stability metrics."
         )
     )
-    parser.add_argument("--run-dir", type=str, required=True, help="VERL run directory.")
+    parser.add_argument("--run-dir", type=str, required=True, help="ELIGN run directory.")
     parser.add_argument(
         "--checkpoint",
         type=str,
@@ -60,7 +60,7 @@ def parse_args() -> argparse.Namespace:
         "--repair-invalid",
         action="store_true",
         help=(
-            "If set, compute_verl_metrics.py will run an UMA-based repair step on RDKit-invalid samples "
+            "If set, compute_elign_metrics.py will run an UMA-based repair step on RDKit-invalid samples "
             "before computing metrics. This typically improves RDKit validity without touching already-valid molecules."
         ),
     )
@@ -116,7 +116,7 @@ def main() -> None:
         subprocess.check_call(
             [
                 sys.executable,
-                "eval_verl_rollout.py",
+                "eval_elign_rollout.py",
                 "--run-dir",
                 str(run_dir),
                 "--args-pickle",
@@ -136,7 +136,7 @@ def main() -> None:
 
         metrics_cmd = [
             sys.executable,
-            "compute_verl_metrics.py",
+            "compute_elign_metrics.py",
             "--run-dir",
             str(run_dir),
             "--samples",

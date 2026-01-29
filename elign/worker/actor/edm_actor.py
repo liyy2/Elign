@@ -3,8 +3,8 @@ import os
 from typing import Callable, Dict, Optional
 from tqdm import tqdm as tq
 from collections import defaultdict
-from verl_diffusion.protocol import DataProto
-from verl_diffusion.utils.torch_functional import (
+from elign.protocol import DataProto
+from elign.utils.torch_functional import (
     get_constant_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
     get_wsd_schedule_with_warmup,
@@ -19,9 +19,9 @@ import torch.distributed as dist
 def _tqdm_enabled() -> bool:
     """Enable tqdm progress bars only when explicitly requested.
 
-    Set `VERL_TQDM=1` to turn them on.
+    Set `ELIGN_TQDM=1` to turn them on.
     """
-    value = os.environ.get("VERL_TQDM", "").strip().lower()
+    value = os.environ.get("ELIGN_TQDM", "").strip().lower()
     return value in {"1", "true", "yes", "on"}
 
 
@@ -83,7 +83,7 @@ class EDMActor(BaseActor):
         scheduler_cfg = {}
         if isinstance(shaping_cfg, dict):
             scheduler_cfg = shaping_cfg.get("scheduler", {}) or {}
-        # The reward shaper mirrors DanceGRPO's API: allow a global skip prefix
+        # Shared-prefix training: allow a global skip prefix (paper: shared prefix cache),
         # with optional per-scheduler overrides. Normalize everything to an int.
         skip_default = shaping_cfg.get("skip_prefix", 0) if isinstance(shaping_cfg, dict) else 0
         skip_value = scheduler_cfg.get("skip_prefix", skip_default)
@@ -284,9 +284,8 @@ class EDMActor(BaseActor):
             if step_condition:
                 current_lr = self.optimizer.param_groups[0]["lr"]
                 if self.max_grad_norm is not None and self.max_grad_norm > 0:
-                    # Clip gradients once per optimizer step, matching DanceGRPO's
-                    # accumulate-then-clip pattern instead of clipping after every
-                    # micro batch.
+                    # Clip gradients once per optimizer step (after accumulation) instead of
+                    # clipping after every micro batch.
                     clip_grad_norm_(
                         self.model.parameters(),
                         max_norm=float(self.max_grad_norm),

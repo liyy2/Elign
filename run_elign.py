@@ -5,7 +5,6 @@ import sys
 from typing import Dict, Optional
 
 import numpy as np
-import ray
 import torch
 import torch.distributed as dist
 from torch.distributions.categorical import Categorical
@@ -14,7 +13,7 @@ from hydra import main as hydra_main
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-from verl_diffusion.trainer.ddpo_trainer import DDPOTrainer
+from elign.trainer.fed_grpo_trainer import FedGrpoTrainer
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 EDM_SOURCE_ROOT = os.path.join(REPO_ROOT, "edm_source")
@@ -26,13 +25,13 @@ from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
 from edm_source.qm9.models import get_model
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
-from verl_diffusion.dataloader.dataloader import EDMDataLoader
-from verl_diffusion.model.edm_model import EDMModel
-from verl_diffusion.worker.actor.edm_actor import EDMActor
-from verl_diffusion.worker.filter.filter import Filter
-from verl_diffusion.worker.reward.dummy import DummyReward
-from verl_diffusion.worker.reward.force import UMAForceReward
-from verl_diffusion.worker.rollout.edm_rollout import EDMRollout
+from elign.dataloader.dataloader import EDMDataLoader
+from elign.model.edm_model import EDMModel
+from elign.worker.actor.edm_actor import EDMActor
+from elign.worker.filter.filter import Filter
+from elign.worker.reward.dummy import DummyReward
+from elign.worker.reward.force import UMAForceReward
+from elign.worker.rollout.edm_rollout import EDMRollout
 
 os.environ.setdefault("WANDB_MODE", "online")
 
@@ -80,9 +79,9 @@ def _make_absolute(path_value: Optional[str]) -> Optional[str]:
     return to_absolute_path(path_value)
 
 
-@hydra_main(config_path="verl_diffusion/trainer/config", config_name="ddpo_config", version_base=None)
+@hydra_main(config_path="elign/trainer/config", config_name="fed_grpo_config", version_base=None)
 def main(cfg: DictConfig) -> None:
-    """Entry point for DDPO training managed by Hydra."""
+    """Entry point for ELIGN post-training via FED-GRPO (Hydra-managed)."""
 
     dist_state = _setup_distributed()
     is_main_process = dist_state["rank"] == 0
@@ -310,18 +309,7 @@ def main(cfg: DictConfig) -> None:
     )
     actor = EDMActor(model, config)
 
-    ray_cfg = config.get("ray", {})
-    ray_enabled = False
-    if isinstance(ray_cfg, dict):
-        ray_enabled = bool(ray_cfg.get("enabled", False))
-    elif ray_cfg:
-        ray_enabled = True
-
-    if ray_enabled and is_main_process and not ray.is_initialized():
-        ray.init()
-        print("Ray initialized")
-
-    trainer = DDPOTrainer(
+    trainer = FedGrpoTrainer(
         config=config,
         model=model,
         dataset_info=dataset_info,
@@ -334,7 +322,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     if is_main_process:
-        print("DDPO Trainer initialized")
+        print("FED-GRPO trainer initialized (ELIGN post-training)")
 
     try:
         if is_main_process:

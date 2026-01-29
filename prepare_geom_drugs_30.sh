@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-# Build the full GEOM-Drugs conformations array used by the EDM/VERL pipelines.
+# Build the full GEOM-Drugs conformations array used by the EDM/ELIGN pipelines.
 #
 # Outputs (under $DATA_DIR):
 #   - geom_drugs_30.npy         # [num_atoms_total, 5] rows: [mol_id, atomic_number, x, y, z]

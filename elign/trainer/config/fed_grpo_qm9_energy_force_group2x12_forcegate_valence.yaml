@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_forcegate_stability
+  - fed_grpo_qm9_energy_force_group4x6_forcegate_stability
   - _self_
 
 # QM9 energy+force post-training with a larger GRPO group and an explicit valence (under-bond) penalty.

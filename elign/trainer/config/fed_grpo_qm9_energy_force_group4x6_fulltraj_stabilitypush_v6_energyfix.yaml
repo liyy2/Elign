@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - fed_grpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
   - _self_
 
 # v6: fix the MLFF energy transform when `energy_normalize_by_atoms=true`.

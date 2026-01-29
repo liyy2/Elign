@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_stronger
+  - fed_grpo_qm9_energy_force_group4x6_valence_overbond_fulltraj_stronger
   - _self_
 
 # Adds sigmoid-smoothed valence shaping on top of the discrete under/over-bond penalties.

@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_geom_force_vxu_suffix
+  - fed_grpo_geom_force_vxu_suffix
   - _self_
 
 # Phase 2: add UMA energies (per-atom normalized) on top of the force objective.

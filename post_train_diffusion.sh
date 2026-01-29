@@ -1,19 +1,10 @@
-#!/bin/bash
-#SBATCH --job-name=exp_cond_alpha
-#SBATCH --output=exp_cond_alpha_%j.out
-#SBATCH --error=exp_cond_alpha_%j.err
-#SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
-#SBATCH --time=48:00:00
-#SBATCH --gres=gpu:1
-#SBATCH --partition=gpu_h200
-#SBATCH --mail-type=ALL
-#SBATCH --mail-user=yunyang.li@yale.edu
+#!/usr/bin/env bash
 
-module load miniconda
-eval "$(conda shell.bash hook)"
-conda activate edm
+set -euo pipefail
+
+# Optional: activate your environment here (conda/venv).
+# Example:
+#   conda activate molecular-diffusion
 
 sanitize_for_name() {
   local value="$1"
@@ -23,8 +14,8 @@ sanitize_for_name() {
   echo "${value}"
 }
 
-# Optional resume from a DDPO checkpoint.
-# NOTE: DDPOTrainer only loads `checkpoint_path` when `resume=true`.
+# Optional resume from a FED-GRPO checkpoint.
+# NOTE: FedGrpoTrainer only loads `checkpoint_path` when `resume=true`.
 CHECKPOINT_PATH="${CHECKPOINT_PATH:-}"
 declare -a RESUME_FLAGS=()
 if [[ -n "${CHECKPOINT_PATH}" ]]; then
@@ -95,7 +86,7 @@ MODEL_TAG=$(sanitize_for_name "${MLFF_MODEL}")
 NOVELTY_PENALTY_TAG=$(sanitize_for_name "${ENABLE_NOVELTY_PENALTY}")
 NOVELTY_PENALTY_SCALE_TAG=$(sanitize_for_name "${NOVELTY_PENALTY_SCALE}")
 
-RUN_NAME_BASE="verl_model_${MODEL_TAG}\
+RUN_NAME_BASE="elign_${MODEL_TAG}\
 _energy_$(sanitize_for_name "${ENERGY_TAG}")\
 _lr_$(sanitize_for_name "${LEARNING_RATE}")\
 _pps_$(sanitize_for_name "${EACH_PROMPT_SAMPLE}")\
@@ -110,7 +101,7 @@ _novpen_scale_${NOVELTY_PENALTY_SCALE_TAG}\
 _epoch_per_rollout_$(sanitize_for_name "${EPOCH_PER_ROLLOUT}")"
 
 RUN_NAME="${RUN_NAME_BASE}_${timestamp}"
-SAVE_ROOT="/home/yl2428/logs"
+SAVE_ROOT="${SAVE_ROOT:-outputs/elign}"
 SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
 
 mkdir -p "${SAVE_PATH}"
@@ -132,8 +123,8 @@ else
 fi
 
 # Launch training
-torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py \
-  --config-name ddpo_qm9_energy_force_group4x6 \
+torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_elign.py \
+  --config-name fed_grpo_qm9_energy_force_group4x6 \
   wandb.enabled=true \
   wandb.wandb_name="${RUN_NAME}" \
   save_path="${SAVE_PATH}" \

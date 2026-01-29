@@ -12,6 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .protocol import DataProto
+"""ELIGN post-training stack for equivariant diffusion models.
 
+ELIGN uses FED-GRPO (Force and Energy Disentangled Group Relative Policy Optimization) to post-train
+the reverse diffusion policy using physics-inspired rewards (e.g., ML force fields).
+"""
+
+from .protocol import DataProto
 

@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
+  - fed_grpo_qm9_energy_force_group4x6_fulltraj_stabilitypush_v2
   - _self_
 
 # v5: oversample hard (small) molecule sizes during RL rollouts to improve QM9 `check_stability`.

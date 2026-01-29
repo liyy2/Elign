@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 
-from verl_diffusion.protocol import DataProto
+from elign.protocol import DataProto
 
 __all__ = ["BaseRollout"]
 

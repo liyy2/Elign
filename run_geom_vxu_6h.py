@@ -13,7 +13,7 @@ import torch
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Run GEOM VERL/DDPO experiments focused on RDKit validity×uniqueness.\n"
+            "Run GEOM ELIGN/FED-GRPO experiments focused on RDKit validity×uniqueness.\n"
             "Phase 1 (experiment A): force-only (suffix-only shared-prefix rollouts).\n"
             "Phase 2 (experiment B): energy+force (resume from phase 1 best checkpoint).\n"
             "Each phase has its own max-hour budget (defaults to 6h each)."
@@ -22,9 +22,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--phase1-hours", type=float, default=6.0)
     parser.add_argument("--phase2-hours", type=float, default=6.0)
     parser.add_argument("--check-minutes", type=float, default=30.0)
-    parser.add_argument("--phase1-config", type=str, default="ddpo_geom_force_vxu_suffix")
-    parser.add_argument("--phase2-config", type=str, default="ddpo_geom_energy_force_vxu_suffix")
-    parser.add_argument("--out-root", type=str, default="outputs/verl/geom_vxu")
+    parser.add_argument("--phase1-config", type=str, default="fed_grpo_geom_force_vxu_suffix")
+    parser.add_argument("--phase2-config", type=str, default="fed_grpo_geom_energy_force_vxu_suffix")
+    parser.add_argument("--out-root", type=str, default="outputs/elign/geom_vxu")
     parser.add_argument("--run-name", type=str, default=None)
     return parser.parse_args()
 
@@ -86,7 +86,7 @@ def run_phase(
 
     cmd = [
         "python",
-        "run_verl_diffusion.py",
+        "run_elign.py",
         "--config-name",
         config_name,
         f"save_path={str(run_dir)}",

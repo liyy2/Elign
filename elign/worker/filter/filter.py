@@ -5,7 +5,7 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 
-from verl_diffusion.protocol import DataProto
+from elign.protocol import DataProto
 
 class Filter:
     def __init__(
@@ -73,8 +73,8 @@ class Filter:
     def _add_terminal_penalty(data: DataProto, penalty: torch.Tensor) -> None:
         """Add a per-sample terminal penalty across reward tensors.
 
-        Notes on GRPO/DDPO implementation:
-        - When both force+energy reward tensors exist, DDPOTrainer computes advantages from
+        Notes on FED-GRPO implementation:
+        - When both force+energy reward tensors exist, FedGrpoTrainer computes advantages from
           `force_rewards(_ts)` / `energy_rewards(_ts)` and ignores `rewards(_ts)` for learning.
         - Penalizing only the scalar `rewards` is therefore insufficient when the trainer is using
           separate force/energy channels. To keep the penalty effective regardless of which reward
@@ -129,7 +129,7 @@ class Filter:
                 "RDKit is required for filters.enable_filtering / filters.enable_penalty / RDKit validity logging."
             ) from exc
 
-        from verl_diffusion.utils.rdkit_metrics import graph_largest_fragment_smiles
+        from elign.utils.rdkit_metrics import graph_largest_fragment_smiles
 
         processed_list = self.process_data(data)
         all_smiles: List[Optional[str]] = []
@@ -276,7 +276,7 @@ class Filter:
 
         # Optional: penalize duplicates within the rollout batch (helps avoid mode collapse).
         #
-        # Implementation detail: when `enable_filtering=true`, DDPO keeps only one representative
+        # Implementation detail: when `enable_filtering=true`, FED-GRPO keeps only one representative
         # per unique SMILES. In that setting, assigning a small per-sample penalty to *all*
         # duplicates would mostly be dropped along with the filtered samples. To ensure PPO
         # actually "sees" collapse, we instead apply the full duplicate cost to the kept sample:

@@ -3,7 +3,7 @@ from typing import Optional
 
 import numpy as np
 import torch
-from verl_diffusion.protocol import DataProto, TensorDict
+from elign.protocol import DataProto, TensorDict
 
 class EDMDataLoader:
     def __init__(

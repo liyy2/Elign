@@ -1,5 +1,5 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_valence
+  - fed_grpo_qm9_energy_force_group4x6_valence
   - _self_
 
 # QM9 post-training config that targets the dominant stability gap:

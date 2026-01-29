@@ -1,4 +1,4 @@
-from verl_diffusion.protocol import DataProto, TensorDict
+from elign.protocol import DataProto, TensorDict
 from .base import BaseRollout
 import torch
 import queue

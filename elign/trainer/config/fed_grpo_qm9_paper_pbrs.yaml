@@ -1,0 +1,76 @@
+defaults:
+  - fed_grpo_config
+  - _self_
+
+# Paper-aligned QM9 post-training config (Elign / ICML 2026).
+#
+# Uses:
+# - Shared-prefix grouped sampling (Alg. 1 line 3)
+# - Energy PBRS return-to-go (Eq. 4) + terminal force reward (Eq. 2)
+# - Force/energy disentangled group normalization (FED-GRPO)
+#
+# Notes:
+# - The paper reports skip_prefix in {600, 700} and energy weight in {0.05, 0.1}.
+# - In this repo, `model.skip_prefix` controls shared-prefix sampling (how many reverse transitions
+#   are shared/skipped before PPO updates). The reward scheduler should use the same value.
+
+dataloader:
+  # 4 prompts × 24 samples each = 96 rollouts per iteration (Table 4).
+  sample_group_size: 4
+  each_prompt_sample: 24
+  micro_batch_size: 96
+
+model:
+  share_initial_noise: true
+  skip_prefix: 600
+
+train:
+  # Table 4: learning rate in [2e-7, 4e-6], clip_range=2e-3, KL weight=0.04.
+  learning_rate: 4.0e-6
+  clip_range: 2.0e-3
+  kl_penalty_weight: 0.04
+  # Table 4: train micro batch size = 4 (per optimizer step).
+  train_micro_batch_size: 4
+  epoch_per_rollout: 1
+  # The paper does not include the optional "force_alignment" regularizer; disable by default.
+  force_alignment_enabled: false
+  force_alignment_weight: 0.0
+  scheduler:
+    name: cosine
+    warmup_steps: 60
+    total_steps: 1500
+    min_lr_ratio: 0.3
+
+reward:
+  mlff_model: uma-m-1p1
+  use_energy: true
+  force_aggregation: rms
+  # Energy normalization: formation energy per atom (paper Section 3.1).
+  energy_normalize_by_atoms: true
+  energy_atom_refs: omol
+  # Keep energy in "native" normalized units (group normalization happens in FED-GRPO).
+  energy_transform_offset: 0.0
+  energy_transform_scale: 1.0
+  energy_transform_clip: null
+  # Table 4: weight_energy in {0.05, 0.1}, weight_force=1.
+  energy_adv_weight: 0.1
+  force_adv_weight: 1.0
+  shaping:
+    enabled: true
+    mode: pbrs_return_to_go
+    gamma: 1.0
+    # Paper: force PBRS was found unstable; keep force reward terminal-only.
+    only_energy_reshape: true
+    # Table 4: MLFF batch size = 8.
+    mlff_batch_size: 8
+    # Not used by `pbrs_return_to_go`, but keep explicit.
+    terminal_weight: 1.0
+    scheduler:
+      mode: uniform
+      skip_prefix: 600
+      uniform_stride: 1
+      include_terminal: true
+
+wandb:
+  enabled: false
+

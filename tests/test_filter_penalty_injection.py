@@ -2,8 +2,8 @@ import unittest
 
 import torch
 
-from verl_diffusion.protocol import DataProto, TensorDict
-from verl_diffusion.worker.filter.filter import Filter
+from elign.protocol import DataProto, TensorDict
+from elign.worker.filter.filter import Filter
 
 
 class TestFilterPenaltyInjection(unittest.TestCase):
@@ -40,4 +40,3 @@ class TestFilterPenaltyInjection(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

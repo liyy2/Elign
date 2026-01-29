@@ -1,6 +1,6 @@
 import torch
-from verl_diffusion.dataloader.dataloader import EDMDataLoader
-from verl_diffusion.protocol import DataProto, TensorDict
+from elign.dataloader.dataloader import EDMDataLoader
+from elign.protocol import DataProto, TensorDict
 
 class SequentialDataLoader(EDMDataLoader):
     def __init__(self, config, dataset_info, nodes_dist, prop_dist, device, condition=False, num_batches=None):

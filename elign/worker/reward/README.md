@@ -1,6 +1,6 @@
-# Reward computation (QM9 VERL / DDPO)
+# Reward computation (ELIGN / FED-GRPO)
 
-This directory contains reward implementations used during VERL post-training.
+This directory contains reward implementations used during ELIGN post-training (optimized with FED-GRPO).
 
 The main one for QM9 is `UMAForceReward` in `force.py`, which scores sampled molecules with an
 ML force field (UMA) using:
@@ -88,15 +88,24 @@ signal that helps reduce the RDKit-valid-but-unstable tail without changing eval
 
 ## Reward shaping mode (optional)
 
-When `reward.shaping.enabled=true`, `UMAForceReward` also emits per-diffusion-step reward traces:
-`force_rewards_ts` and (optionally) `energy_rewards_ts`.
+When `reward.shaping.enabled=true`, `UMAForceReward` can emit per-diffusion-step traces.
 
-The trainer uses these traces to compute per-step GRPO-style advantages (see below). In practice,
-shaping can be noisier because it requires many MLFF evaluations on intermediate diffusion states.
+Two shaping styles are supported:
 
-## What DDPOTrainer actually optimizes (important)
+1) `reward.shaping.mode=delta` (legacy):
+   - emits PBRS *deltas* (paper Eq. 3) over a scheduled subset of diffusion steps
+   - writes the terminal reward once at the final step
 
-In `DDPOTrainer.compute_advantage()`:
+2) `reward.shaping.mode=pbrs_return_to_go` (paper-aligned):
+   - emits **energy potentials** `Ψ_t = -E_ϕ(ẑ_{0|t})` in `energy_rewards_ts` (plus terminal `Ψ_0`)
+   - the trainer computes the **return-to-go** `G_t^(E) = γ^t Ψ_0 - Ψ_t` (paper Eq. 4)
+   - the terminal force advantage is broadcast across diffusion steps (paper Algorithm 1)
+
+In both modes, the diffusion steps that receive MLFF evaluation are controlled by `reward.shaping.scheduler.*`.
+
+## What FedGrpoTrainer actually optimizes (important)
+
+In `FedGrpoTrainer.compute_advantage()`:
 
 - Rollouts are grouped by `group_index` (same prompt, multiple samples).
 - If both force and energy channels exist, the trainer **normalizes them separately within each
@@ -125,7 +134,7 @@ models cannot inflate training-time uniqueness by appending many tiny disconnect
 
 Penalties are injected into all available reward channels (`rewards`, `force_rewards`, and
 `energy_rewards`, plus the corresponding `*_ts` tensors when present) so they always affect learning
-even when DDPOTrainer uses separate force/energy advantages.
+even when FedGrpoTrainer uses separate force/energy advantages.
 
 When `filters.invalid_penalty_scale > 0`, the filter also **zeros `energy_rewards` for RDKit-invalid
 molecules**, so the energy channel cannot accidentally incentivize invalid chemistry via
@@ -143,7 +152,7 @@ Even when RDKit validity is high, QM9 stability can lag because `check_stability
 sensitive to small geometry errors (e.g. a single C/N valence off by ±1 due to a borderline bond
 length). Many of these cases have **large UMA forces**, indicating they are simply not relaxed.
 
-For evaluation, `compute_verl_metrics.py` supports a small MLFF-based relaxation loop:
+For evaluation, `compute_elign_metrics.py` supports a small MLFF-based relaxation loop:
 
 - `--repair-invalid`: apply to RDKit-invalid molecules only
 - `--repair-unstable`: apply to QM9-unstable molecules only

@@ -1,4 +1,0 @@
-config_name: ddpo_geom_force_vxu_suffix
-save_path: outputs/verl/geom_vxu/geom_vxu_20260108_113759_phase1_force
-note: Output directory appears empty (wrapper interrupted before checkpoints/config write).
-

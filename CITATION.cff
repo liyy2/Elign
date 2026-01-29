@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use ELIGN or FED-GRPO in your research, please cite this software."
+title: "ELIGN: Post-training Equivariant Diffusion Models with FED-GRPO"
+type: software
+license: Apache-2.0
+authors:
+  - name: "ELIGN contributors"
+

@@ -1,12 +1,12 @@
 defaults:
-  - ddpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate
+  - fed_grpo_qm9_energy_force_group4x6_fulltraj_softvalence_forcegate
   - _self_
 
 # Stability-focused follow-up:
 # - The dominant RDKit-valid-but-unstable failure mode is **under-bonded heavy atoms** (mostly C/N),
 #   and a large fraction of those are near the discrete double/triple bond cutoffs.
 # - The sigmoid-soft valence shaping provides a dense signal around these cutoffs; making it
-#   *sharper* improves the ranking signal used by GRPO/DDPO without changing the discrete metric.
+#   *sharper* improves the ranking signal used by FED-GRPO without changing the discrete metric.
 # - Increasing PPO clip slightly helps the policy move the categorical/geometry distribution enough
 #   to reduce the persistent under-bonded fraction, while we rely on KL + duplicate penalties to
 #   avoid collapse.
