@@ -1,0 +1,23 @@
+# Core
+numpy
+scipy
+pandas
+tqdm
+pyyaml
+packaging
+matplotlib
+imageio
+msgpack
+ase
+
+# ML / RL stack
+torch
+wandb
+tensordict
+
+# Config
+hydra-core
+omegaconf
+
+# Chemistry / evaluation
+# - RDKit is strongly recommended, but is easiest to install via conda (see README).

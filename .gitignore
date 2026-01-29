@@ -118,7 +118,6 @@ qm9/temp/
 generated_samples/
 samples/
 *.xyz
-*.txt
 *.png
 *.jpg
 *.jpeg
@@ -225,3 +224,7 @@ force_output_1000_step.npy
 # Third-party vendored deps (installed via pip/conda in most setups).
 fairchem/
 codex_attempts/
+
+# Public-release files that should stay tracked.
+!requirements.txt
+!requirements-dev.txt

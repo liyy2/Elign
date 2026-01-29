@@ -33,7 +33,6 @@ def _tqdm_enabled() -> bool:
 from edm_source.qm9.analyze import check_stability
 from edm_source.qm9 import bond_analyze as qm9_bond_analyze
 
-from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
 from edm_source.mlff_modules.mlff_utils import get_mlff_predictor
 
 from elign.protocol import DataProto, TensorDict
@@ -272,6 +271,14 @@ class UMAForceReward(BaseReward):
                 self.mlff_predictor = get_mlff_predictor(mlff_model, self.mlff_device)
 
             if self.mlff_predictor is not None:
+                try:
+                    from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
+                except ModuleNotFoundError as exc:
+                    raise ModuleNotFoundError(
+                        "UMAForceReward: MLFF force computation requires optional dependencies "
+                        "(`fairchem` + `ase`). Install them, pass a custom `force_computer`, "
+                        "or set `reward.type=dummy`."
+                    ) from exc
                 self.force_computer = MLFFForceComputer(
                     mlff_predictor=self.mlff_predictor,
                     position_scale=self.position_scale,

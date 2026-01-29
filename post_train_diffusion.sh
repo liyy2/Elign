@@ -22,7 +22,7 @@ if [[ -n "${CHECKPOINT_PATH}" ]]; then
   RESUME_FLAGS=("resume=true" "checkpoint_path=${CHECKPOINT_PATH}")
 fi
 
-# Optimization / training loop (defaults match `ddpo_qm9_energy_force_group4x6.yaml`)
+# Optimization / training loop (defaults match `fed_grpo_qm9_energy_force_group4x6.yaml`)
 LEARNING_RATE="4e-6"
 CLIP_RANGE="2e-3"
 TRAIN_MICRO_BATCH_SIZE=8 # PPO micro-batch size during the update (reduce if OOM)
