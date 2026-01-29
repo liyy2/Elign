@@ -130,6 +130,10 @@ python eval_mlff_guided.py \
     --guidance_steps 10
 ```
 
+### Evaluation Notes
+
+- RDKit uniqueness during training is computed on grouped rollouts that may share initial noise and skip a diffusion prefix (for example, `share_initial_noise: true`, `skip_prefix: 700`).
+- `eval_verl_rollout.py` defaults to `share_initial_noise=false` and `skip_prefix=0` unless you pass flags, which makes samples more independent and can push uniqueness to ~99%.
 
 ## Key Features
 

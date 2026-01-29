@@ -286,6 +286,7 @@ def main(cfg: DictConfig) -> None:
             energy_transform_scale=reward_cfg.get("energy_transform_scale", 1000.0),
             energy_transform_clip=reward_cfg.get("energy_transform_clip", None),
             energy_normalize_by_atoms=reward_cfg.get("energy_normalize_by_atoms", False),
+            energy_atom_refs=reward_cfg.get("energy_atom_refs", None),
         )
     else:
         raise ValueError(f"Unsupported reward.type '{reward_type}'. Use 'uma' or 'dummy'.")

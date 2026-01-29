@@ -42,6 +42,25 @@ from .scheduler import RewardScheduler
 
 logger = logging.getLogger(__name__)
 
+_SYMBOL_TO_Z = {
+    "H": 1,
+    "B": 5,
+    "C": 6,
+    "N": 7,
+    "O": 8,
+    "F": 9,
+    "Al": 13,
+    "Si": 14,
+    "P": 15,
+    "S": 16,
+    "Cl": 17,
+    "As": 33,
+    "Br": 35,
+    "I": 53,
+    "Hg": 80,
+    "Bi": 83,
+}
+
 
 def _resolve_mlff_device(device_like, default_device):
     """Normalize MLFF device hints to strings understood by the loader."""
@@ -120,6 +139,7 @@ class UMAForceReward(BaseReward):
         energy_transform_scale: float = 1000.0,
         energy_transform_clip: Optional[float] = None,
         energy_normalize_by_atoms: bool = False,
+        energy_atom_refs: Optional[str] = None,
     ):
         super().__init__()
         self.is_main_process = _is_main_process()
@@ -185,7 +205,9 @@ class UMAForceReward(BaseReward):
         self.energy_transform_scale = energy_transform_scale
         self.energy_transform_clip = None if energy_transform_clip is None else float(energy_transform_clip)
         self.energy_normalize_by_atoms = bool(energy_normalize_by_atoms)
-        
+        self.energy_atom_refs = str(energy_atom_refs) if energy_atom_refs else None
+        self._atom_ref_by_type = None
+
 
         # Reward shaping config
         # Scheduler allows switching between uniform and adaptive sampling of diffusion steps.
@@ -250,6 +272,68 @@ class UMAForceReward(BaseReward):
             else:
                 self.force_computer = None
                 logger.warning("UMAForceReward: MLFF predictor not loaded, rewards will default to zero.")
+
+        if self.use_energy and self.energy_atom_refs:
+            self._atom_ref_by_type = self._build_atom_ref_by_type(self.energy_atom_refs)
+
+    def _build_atom_ref_by_type(self, ref_key: str) -> torch.Tensor:
+        """Build a lookup table mapping dataset atom-type indices -> reference energies.
+
+        The UMA predictor exposes per-element reference energies (used to compute formation energies)
+        under `predictor.atom_refs[ref_key][Z][charge]`.
+        """
+        predictor = getattr(self, "mlff_predictor", None)
+        if predictor is None:
+            raise RuntimeError("energy_atom_refs requires an MLFF predictor, but none is loaded.")
+        atom_refs = getattr(predictor, "atom_refs", None)
+        if atom_refs is None:
+            raise RuntimeError("MLFF predictor is missing atom_refs; cannot use energy_atom_refs.")
+        try:
+            refs_for_key = atom_refs.get(ref_key)
+        except Exception:
+            refs_for_key = None
+        if refs_for_key is None:
+            raise RuntimeError(f"MLFF predictor is missing atom_refs['{ref_key}']; cannot use energy_atom_refs.")
+
+        decoder = self.dataset_info.get("atom_decoder")
+        if not decoder:
+            raise RuntimeError("dataset_info is missing atom_decoder; required for energy_atom_refs.")
+
+        ref_values = []
+        missing_symbols = []
+        for symbol in decoder:
+            znum = _SYMBOL_TO_Z.get(symbol)
+            if znum is None:
+                missing_symbols.append(symbol)
+                znum = 1
+            try:
+                entry = refs_for_key.get(int(znum))
+            except Exception:
+                entry = None
+            if entry is None:
+                raise RuntimeError(f"MLFF atom_refs['{ref_key}'] missing atomic number {znum} (symbol={symbol}).")
+
+            energy0 = None
+            if hasattr(entry, "get"):
+                energy0 = entry.get(0)
+                if energy0 is None:
+                    energy0 = entry.get("0")
+            if energy0 is None:
+                try:
+                    energy0 = entry[0]
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Invalid MLFF atom_ref entry for Z={znum} (symbol={symbol}): {entry}"
+                    ) from exc
+            ref_values.append(float(energy0))
+
+        if missing_symbols and self.is_main_process:
+            logger.warning(
+                "UMAForceReward: missing atomic-number mapping for symbols %s; defaulting to H reference.",
+                sorted(set(missing_symbols)),
+            )
+
+        return torch.tensor(ref_values, dtype=torch.float32, device=self.device)
 
     def process_data(self, samples: DataProto) -> dict:
         positions = samples.batch["x"].detach()
@@ -325,6 +409,14 @@ class UMAForceReward(BaseReward):
 
         # Decide shaping path: if enabled, compute terminal + shaped in one MLFF pass over latents
         shaping_active = self.shaping_enabled and ("latents" in data.batch.keys()) and (self.force_computer is not None)
+
+        atom_ref_sums = None
+        if self.use_energy and self._atom_ref_by_type is not None:
+            atom_type_indices = categorical.argmax(dim=-1)
+            valid_mask = node_mask[..., 0] > 0.5
+            ref_by_type = self._atom_ref_by_type.to(device=categorical.device, dtype=torch.float32)
+            ref_per_atom = ref_by_type[atom_type_indices]
+            atom_ref_sums = (ref_per_atom * valid_mask.to(dtype=ref_per_atom.dtype)).sum(dim=1)
 
         force_rewards = torch.zeros(batch_size, device=self.device)
         energy_rewards = torch.zeros(batch_size, device=self.device)
@@ -460,6 +552,8 @@ class UMAForceReward(BaseReward):
 
             if self.use_energy and flat_energy is not None:
                 energies_bt = flat_energy.view(B, selected_count)
+                if atom_ref_sums is not None:
+                    energies_bt = energies_bt - atom_ref_sums.to(device=energies_bt.device, dtype=energies_bt.dtype).unsqueeze(1)
                 if self.energy_normalize_by_atoms:
                     atom_counts = (node_mask_b[..., 0] > 0.5).sum(dim=1).clamp(min=1).to(energies_bt.dtype)
                     energies_bt = energies_bt / atom_counts.unsqueeze(1)
@@ -607,6 +701,8 @@ class UMAForceReward(BaseReward):
                 force_rewards[batch_idx] = -aggregated_force
                 if self.use_energy:
                     energy = energies[batch_idx]
+                    if atom_ref_sums is not None:
+                        energy = energy - atom_ref_sums[batch_idx].to(dtype=energy.dtype)
                     if self.energy_normalize_by_atoms:
                         num_atoms = valid_mask.sum().clamp(min=1).to(dtype=energy.dtype)
                         energy = energy / num_atoms

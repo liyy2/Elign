@@ -97,6 +97,10 @@ reward:
   # If you enable this, you likely also want to adjust `energy_transform_offset/scale`
   # because QM9 per-atom energies are ~O(1e3) smaller than total energies.
   energy_normalize_by_atoms: false
+  # Optional: subtract per-element reference energies before transforming.
+  # When set (e.g., "omol" for UMA), energies become formation energies that are better aligned
+  # with downstream DFT-style metrics.
+  energy_atom_refs: null
   # Gate energy reward to stable molecules only.
   energy_only_if_stable: false
   # Optional: gate force reward to stable molecules only. This prevents unstable low-force

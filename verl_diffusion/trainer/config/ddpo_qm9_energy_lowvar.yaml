@@ -1,0 +1,42 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6
+  - _self_
+
+# Low-variance energy+force tuning:
+# - more samples per update for smoother GRPO normalization
+# - avoid hard stability gating and penalty spikes
+# - clip energy/force outliers and use soft valence shaping
+
+dataloader:
+  sample_group_size: 4
+  each_prompt_sample: 24
+  micro_batch_size: 96
+  epoches: 600
+
+filters:
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.0
+  invalid_penalty_scale: 0.0
+  duplicate_penalty_scale: 0.0
+
+reward:
+  use_energy: true
+  energy_only_if_stable: true
+  energy_weight: 0.25
+  energy_transform_clip: 3.0
+  energy_normalize_by_atoms: true
+  force_only_if_stable: false
+  stability_weight: 1.0
+  valence_underbond_soft_weight: 0.05
+  valence_soft_temperature: 0.05
+  force_clip_threshold: 2.0
+
+train:
+  learning_rate: 2.0e-6
+  clip_range: 1.0e-3
+  kl_penalty_weight: 0.08
+  train_micro_batch_size: 24
+  epoch_per_rollout: 1
+  scheduler:
+    total_steps: 600

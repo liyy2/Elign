@@ -1,0 +1,40 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6_forcegate_stability
+  - _self_
+
+# Low-variance force-only tuning:
+# - larger rollout batch per update (more samples per prompt)
+# - remove hard stability gate and heavy penalties
+# - use soft valence shaping for smoother signals
+
+dataloader:
+  sample_group_size: 4
+  each_prompt_sample: 12
+  micro_batch_size: 48
+  epoches: 600
+
+filters:
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.0
+  invalid_penalty_scale: 0.0
+  duplicate_penalty_scale: 0.0
+
+reward:
+  use_energy: false
+  energy_weight: 0.0
+  energy_adv_weight: 0.0
+  force_only_if_stable: false
+  stability_weight: 0.5
+  valence_underbond_soft_weight: 0.05
+  valence_soft_temperature: 0.05
+  force_clip_threshold: 2.0
+
+train:
+  learning_rate: 3.0e-6
+  clip_range: 1.0e-3
+  kl_penalty_weight: 0.08
+  train_micro_batch_size: 16
+  epoch_per_rollout: 1
+  scheduler:
+    total_steps: 600

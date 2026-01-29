@@ -1,0 +1,14 @@
+{
+  "description": "Energy+force resume + dup0.10 + KL0.02",
+  "start_time": "2026-01-08 16:57:26",
+  "duration_hours": 1.5001097083091737,
+  "status": "completed",
+  "log_path": "/home/yl2428/e3_diffusion_for_molecules-main/outputs/verl/geom_vxu/codex_geom_vxu_attempt010_energy_resume_dup10_kl002_20260108_165726.log",
+  "run_dir": "/home/yl2428/e3_diffusion_for_molecules-main/outputs/verl/geom_vxu/codex_geom_vxu_attempt010_energy_resume_dup10_kl002_20260108_165726",
+  "config_name": "ddpo_geom_energy_force_vxu_suffix",
+  "overrides": [
+    "filters.duplicate_penalty_scale=0.10",
+    "train.kl_penalty_weight=0.02"
+  ],
+  "resume_from": "outputs/verl/geom_vxu/geom_vxu_energy2_20260108_122126/checkpoint_best.pth"
+}

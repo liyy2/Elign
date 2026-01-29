@@ -1,0 +1,56 @@
+defaults:
+  - ddpo_qm9_energy_lowvar
+  - _self_
+
+# Energy-focused continuation config (QM9).
+#
+# Motivation:
+# - Previous runs used raw UMA energies with a large offset/scale and a tight clip, which
+#   saturated the energy reward (most samples hit the clip ceiling). That prevents PPO from
+#   making meaningful energy improvements and can increase apparent variance.
+#
+# Strategy:
+# - Use UMA per-element reference energies (atom_refs='omol') to compute a formation-energy-like
+#   proxy: (E - sum(atom_refs)) / n_atoms.
+# - Use a non-saturating transform for this proxy (offset=0, scale=1, wide clip).
+# - Increase GRPO/DDPO energy advantage weight vs. force to bias updates toward energy.
+
+dataloader:
+  # 4 prompts × 24 samples each = 96 rollouts per iteration (lower-variance GRPO stats).
+  sample_group_size: 4
+  each_prompt_sample: 24
+  micro_batch_size: 96
+  # Set high so runs do not stop due to epoch budget.
+  epoches: 20000
+
+train:
+  # Keep PPO stable; disable any wall-clock cap / early stopping (user-controlled).
+  max_time_hours: null
+  early_stop_metric: null
+  early_stop_patience_minutes: null
+  # Avoid additional alignment regularizer noise while focusing on energy.
+  force_alignment_enabled: false
+  # Keep LR constant when resuming (avoid scheduler boundary effects).
+  scheduler:
+    name: null
+
+reward:
+  use_energy: true
+  # Use UMA atom reference energies for a DFT-like formation energy proxy.
+  energy_atom_refs: omol
+  energy_normalize_by_atoms: true
+  # For formation-energy-per-atom values around ~[-5, -4] eV/atom.
+  energy_transform_offset: 0.0
+  energy_transform_scale: 1.0
+  # Wide clip to avoid saturation while still bounding outliers.
+  energy_transform_clip: 10.0
+  # Gate energy to stable molecules (prevents energy exploits on unstable chemistry).
+  energy_only_if_stable: true
+  # Bias PPO updates toward energy improvements.
+  force_adv_weight: 0.5
+  energy_adv_weight: 2.0
+
+# Select best checkpoints by energy proxy (higher is better because reward = -E_form/atom).
+best_checkpoint_metric: energy_reward_mean
+best_checkpoint_mode: max
+

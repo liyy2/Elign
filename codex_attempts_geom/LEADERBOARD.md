@@ -15,6 +15,7 @@ This file tracks iterative GEOM RL experiments focused on **RDKit validity × RD
 | 007 | 2026-01-08 | Energy+force (older weights; interrupted) | 0.804 | 0.000 | 0.992 | 0.606 | 0.602 | 0.040h | early_stop |
 | 008 | 2026-01-08 | Energy+force (gentle energy; interrupted) | 0.726 | 0.000 | 0.992 | 0.890 | 0.883 | 0.142h | early_stop |
 | 009 | 2026-01-08 | Energy+force resume (allocator crash) | 0.724 | 0.000 | 0.992 | 0.882 | 0.875 | 0.916h | failed |
+| 010 | 2026-01-08 | Energy+force resume + dup0.10 + KL0.02 | -- | -- | -- | -- | -- | 1.500h | completed |
 
 ## Best Run So Far
 
