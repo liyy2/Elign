@@ -1,4 +1,4 @@
-# ELIGN: Post-training Equivariant Diffusion Models with FED-GRPO
+# Elign: Equivariant Diffusion Model Alignment from Foundational Machine Learned Force Fields
 
 ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. It takes a pretrained equivariant diffusion backbone (EDM-style) and post-trains the diffusion **reverse process policy** using reinforcement learning with physics-inspired rewards (e.g., ML force fields).
 
