@@ -1,20 +1,39 @@
-# Elign: Equivariant Diffusion Model Alignment from Foundational Machine Learned Force Fields
+# ELIGN: Equivariant Diffusion Alignment with Foundational ML Force Fields
 
-ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. It takes a pretrained equivariant diffusion backbone (EDM-style) and post-trains the diffusion **reverse process policy** using reinforcement learning with physics-inspired rewards (e.g., ML force fields).
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-informational)](#installation)
 
-The RL algorithm used in ELIGN is **FED-GRPO** (**F**orce and **E**nergy **D**isentangled **G**roup **R**elative **P**olicy **O**ptimization). FED-GRPO:
+ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. Starting from a pretrained diffusion backbone (EDM-style), ELIGN optimizes the **reverse-diffusion policy** with reinforcement learning using physics-inspired rewards (e.g., energies and forces from foundational ML force fields).
 
-- samples **groups** of rollouts per prompt (`group_index`)
+The RL optimizer used in ELIGN is **FED-GRPO** (**F**orce and **E**nergy **D**isentangled **G**roup **R**elative **P**olicy **O**ptimization), which:
+
+- samples **groups** of rollouts per prompt and normalizes rewards *within each group*
 - computes force and (optional) energy rewards from an ML force field
-- computes **group-relative advantages**, disentangling **force** and **energy** channels and mixing them with configurable weights
-- updates the diffusion policy with a **clipped policy-gradient objective** (PPO-style) plus optional KL regularization to a reference policy
+- builds **group-relative advantages** with disentangled force/energy channels mixed via configurable weights
+- updates the diffusion policy with a **clipped policy-gradient objective** (PPO-style) and optional KL-to-reference regularization
 
-This repo is organized into two main codebases:
+This repository contains:
 
-- `edm_source/`: the equivariant diffusion backbone (training + MLFF-guided sampling utilities)
+- `edm_source/`: equivariant diffusion backbone (training + MLFF-guided sampling utilities)
 - `elign/`: ELIGN post-training stack (rollout, reward, filtering, FED-GRPO trainer/actor)
 
-## Table of contents
+## Method overview
+
+<p align="center">
+  <img src="assets/figures/fig1_elign_overview.png" width="720" alt="ELIGN pipeline: pretraining, conditional midtraining, preference model (MLFF), and RL post-training alignment." />
+</p>
+<p align="center">
+  <em>Figure 1. High-level ELIGN pipeline: pretraining (score matching), conditional midtraining, foundational MLFF as a preference model, and RL post-training (alignment).</em>
+</p>
+
+<p align="center">
+  <img src="assets/figures/fig2_fed_grpo_overview.png" width="900" alt="FED-GRPO overview: shared-prefix diffusion rollout groups, energy shaping, and force/energy advantage normalization." />
+</p>
+<p align="center">
+  <em>Figure 2. FED-GRPO overview: grouped diffusion rollouts with optional shared prefix, energy shaping (PBRS), and force/energy advantage normalization.</em>
+</p>
+
+## Contents
 
 - [Installation](#installation)
 - [Quick start](#quick-start)
@@ -104,6 +123,15 @@ QM9 post-training with UMA rewards (requires FAIRChem/UMA):
 torchrun --standalone --nproc_per_node=1 run_elign.py \
   --config-name fed_grpo_qm9_energy_force_group4x6 \
   save_path=outputs/elign/qm9/my_run \
+  wandb.enabled=false
+```
+
+Paper-aligned QM9 config (PBRS return-to-go):
+
+```bash
+torchrun --standalone --nproc_per_node=1 run_elign.py \
+  --config-name fed_grpo_qm9_paper_pbrs \
+  save_path=outputs/elign/qm9/paper_pbrs \
   wandb.enabled=false
 ```
 
