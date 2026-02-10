@@ -125,6 +125,11 @@ samples/
 *.mp4
 *.avi
 
+# Repo documentation figures (tracked).
+!assets/figures/*.png
+!assets/figures/*.jpg
+!assets/figures/*.jpeg
+
 # Logs and experiment tracking
 *.log
 *.out
@@ -170,8 +175,6 @@ results/
 
 # Local experiment scratchpads
 exp/
-codex_attempts*/
-.claude_resources.json
 
 # CUDA and GPU related
 *.cu
@@ -217,13 +220,11 @@ exp_*.err
 exp_*.out
 exp/*
 
-# Local agent artifacts (not part of the project).
-.claude_resources.json
+# Local scratch files (not part of the project).
 force_output_1000_step.npy
 
 # Third-party vendored deps (installed via pip/conda in most setups).
 fairchem/
-codex_attempts/
 
 # Public-release files that should stay tracked.
 !requirements.txt
