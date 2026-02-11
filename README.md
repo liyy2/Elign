@@ -35,7 +35,7 @@ This repository contains:
 </p>
 
 <p align="center">
-  <img src="assets/figures/fig2_fed_grpo_overview.png" width="900" alt="FED-GRPO overview: shared-prefix diffusion rollout groups, energy shaping, and force/energy advantage normalization." />
+  <img src="assets/figures/fig2_fed_grpo_overview.png" width="1000" alt="FED-GRPO overview: shared-prefix diffusion rollout groups, energy shaping, and force/energy advantage normalization." />
 </p>
 <p align="center">
   <em>Figure 2. FED-GRPO overview: grouped diffusion rollouts with optional shared prefix, energy shaping (PBRS), and force/energy advantage normalization.</em>
