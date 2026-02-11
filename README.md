@@ -1,7 +1,15 @@
-# ELIGN: Equivariant Diffusion Alignment with Foundational ML Force Fields
+<div align="center">
+
+# ELIGN
+
+**Equivariant Diffusion Alignment with Foundational ML Force Fields**
+
+[Paper](https://arxiv.org/abs/2601.21985) • [Documentation](docs/) • [Quick start](#quick-start) • [Citation](#citation)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-informational)](#installation)
+
+</div>
 
 ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. Starting from a pretrained diffusion backbone (EDM-style), ELIGN optimizes the **reverse-diffusion policy** with reinforcement learning using physics-inspired rewards (e.g., energies and forces from foundational ML force fields).
 
@@ -197,8 +205,32 @@ Backbone docs (upstream EDM-style code):
 
 If you use ELIGN/FED-GRPO in your work, please cite:
 
-- ELIGN (this repo)
-- the upstream EDM / E(3)-diffusion work (see `edm_source/LICENSE` and `edm_source/README.md`)
+```bibtex
+@misc{li2026elignequivariantdiffusionmodel,
+      title={Elign: Equivariant Diffusion Model Alignment from Foundational Machine Learning Force Fields},
+      author={Yunyang Li and Lin Huang and Luojia Xia and Wenhe Zhang and Mark Gerstein},
+      year={2026},
+      eprint={2601.21985},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2601.21985},
+}
+```
+
+For UMA (the default MLFF reward backend used by this repo), please cite:
+
+```bibtex
+@inproceedings{
+wood2025uma,
+title={{UMA}: A Family of Universal Models for Atoms},
+author={Brandon M Wood and Misko Dzamba and Xiang Fu and Meng Gao and Muhammed Shuaibi and Luis Barroso-Luque and Kareem Abdelmaqsoud and Vahe Gharakhanyan and John R. Kitchin and Daniel S. Levine and Kyle Michel and Anuroop Sriram and Taco Cohen and Abhishek Das and Sushree Jagriti Sahoo and Ammar Rizvi and Zachary Ward Ulissi and C. Lawrence Zitnick},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=SvopaNxYWt}
+}
+```
+
+Also cite the upstream EDM / E(3)-diffusion work (see `edm_source/LICENSE`, `edm_source/README.md`, and `edm_source/README_MLFF_GUIDANCE.md`).
 
 A `CITATION.cff` file is provided in the repo root.
 

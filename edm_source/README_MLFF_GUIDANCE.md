@@ -285,7 +285,7 @@ x, h = enhanced_sampling_with_mlff(
 
 ## Citation
 
-If you use this code, please cite the original E(3) Diffusion paper and the UMA paper:
+If you use this code, please cite the original E(3) Diffusion paper and the UMA paper (NeurIPS 2025):
 
 ```bibtex
 @article{hoogeboom2022equivariant,
@@ -295,11 +295,13 @@ If you use this code, please cite the original E(3) Diffusion paper and the UMA 
   year={2022}
 }
 
-@article{uma2024,
-  title={UMA: A Universal Model for Atoms},
-  author={...},
-  journal={arXiv preprint},
-  year={2024}
+@inproceedings{
+wood2025uma,
+title={{UMA}: A Family of Universal Models for Atoms},
+author={Brandon M Wood and Misko Dzamba and Xiang Fu and Meng Gao and Muhammed Shuaibi and Luis Barroso-Luque and Kareem Abdelmaqsoud and Vahe Gharakhanyan and John R. Kitchin and Daniel S. Levine and Kyle Michel and Anuroop Sriram and Taco Cohen and Abhishek Das and Sushree Jagriti Sahoo and Ammar Rizvi and Zachary Ward Ulissi and C. Lawrence Zitnick},
+booktitle={The Thirty-ninth Annual Conference on Neural Information Processing Systems},
+year={2025},
+url={https://openreview.net/forum?id=SvopaNxYWt}
 }
 ```
 

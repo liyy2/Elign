@@ -2,7 +2,7 @@
 
 This repo contains an implementation of **Elign** (post-training for E(3)-equivariant diffusion models) and its RL optimizer **FED-GRPO**.
 
-The paper PDF is tracked in this repo as `main (1).pdf`.
+Paper: [arXiv:2601.21985](https://arxiv.org/abs/2601.21985).
 
 Below is a pragmatic mapping from the paper’s notation / pseudocode to the corresponding code and config knobs.
 
@@ -86,4 +86,3 @@ Paper-aligned example config:
 - `dataloader.sample_group_size` is “# prompts per iteration”; `dataloader.each_prompt_sample` is the group size `K`.
 - `model.skip_prefix` counts how many *early* reverse-diffusion transitions are shared (and then skipped in PPO updates).
   If `model.time_step=1000` and `model.skip_prefix=600`, PPO updates cover the last 400 diffusion transitions.
-
