@@ -195,6 +195,7 @@ Start here:
 - `docs/paper_code_map.md`
 - `docs/evaluation.md`
 - `docs/config_reference.md`
+- `docs/site/index.html` (interactive animated concept page)
 
 Backbone docs (upstream EDM-style code):
 

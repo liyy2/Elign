@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="description" content="ELIGN and FED-GRPO: an animated concept page for post-training equivariant diffusion models with force-field rewards." />
+  <title>ELIGN | Dynamic Concept Page</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@400;600;700;800&family=Sora:wght@300;400;500;600;700&family=Space+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body id="top">
+  <div class="grain" aria-hidden="true"></div>
+  <div class="bg-orb orb-a" aria-hidden="true"></div>
+  <div class="bg-orb orb-b" aria-hidden="true"></div>
+
+  <header class="hero section-pad">
+    <canvas id="hero-canvas" aria-hidden="true"></canvas>
+
+    <nav class="topbar">
+      <a class="brand" href="#top">ELIGN</a>
+      <div class="top-links">
+        <a href="#story">Method</a>
+        <a href="#fed-grpo">FED-GRPO</a>
+        <a href="#figures">Figures</a>
+      </div>
+    </nav>
+
+    <div class="hero-layout">
+      <div class="hero-copy reveal in-view">
+        <p class="eyebrow">Physics-guided alignment for 3D molecule generation</p>
+        <h1>From diffusion pretraining to energy- and force-aligned sampling.</h1>
+        <p class="subhead">
+          ELIGN post-trains an E(3)-equivariant diffusion policy with FED-GRPO, combining
+          grouped policy optimization, force/energy disentanglement, and shaped rewards from
+          foundational ML force fields.
+        </p>
+        <div class="hero-ctas">
+          <a class="btn btn-solid" href="#fed-grpo">Explore FED-GRPO</a>
+          <a class="btn btn-ghost" href="../paper_code_map.md">Paper ↔ code map</a>
+        </div>
+      </div>
+
+      <aside class="hero-panel reveal in-view" aria-label="Key ideas">
+        <h2>Core Ideas</h2>
+        <ul>
+          <li><span>Shared-prefix branching</span><em>One prefix, many rollouts</em></li>
+          <li><span>Disentangled rewards</span><em>Force and energy channels</em></li>
+          <li><span>Group-relative optimization</span><em>Stable ranking signal</em></li>
+          <li><span>Physics-informed alignment</span><em>Closer to equilibrium</em></li>
+        </ul>
+        <div class="formula-block">
+          <code>A = w<sub>F</sub> z(F) + w<sub>E</sub> z(E)</code>
+          <small>FED-GRPO mixed advantage</small>
+        </div>
+      </aside>
+    </div>
+
+    <div class="hero-metrics reveal in-view">
+      <div class="metric">
+        <span class="metric-value">E(3)</span>
+        <span class="metric-label">Equivariance preserved</span>
+      </div>
+      <div class="metric">
+        <span class="metric-value">PBRS</span>
+        <span class="metric-label">Energy shaping return-to-go</span>
+      </div>
+      <div class="metric">
+        <span class="metric-value">K-rollouts</span>
+        <span class="metric-label">Grouped relative updates</span>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="story" class="section-pad section-block">
+      <div class="section-head reveal">
+        <p class="eyebrow">ELIGN at a glance</p>
+        <h2>What changes after diffusion pretraining?</h2>
+      </div>
+
+      <div class="concept-grid">
+        <article class="concept-step reveal is-active" data-step="0">
+          <span class="step-index">01</span>
+          <h3>Pretrain sampler</h3>
+          <p>Train an equivariant diffusion backbone with score matching to model molecular structure distribution.</p>
+        </article>
+        <article class="concept-step reveal" data-step="1">
+          <span class="step-index">02</span>
+          <h3>Inject conditions</h3>
+          <p>Move to conditional sampling for composition and charge, preparing the policy for controlled generation.</p>
+        </article>
+        <article class="concept-step reveal" data-step="2">
+          <span class="step-index">03</span>
+          <h3>Score with MLFF</h3>
+          <p>Use foundational force fields to evaluate terminal force and energy, and shape intermediate energy signals.</p>
+        </article>
+        <article class="concept-step reveal" data-step="3">
+          <span class="step-index">04</span>
+          <h3>Align with FED-GRPO</h3>
+          <p>Optimize a clipped policy objective with group-relative normalized advantages and optional KL regularization.</p>
+        </article>
+      </div>
+    </section>
+
+    <section id="fed-grpo" class="section-pad section-block fed-block">
+      <div class="section-head reveal">
+        <p class="eyebrow">Interactive mechanics</p>
+        <h2>FED-GRPO optimization loop</h2>
+      </div>
+
+      <div class="fed-layout">
+        <article class="engine-card reveal">
+          <h3>Shared prefix → branch → reward → update</h3>
+          <div class="pipeline" role="img" aria-label="Animated FED-GRPO rollout process">
+            <div class="node prefix">Shared Prefix<br /><strong>z<sub>pre</sub></strong></div>
+
+            <div class="lanes" aria-hidden="true">
+              <div class="lane lane-a"><span class="runner"></span></div>
+              <div class="lane lane-b"><span class="runner"></span></div>
+              <div class="lane lane-c"><span class="runner"></span></div>
+            </div>
+
+            <div class="node terminal">Terminal<br /><strong>z<sub>0</sub></strong></div>
+          </div>
+
+          <div class="engine-notes">
+            <p><strong>Force reward:</strong> terminal stability/geometry quality signal.</p>
+            <p><strong>Energy reward:</strong> optional PBRS return-to-go from MLFF potentials.</p>
+          </div>
+        </article>
+
+        <aside class="controls-card reveal">
+          <h3>FED-GRPO mixer</h3>
+          <p>Tune the relative influence of force and energy channels in the mixed advantage.</p>
+
+          <label class="control-row" for="forceWeight">
+            <span>Force weight w<sub>F</sub></span>
+            <output id="forceOut">1.00</output>
+          </label>
+          <input id="forceWeight" type="range" min="0.4" max="2.0" step="0.05" value="1.00" />
+
+          <label class="control-row" for="energyWeight">
+            <span>Energy weight w<sub>E</sub></span>
+            <output id="energyOut">0.10</output>
+          </label>
+          <input id="energyWeight" type="range" min="0.00" max="0.30" step="0.01" value="0.10" />
+
+          <label class="control-row" for="groupSize">
+            <span>Group size K</span>
+            <output id="groupOut">24</output>
+          </label>
+          <input id="groupSize" type="range" min="4" max="32" step="2" value="24" />
+
+          <p class="live-formula" id="mixFormula">A = 1.00 · z(F) + 0.10 · z(E)</p>
+
+          <div class="mix-bars" aria-hidden="true">
+            <div class="mix-col">
+              <div class="mix-bar force" id="forceBar"></div>
+              <span>Force</span>
+            </div>
+            <div class="mix-col">
+              <div class="mix-bar energy" id="energyBar"></div>
+              <span>Energy</span>
+            </div>
+          </div>
+
+          <div class="rollout-strip" id="rolloutStrip" aria-label="Rollout samples"></div>
+          <small id="rolloutCaption">Showing 12 sampled rollouts from K=24.</small>
+        </aside>
+      </div>
+    </section>
+
+    <section id="figures" class="section-pad section-block">
+      <div class="section-head reveal">
+        <p class="eyebrow">Visual anchors</p>
+        <h2>Pipeline and optimization diagrams</h2>
+      </div>
+
+      <div class="figure-grid">
+        <figure class="figure-card reveal">
+          <img src="../../assets/figures/fig1_elign_overview.png" alt="ELIGN pipeline from pretraining to post-training alignment" loading="lazy" />
+          <figcaption>ELIGN pipeline: pretraining, conditioning, preference modeling, and alignment.</figcaption>
+        </figure>
+        <figure class="figure-card reveal">
+          <img src="../../assets/figures/fig2_fed_grpo_overview.png" alt="FED-GRPO grouped rollout and reward disentanglement overview" loading="lazy" />
+          <figcaption>FED-GRPO: shared-prefix branching, shaped energy, and force-energy mixed advantage.</figcaption>
+        </figure>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer section-pad">
+    <p>ELIGN project page concept • Built for clear communication of method intuition and optimization dynamics.</p>
+    <a href="../../README.md">Back to repository README</a>
+  </footer>
+
+  <script src="main.js"></script>
+</body>
+</html>
