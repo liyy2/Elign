@@ -51,57 +51,188 @@
     }
   }
 
-  const forceWeight = document.getElementById("forceWeight");
-  const energyWeight = document.getElementById("energyWeight");
-  const groupSize = document.getElementById("groupSize");
+  const fedSequence = document.getElementById("fedSequence");
+  const stageButtons = [...document.querySelectorAll(".stage-chip")];
+  const sequenceCaption = document.getElementById("sequenceCaption");
+  const stageCaptions = [
+    "1) A node follows the shared trajectory to the branch point.",
+    "2) The shared prefix branches into grouped rollout trajectories.",
+    "3) Terminal rollouts are sent to the preference model (MLFF).",
+    "4) Rewards are computed and used for FED-GRPO policy updates."
+  ];
 
-  const forceOut = document.getElementById("forceOut");
-  const energyOut = document.getElementById("energyOut");
-  const groupOut = document.getElementById("groupOut");
+  let currentStage = 0;
+  let stageTimer = null;
+  let tokenStops = [];
 
-  const forceBar = document.getElementById("forceBar");
-  const energyBar = document.getElementById("energyBar");
-  const mixFormula = document.getElementById("mixFormula");
-  const rolloutStrip = document.getElementById("rolloutStrip");
-  const rolloutCaption = document.getElementById("rolloutCaption");
-
-  const renderRolloutStrip = (k) => {
-    const shown = Math.min(12, k);
-    rolloutStrip.innerHTML = "";
-    for (let i = 0; i < shown; i += 1) {
-      const chip = document.createElement("span");
-      chip.className = "rollout-chip";
-      chip.style.animationDelay = `${(i % 6) * -0.15}s`;
-      rolloutStrip.appendChild(chip);
+  const getTokenAndPath = (tokenId, pathId) => {
+    if (!fedSequence) {
+      return null;
     }
-    rolloutCaption.textContent = `Showing ${shown} sampled rollouts from K=${k}.`;
+    const token = fedSequence.querySelector(`#${tokenId}`);
+    const path = fedSequence.querySelector(`#${pathId}`);
+    if (!token || !path) {
+      return null;
+    }
+    return { token, path };
   };
 
-  const updateMixer = () => {
-    const wf = Number.parseFloat(forceWeight.value);
-    const we = Number.parseFloat(energyWeight.value);
-    const k = Number.parseInt(groupSize.value, 10);
-
-    forceOut.value = wf.toFixed(2);
-    energyOut.value = we.toFixed(2);
-    groupOut.value = String(k);
-
-    const total = Math.max(wf + we, 1e-6);
-    const forcePct = Math.max(12, (wf / total) * 100);
-    const energyPct = Math.max(12, (we / total) * 100);
-
-    forceBar.style.height = `${forcePct}%`;
-    energyBar.style.height = `${energyPct}%`;
-    mixFormula.textContent = `A = ${wf.toFixed(2)} · z(F) + ${we.toFixed(2)} · z(E)`;
-
-    renderRolloutStrip(k);
-  };
-
-  if (forceWeight && energyWeight && groupSize) {
-    [forceWeight, energyWeight, groupSize].forEach((el) => {
-      el.addEventListener("input", updateMixer);
+  const hideAllTokens = () => {
+    if (!fedSequence) {
+      return;
+    }
+    [...fedSequence.querySelectorAll(".token")].forEach((token) => {
+      token.style.opacity = "0";
     });
-    updateMixer();
+  };
+
+  const placeTokenOnPath = (tokenId, pathId, progress) => {
+    const pair = getTokenAndPath(tokenId, pathId);
+    if (!pair) {
+      return;
+    }
+    const length = pair.path.getTotalLength();
+    const point = pair.path.getPointAtLength(length * progress);
+    pair.token.setAttribute("cx", point.x.toFixed(2));
+    pair.token.setAttribute("cy", point.y.toFixed(2));
+    pair.token.style.opacity = "1";
+  };
+
+  const animateTokenOnPath = (tokenId, pathId, durationMs, options = {}) => {
+    const pair = getTokenAndPath(tokenId, pathId);
+    if (!pair) {
+      return () => {};
+    }
+
+    const { loop = true, delayMs = 0 } = options;
+    const totalLength = pair.path.getTotalLength();
+    pair.token.style.opacity = "1";
+
+    let rafId = 0;
+    let startTs = 0;
+    let stopped = false;
+
+    const tickToken = (ts) => {
+      if (stopped) {
+        return;
+      }
+      if (startTs === 0) {
+        startTs = ts + delayMs;
+      }
+      if (ts < startTs) {
+        rafId = window.requestAnimationFrame(tickToken);
+        return;
+      }
+
+      const elapsed = ts - startTs;
+      const rawProgress = elapsed / durationMs;
+      const progress = loop ? rawProgress % 1 : Math.min(rawProgress, 1);
+      const point = pair.path.getPointAtLength(totalLength * progress);
+
+      pair.token.setAttribute("cx", point.x.toFixed(2));
+      pair.token.setAttribute("cy", point.y.toFixed(2));
+
+      if (!loop && rawProgress >= 1) {
+        return;
+      }
+      rafId = window.requestAnimationFrame(tickToken);
+    };
+
+    rafId = window.requestAnimationFrame(tickToken);
+    return () => {
+      stopped = true;
+      window.cancelAnimationFrame(rafId);
+      pair.token.style.opacity = "0";
+    };
+  };
+
+  const stopTokenAnimations = () => {
+    tokenStops.forEach((stopFn) => stopFn());
+    tokenStops = [];
+    hideAllTokens();
+  };
+
+  const runStageAnimation = (stage) => {
+    stopTokenAnimations();
+    if (!fedSequence) {
+      return;
+    }
+
+    if (prefersReducedMotion) {
+      if (stage === 0) {
+        placeTokenOnPath("token-main", "edge-main", 1);
+      }
+      if (stage === 1) {
+        placeTokenOnPath("token-b1", "edge-b1", 1);
+        placeTokenOnPath("token-b2", "edge-b2", 1);
+        placeTokenOnPath("token-b3", "edge-b3", 1);
+      }
+      if (stage === 2) {
+        placeTokenOnPath("token-p1", "edge-p1", 1);
+        placeTokenOnPath("token-p2", "edge-p2", 1);
+        placeTokenOnPath("token-p3", "edge-p3", 1);
+      }
+      if (stage === 3) {
+        placeTokenOnPath("token-r", "edge-r", 1);
+        placeTokenOnPath("token-u", "edge-u", 1);
+      }
+      return;
+    }
+
+    if (stage === 0) {
+      tokenStops.push(animateTokenOnPath("token-main", "edge-main", 1700));
+    }
+    if (stage === 1) {
+      tokenStops.push(animateTokenOnPath("token-b1", "edge-b1", 1500, { delayMs: 0 }));
+      tokenStops.push(animateTokenOnPath("token-b2", "edge-b2", 1500, { delayMs: 230 }));
+      tokenStops.push(animateTokenOnPath("token-b3", "edge-b3", 1500, { delayMs: 460 }));
+    }
+    if (stage === 2) {
+      tokenStops.push(animateTokenOnPath("token-p1", "edge-p1", 1500, { delayMs: 0 }));
+      tokenStops.push(animateTokenOnPath("token-p2", "edge-p2", 1500, { delayMs: 220 }));
+      tokenStops.push(animateTokenOnPath("token-p3", "edge-p3", 1500, { delayMs: 440 }));
+    }
+    if (stage === 3) {
+      tokenStops.push(animateTokenOnPath("token-r", "edge-r", 1250, { delayMs: 0 }));
+      tokenStops.push(animateTokenOnPath("token-u", "edge-u", 1250, { delayMs: 320 }));
+    }
+  };
+
+  const setStage = (stage, manual = false) => {
+    currentStage = stage;
+    if (fedSequence) {
+      fedSequence.dataset.stage = String(stage);
+    }
+    stageButtons.forEach((btn) => {
+      btn.classList.toggle("is-active", Number.parseInt(btn.dataset.stage || "0", 10) === stage);
+    });
+    if (sequenceCaption) {
+      sequenceCaption.textContent = stageCaptions[stage] || stageCaptions[0];
+    }
+    runStageAnimation(stage);
+
+    if (manual && !prefersReducedMotion) {
+      window.clearInterval(stageTimer);
+      stageTimer = window.setInterval(() => {
+        setStage((currentStage + 1) % 4);
+      }, 3600);
+    }
+  };
+
+  if (fedSequence) {
+    stageButtons.forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const idx = Number.parseInt(btn.dataset.stage || "0", 10);
+        setStage(idx, true);
+      });
+    });
+
+    setStage(0);
+    if (!prefersReducedMotion) {
+      stageTimer = window.setInterval(() => {
+        setStage((currentStage + 1) % 4);
+      }, 3600);
+    }
   }
 
   const canvas = document.getElementById("hero-canvas");
@@ -204,5 +335,9 @@
     if (stepTimer) {
       window.clearInterval(stepTimer);
     }
+    if (stageTimer) {
+      window.clearInterval(stageTimer);
+    }
+    stopTokenAnimations();
   });
 })();

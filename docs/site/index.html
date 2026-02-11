@@ -112,63 +112,60 @@
 
       <div class="fed-layout">
         <article class="engine-card reveal">
-          <h3>Shared prefix → branch → reward → update</h3>
-          <div class="pipeline" role="img" aria-label="Animated FED-GRPO rollout process">
-            <div class="node prefix">Shared Prefix<br /><strong>z<sub>pre</sub></strong></div>
+          <h3>Shared prefix → branch → preference model → reward → update</h3>
+          <p class="engine-intro">
+            The animation runs in four steps: one shared trajectory to the branching point, grouped rollout branches,
+            preference-model evaluation, then reward-driven policy update.
+          </p>
 
-            <div class="lanes" aria-hidden="true">
-              <div class="lane lane-a"><span class="runner"></span></div>
-              <div class="lane lane-b"><span class="runner"></span></div>
-              <div class="lane lane-c"><span class="runner"></span></div>
+          <div class="stage-rail" id="stageRail" aria-label="FED-GRPO animation stages">
+            <button type="button" class="stage-chip is-active" data-stage="0">1. Shared trajectory</button>
+            <button type="button" class="stage-chip" data-stage="1">2. Branch rollouts</button>
+            <button type="button" class="stage-chip" data-stage="2">3. Preference model</button>
+            <button type="button" class="stage-chip" data-stage="3">4. Reward and update</button>
+          </div>
+
+          <div class="sequence-scroller">
+            <div class="sequence-canvas" id="fedSequence" data-stage="0" role="img" aria-label="Animated FED-GRPO staged process">
+              <svg class="seq-svg" viewBox="0 0 1200 620" aria-hidden="true">
+                <path id="edge-main" class="edge edge-main" d="M 150 320 L 360 320" />
+                <path id="edge-b1" class="edge edge-branch" d="M 360 320 L 600 205" />
+                <path id="edge-b2" class="edge edge-branch" d="M 360 320 L 600 320" />
+                <path id="edge-b3" class="edge edge-branch" d="M 360 320 L 600 435" />
+                <path id="edge-p1" class="edge edge-pref" d="M 675 205 C 760 210, 800 244, 860 276" />
+                <path id="edge-p2" class="edge edge-pref" d="M 675 320 C 760 320, 800 302, 860 286" />
+                <path id="edge-p3" class="edge edge-pref" d="M 675 435 C 760 418, 800 348, 860 300" />
+                <path id="edge-r" class="edge edge-reward" d="M 930 290 L 1070 236" />
+                <path id="edge-u" class="edge edge-update" d="M 930 320 L 1070 392" />
+
+                <circle id="token-main" class="token token-main" cx="150" cy="320" r="10" />
+                <circle id="token-b1" class="token token-branch" cx="360" cy="320" r="9" />
+                <circle id="token-b2" class="token token-branch" cx="360" cy="320" r="9" />
+                <circle id="token-b3" class="token token-branch" cx="360" cy="320" r="9" />
+                <circle id="token-p1" class="token token-pref" cx="675" cy="205" r="8" />
+                <circle id="token-p2" class="token token-pref" cx="675" cy="320" r="8" />
+                <circle id="token-p3" class="token token-pref" cx="675" cy="435" r="8" />
+                <circle id="token-r" class="token token-reward" cx="930" cy="290" r="8" />
+                <circle id="token-u" class="token token-update" cx="930" cy="320" r="8" />
+              </svg>
+
+              <div class="seq-node-card" id="seqStart">Shared Prefix<br /><strong>z<sub>pre</sub></strong></div>
+              <div class="seq-node-card seq-hub" id="seqBranch">Branch Point</div>
+
+              <div class="seq-node-card seq-terminal t1" id="seqRollout1">Rollout 1<br /><strong>z<sub>0</sub></strong></div>
+              <div class="seq-node-card seq-terminal t2" id="seqRollout2">Rollout 2<br /><strong>z<sub>0</sub></strong></div>
+              <div class="seq-node-card seq-terminal t3" id="seqRollout3">Rollout 3<br /><strong>z<sub>0</sub></strong></div>
+
+              <div class="seq-node-card seq-pref-card" id="seqPref">Preference Model<br /><strong>MLFF &phi;</strong></div>
+              <div class="seq-node-card seq-reward-card" id="seqReward">Reward<br /><strong>r(z, &phi;)</strong></div>
+              <div class="seq-node-card seq-update-card" id="seqUpdate">Policy Update<br /><strong>&theta; &larr; &theta; + &Delta;</strong></div>
             </div>
-
-            <div class="node terminal">Terminal<br /><strong>z<sub>0</sub></strong></div>
           </div>
 
-          <div class="engine-notes">
-            <p><strong>Force reward:</strong> terminal stability/geometry quality signal.</p>
-            <p><strong>Energy reward:</strong> optional PBRS return-to-go from MLFF potentials.</p>
-          </div>
+          <p class="sequence-caption" id="sequenceCaption">
+            1) A node follows the shared trajectory to the branch point.
+          </p>
         </article>
-
-        <aside class="controls-card reveal">
-          <h3>FED-GRPO mixer</h3>
-          <p>Tune the relative influence of force and energy channels in the mixed advantage.</p>
-
-          <label class="control-row" for="forceWeight">
-            <span>Force weight w<sub>F</sub></span>
-            <output id="forceOut">1.00</output>
-          </label>
-          <input id="forceWeight" type="range" min="0.4" max="2.0" step="0.05" value="1.00" />
-
-          <label class="control-row" for="energyWeight">
-            <span>Energy weight w<sub>E</sub></span>
-            <output id="energyOut">0.10</output>
-          </label>
-          <input id="energyWeight" type="range" min="0.00" max="0.30" step="0.01" value="0.10" />
-
-          <label class="control-row" for="groupSize">
-            <span>Group size K</span>
-            <output id="groupOut">24</output>
-          </label>
-          <input id="groupSize" type="range" min="4" max="32" step="2" value="24" />
-
-          <p class="live-formula" id="mixFormula">A = 1.00 · z(F) + 0.10 · z(E)</p>
-
-          <div class="mix-bars" aria-hidden="true">
-            <div class="mix-col">
-              <div class="mix-bar force" id="forceBar"></div>
-              <span>Force</span>
-            </div>
-            <div class="mix-col">
-              <div class="mix-bar energy" id="energyBar"></div>
-              <span>Energy</span>
-            </div>
-          </div>
-
-          <div class="rollout-strip" id="rolloutStrip" aria-label="Rollout samples"></div>
-          <small id="rolloutCaption">Showing 12 sampled rollouts from K=24.</small>
-        </aside>
       </div>
     </section>
 
