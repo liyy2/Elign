@@ -28,7 +28,7 @@ This repository contains:
 ## Method overview
 
 <p align="center">
-  <img src="assets/figures/fig1_elign_overview.png" width="720" alt="ELIGN pipeline: pretraining, conditional midtraining, preference model (MLFF), and RL post-training alignment." />
+  <img src="assets/figures/fig1_elign_overview.png" width="520" alt="ELIGN pipeline: pretraining, conditional midtraining, preference model (MLFF), and RL post-training alignment." />
 </p>
 <p align="center">
   <em>Figure 1. High-level ELIGN pipeline: pretraining (score matching), conditional midtraining, foundational MLFF as a preference model, and RL post-training (alignment).</em>
@@ -195,6 +195,7 @@ Start here:
 - `docs/paper_code_map.md`
 - `docs/evaluation.md`
 - `docs/config_reference.md`
+- `docs/site/index.html` (interactive animated concept page)
 
 Backbone docs (upstream EDM-style code):
 
