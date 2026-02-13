@@ -18,7 +18,7 @@
 </p>
 
 </div>
-
+---
 ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. Starting from a pretrained diffusion backbone (EDM-style), ELIGN optimizes the **reverse-diffusion policy** with reinforcement learning using physics-inspired rewards (e.g., energies and forces from foundational ML force fields).
 
 The RL optimizer used in ELIGN is **FED-GRPO** (**F**orce and **E**nergy **D**isentangled **G**roup **R**elative **P**olicy **O**ptimization), which:
