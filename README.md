@@ -9,6 +9,14 @@
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-informational)](#installation)
 
+
+<p align="center">
+  <img src="assets/figures/fig1_elign_overview.png" width="520" alt="ELIGN pipeline: pretraining, conditional midtraining, preference model (MLFF), and RL post-training alignment." />
+</p>
+<p align="center">
+  <em>Figure 1. High-level ELIGN pipeline: pretraining (score matching), conditional midtraining, foundational MLFF as a preference model, and RL post-training (alignment).</em>
+</p>
+
 </div>
 
 ELIGN is a post-training method for **E(3)-equivariant diffusion models** for 3D molecule generation. Starting from a pretrained diffusion backbone (EDM-style), ELIGN optimizes the **reverse-diffusion policy** with reinforcement learning using physics-inspired rewards (e.g., energies and forces from foundational ML force fields).
@@ -27,12 +35,6 @@ This repository contains:
 
 ## Method overview
 
-<p align="center">
-  <img src="assets/figures/fig1_elign_overview.png" width="520" alt="ELIGN pipeline: pretraining, conditional midtraining, preference model (MLFF), and RL post-training alignment." />
-</p>
-<p align="center">
-  <em>Figure 1. High-level ELIGN pipeline: pretraining (score matching), conditional midtraining, foundational MLFF as a preference model, and RL post-training (alignment).</em>
-</p>
 
 <p align="center">
   <img src="assets/figures/fig2_fed_grpo_overview.png" width="1000" alt="FED-GRPO overview: shared-prefix diffusion rollout groups, energy shaping, and force/energy advantage normalization." />
