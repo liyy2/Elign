@@ -61,15 +61,17 @@ KL_PENALTY_WEIGHT="${KL_PENALTY_WEIGHT:-0.08}"
 
 SAMPLE_GROUP_SIZE="${SAMPLE_GROUP_SIZE:-4}"
 EACH_PROMPT_SAMPLE="${EACH_PROMPT_SAMPLE:-6}"
-TIME_STEP="${TIME_STEP:-1000}"
+TIME_STEP="${TIME_STEP:-256}"
 SHARE_INITIAL_NOISE="${SHARE_INITIAL_NOISE:-true}"
 RETURN_SUFFIX_ONLY="${RETURN_SUFFIX_ONLY:-true}"
-SKIP_PREFIX="${SKIP_PREFIX:-700}"
-POLICY_START_IDX="${POLICY_START_IDX:-700}"
+SKIP_PREFIX="${SKIP_PREFIX:-192}"
+POLICY_START_IDX="${POLICY_START_IDX:-192}"
+SDE_WINDOW_SIZE="${SDE_WINDOW_SIZE:-4}"
+SDE_MODE="${SDE_MODE:-sigma_corrected_hb}"
 
 SDE_NOISE_SCALE="${SDE_NOISE_SCALE:-0.35}"
 SDE_COORDINATE_NOISE_SCALE="${SDE_COORDINATE_NOISE_SCALE:-0.35}"
-SDE_FEATURE_NOISE_SCALE="${SDE_FEATURE_NOISE_SCALE:-0.10}"
+SDE_FEATURE_NOISE_SCALE="${SDE_FEATURE_NOISE_SCALE:-0.05}"
 SDE_MIN_SIGMA="${SDE_MIN_SIGMA:-1e-6}"
 
 FORCE_ALIGNMENT_ENABLED="${FORCE_ALIGNMENT_ENABLED:-false}"
@@ -99,7 +101,7 @@ SCHEDULER_TOTAL_STEPS="${SCHEDULER_TOTAL_STEPS:-1500}"
 SCHEDULER_MIN_LR_RATIO="${SCHEDULER_MIN_LR_RATIO:-0.3}"
 
 timestamp=$(date +"%Y%m%d_%H%M%S")
-RUN_NAME="verl_molfm_qm9_lr_$(sanitize_for_name "${LEARNING_RATE}")_sde_$(sanitize_for_name "${SDE_NOISE_SCALE}")_${timestamp}"
+RUN_NAME="verl_molfm_qm9_ts_$(sanitize_for_name "${TIME_STEP}")_lr_$(sanitize_for_name "${LEARNING_RATE}")_sde_$(sanitize_for_name "${SDE_NOISE_SCALE}")_${timestamp}"
 
 SAVE_ROOT="${SAVE_ROOT:-${REPO_ROOT}/outputs/verl}"
 SAVE_PATH="${SAVE_ROOT}/${RUN_NAME}"
@@ -155,6 +157,8 @@ fi
   model.return_suffix_only="${RETURN_SUFFIX_ONLY}" \
   model.skip_prefix="${SKIP_PREFIX}" \
   model.policy_start_idx="${POLICY_START_IDX}" \
+  model.sde_window_size="${SDE_WINDOW_SIZE}" \
+  model.sde_mode="${SDE_MODE}" \
   model.sde_noise_scale="${SDE_NOISE_SCALE}" \
   model.sde_coordinate_noise_scale="${SDE_COORDINATE_NOISE_SCALE}" \
   model.sde_feature_noise_scale="${SDE_FEATURE_NOISE_SCALE}" \

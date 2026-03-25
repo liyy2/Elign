@@ -15,16 +15,28 @@ model:
   # the checkpoint/config files locally.
   config: "./pretrained/molfm/qm9/args.pickle"
   model_path: "./pretrained/molfm/qm9/generative_model_ema_0.npy"
-  time_step: 1000
+  # Use a fixed RL grid instead of mirroring the upstream `diffusion_steps`
+  # config. The public MolFM sampler is adaptive `dopri5`, and a 256-step fixed
+  # grid is a closer practical approximation than forcing 1000 explicit PPO
+  # transitions.
+  time_step: 256
   share_initial_noise: true
-  skip_prefix: 700
+  # Keep the first 75% of the trajectory deterministic and train the stochastic
+  # suffix on the final quarter of reverse steps.
+  skip_prefix: 192
   return_suffix_only: true
-  # Train only on the stochastic suffix. The first `policy_start_idx` reverse
-  # steps remain deterministic ODE updates.
-  policy_start_idx: 700
-  # Isotropic Brownian perturbation around the MolFM vector field.
+  # Train only on a short stochastic window. The first `policy_start_idx`
+  # reverse steps remain deterministic ODE updates.
+  policy_start_idx: 192
+  # Flow-GRPO-style short stochastic window instead of perturbing the entire
+  # suffix. This keeps the policy close to the deterministic MolFM solver.
+  sde_window_size: 4
+  # Use a sigma-corrected HB-path SDE step. Coordinates and features get
+  # separate sigma-dependent corrections; feature noise stays much smaller.
+  sde_mode: sigma_corrected_hb
+  # Global coordinate noise multiplier. The sigma dependence is built into the
+  # corrected mean / variance rule; this scalar is the tunable noise level.
   sde_noise_scale: 0.35
-  # Coordinates are more robust than categorical/charge channels.
   sde_coordinate_noise_scale: 0.35
-  sde_feature_noise_scale: 0.10
+  sde_feature_noise_scale: 0.05
   sde_min_sigma: 1.0e-6
