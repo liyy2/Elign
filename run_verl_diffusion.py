@@ -29,6 +29,8 @@ from edm_source.qm9.models import get_model, get_latent_diffusion
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.model.edm_model import EDMModel
+from verl_diffusion.model.molfm_core import build_molfm_qm9_components
+from verl_diffusion.model.molfm_model import MolFMModel
 from verl_diffusion.worker.actor.edm_actor import EDMActor
 from verl_diffusion.worker.filter.filter import Filter
 from verl_diffusion.worker.reward.dummy import DummyReward
@@ -160,14 +162,20 @@ def main(cfg: DictConfig) -> None:
         edm_config.normalization_factor = 1
     if not hasattr(edm_config, "aggregation_method"):
         edm_config.aggregation_method = "sum"
+    if not hasattr(edm_config, "probabilistic_model"):
+        edm_config.probabilistic_model = "diffusion"
 
     model_cfg = config.get("model") if isinstance(config, dict) else {}
     backend = "auto"
     if isinstance(model_cfg, dict):
         backend = str(model_cfg.get("backend", "auto") or "auto").lower()
     if backend in {"", "auto"}:
-        backend = "geoldm" if bool(getattr(edm_config, "train_diffusion", False)) else "edm"
-    if backend not in {"edm", "geoldm"}:
+        probabilistic_model = str(getattr(edm_config, "probabilistic_model", "") or "").lower()
+        if probabilistic_model == "flow_matching":
+            backend = "molfm"
+        else:
+            backend = "geoldm" if bool(getattr(edm_config, "train_diffusion", False)) else "edm"
+    if backend not in {"edm", "geoldm", "molfm"}:
         raise ValueError(f"Unsupported model backend '{backend}'.")
     if is_main_process:
         print(f"Using diffusion backend: {backend}")
@@ -198,8 +206,13 @@ def main(cfg: DictConfig) -> None:
                     "Provide `dataloader.smiles_path` or disable `filters.enable_penalty`."
                 )
     dataloaders, _ = retrieve_dataloaders(edm_config)
+    dequantizer = None
     if backend == "geoldm":
         flow, nodes_dist, prop_dist = get_latent_diffusion(
+            edm_config, edm_config.device, dataset_info, dataloaders["train"]
+        )
+    elif backend == "molfm":
+        flow, nodes_dist, prop_dist, dequantizer = build_molfm_qm9_components(
             edm_config, edm_config.device, dataset_info, dataloaders["train"]
         )
     else:
@@ -247,7 +260,10 @@ def main(cfg: DictConfig) -> None:
     flow.to(device)
 
     # Initialize EDM model
-    model = EDMModel(flow, edm_config, backend=backend)
+    if backend == "molfm":
+        model = MolFMModel(flow, dequantizer, edm_config, policy_config=model_cfg)
+    else:
+        model = EDMModel(flow, edm_config, backend=backend)
     model.to(device)
     model.load(model_path=config["model"]["model_path"])
 

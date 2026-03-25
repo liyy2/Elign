@@ -1,0 +1,30 @@
+defaults:
+  - ddpo_qm9_energy_force_group4x6
+  - _self_
+
+name: molfm-qm9-sde
+
+model:
+  backend: molfm
+  # Place the upstream MolFM QM9 sampling bundle here:
+  #   pretrained/molfm/qm9/args.pickle
+  #   pretrained/molfm/qm9/generative_model_ema_0.npy
+  #
+  # The upstream repo ships a Docker image for environment setup, but this
+  # integration does not require running sampling inside Docker. We only need
+  # the checkpoint/config files locally.
+  config: "./pretrained/molfm/qm9/args.pickle"
+  model_path: "./pretrained/molfm/qm9/generative_model_ema_0.npy"
+  time_step: 1000
+  share_initial_noise: true
+  skip_prefix: 700
+  return_suffix_only: true
+  # Train only on the stochastic suffix. The first `policy_start_idx` reverse
+  # steps remain deterministic ODE updates.
+  policy_start_idx: 700
+  # Isotropic Brownian perturbation around the MolFM vector field.
+  sde_noise_scale: 0.35
+  # Coordinates are more robust than categorical/charge channels.
+  sde_coordinate_noise_scale: 0.35
+  sde_feature_noise_scale: 0.10
+  sde_min_sigma: 1.0e-6

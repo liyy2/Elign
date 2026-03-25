@@ -51,6 +51,12 @@ class EDMRollout(BaseRollout):
                 self.skip_prefix = max(0, int(model_cfg.get("skip_prefix")))
             except Exception:
                 pass
+        self.policy_start_idx = None
+        if isinstance(model_cfg, dict) and model_cfg.get("policy_start_idx") is not None:
+            try:
+                self.policy_start_idx = max(0, int(model_cfg.get("policy_start_idx")))
+            except Exception:
+                self.policy_start_idx = None
         
         
     def start_async(self, prompts_queue):
@@ -165,7 +171,10 @@ class EDMRollout(BaseRollout):
         mus_tensor = None
         if self.force_alignment_enabled and self.force_alignment_weight > 0.0:
             mus_tensor = torch.stack(mus, dim=1)
-        z0_preds_tensor = torch.stack(z0_preds, dim=1)
+        expose_z0_preds = bool(getattr(model_ref, "expose_z0_preds", True))
+        z0_preds_tensor = None
+        if expose_z0_preds:
+            z0_preds_tensor = torch.stack(z0_preds, dim=1)
 
         # Convert timesteps to tensor and expand to batch_size
         timesteps_tensor = torch.tensor(timesteps, device=device)
@@ -178,12 +187,13 @@ class EDMRollout(BaseRollout):
             "x": x,
             "categorical": h["categorical"],
             "latents": latents_tensor,
-            "z0_preds": z0_preds_tensor,
             "logps": logps_tensor,
             "nodesxsample": nodesxsample,
             "timesteps": expanded_timesteps,
             "group_index": prompts.batch["group_index"],
         }
+        if z0_preds_tensor is not None:
+            batch_data["z0_preds"] = z0_preds_tensor
         if mus_tensor is not None:
             batch_data["mus"] = mus_tensor
 
@@ -192,6 +202,16 @@ class EDMRollout(BaseRollout):
         meta_info["skip_prefix"] = effective_skip_prefix
         meta_info["original_skip_prefix"] = self.skip_prefix
         meta_info["share_initial_noise"] = bool(self.config["model"].get("share_initial_noise", False))
+        configured_policy_start_idx = self.policy_start_idx
+        if configured_policy_start_idx is None:
+            if getattr(model_ref, "backend", None) == "molfm":
+                configured_policy_start_idx = self.skip_prefix
+            elif share_prefix:
+                configured_policy_start_idx = self.skip_prefix
+            else:
+                configured_policy_start_idx = 0
+        effective_policy_start_idx = 0 if (return_suffix_only and share_prefix) else configured_policy_start_idx
+        meta_info["policy_start_idx"] = int(max(0, effective_policy_start_idx))
 
         return DataProto(batch=TensorDict(batch_data, batch_size= batch_size), meta_info=meta_info)
     

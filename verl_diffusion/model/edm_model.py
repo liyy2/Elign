@@ -23,7 +23,7 @@ class EDMModel(BaseModel, torch.nn.Module):
         normalized_backend = str(backend or "auto").strip().lower()
         if normalized_backend in {"", "auto"}:
             normalized_backend = "geoldm" if hasattr(model, "vae") else "edm"
-        if normalized_backend not in {"edm", "geoldm"}:
+        if normalized_backend not in {"edm", "geoldm", "molfm"}:
             raise ValueError(f"Unsupported diffusion backend '{backend}'.")
         self.backend = normalized_backend
 

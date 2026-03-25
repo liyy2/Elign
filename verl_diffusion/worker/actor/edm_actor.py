@@ -622,13 +622,20 @@ class EDMActor(BaseActor):
         timesteps_full = timesteps_all[:, :diffusion_steps].clone()
         logps_full = logps_all[:, :diffusion_steps].clone()
 
-        meta_skip_prefix = data.meta_info.get("skip_prefix", self.skip_prefix)
-        try:
-            meta_skip_prefix = int(meta_skip_prefix)
-        except Exception:
-            meta_skip_prefix = self.skip_prefix
-        share_prefix = bool(data.meta_info.get("share_initial_noise", self.share_initial_noise))
-        start_idx = min(meta_skip_prefix if share_prefix else 0, diffusion_steps)
+        policy_start_idx = data.meta_info.get("policy_start_idx")
+        if policy_start_idx is None:
+            meta_skip_prefix = data.meta_info.get("skip_prefix", self.skip_prefix)
+            try:
+                meta_skip_prefix = int(meta_skip_prefix)
+            except Exception:
+                meta_skip_prefix = self.skip_prefix
+            share_prefix = bool(data.meta_info.get("share_initial_noise", self.share_initial_noise))
+            start_idx = min(meta_skip_prefix if share_prefix else 0, diffusion_steps)
+        else:
+            try:
+                start_idx = min(max(int(policy_start_idx), 0), diffusion_steps)
+            except Exception:
+                start_idx = 0
 
         if start_idx > 0:
             latents_full = latents_full[:, start_idx:]
