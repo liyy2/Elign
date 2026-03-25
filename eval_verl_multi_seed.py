@@ -23,8 +23,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--args-pickle",
         type=str,
-        default="pretrained/edm/edm_qm9/args.pickle",
-        help="Path to EDM args.pickle.",
+        default=None,
+        help=(
+            "Path to EDM args.pickle. Defaults to <run-dir>/args.pickle when present, otherwise "
+            "config.yaml's model.config, otherwise pretrained/edm/edm_qm9/args.pickle."
+        ),
     )
     parser.add_argument(
         "--seeds",
@@ -95,7 +98,28 @@ def main() -> None:
     args = parse_args()
     run_dir = _abs_path(args.run_dir, Path.cwd())
     checkpoint_path = _abs_path(args.checkpoint, run_dir)
-    args_pickle = _abs_path(args.args_pickle, Path.cwd())
+
+    args_pickle_value = args.args_pickle
+    if args_pickle_value is None:
+        candidate = run_dir / "args.pickle"
+        if candidate.exists():
+            args_pickle_value = str(candidate)
+        else:
+            cfg_path = run_dir / "config.yaml"
+            if cfg_path.exists():
+                import yaml
+
+                with open(cfg_path, "r") as f:
+                    payload = yaml.safe_load(f) or {}
+                model_cfg = payload.get("model", {}) if isinstance(payload, dict) else {}
+                config_value = model_cfg.get("config")
+                if config_value:
+                    args_pickle_value = str(config_value)
+
+    if args_pickle_value is None:
+        args_pickle_value = "pretrained/edm/edm_qm9/args.pickle"
+
+    args_pickle = _abs_path(args_pickle_value, Path.cwd())
     seeds = [int(s.strip()) for s in args.seeds.split(",") if s.strip()]
     if not seeds:
         raise ValueError("--seeds must contain at least one integer seed")

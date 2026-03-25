@@ -86,9 +86,8 @@ FORCE_ALIGNMENT_ENABLED="${FORCE_ALIGNMENT_ENABLED:-false}"
 # Reward configuration
 # ----------------------------
 USE_ENERGY="${USE_ENERGY:-true}"
-# Default to UMA-S for stability. UMA-M can be enabled via `MLFF_MODEL=uma-m-1p1`,
-# but in our quick tests it was much more sensitive to PPO hyperparameters.
-MLFF_MODEL="${MLFF_MODEL:-uma-s-1p1}"
+# Polar MACE is the default reward backend. Override `MLFF_MODEL` to switch checkpoints.
+MLFF_MODEL="${MLFF_MODEL:-polar-1-m}"
 MLFF_BATCH_SIZE="${MLFF_BATCH_SIZE:-32}"
 FORCE_AGGREGATION="${FORCE_AGGREGATION:-rms}"
 STABILITY_WEIGHT="${STABILITY_WEIGHT:-2.0}"
@@ -190,6 +189,7 @@ fi
   dataloader.each_prompt_sample="${EACH_PROMPT_SAMPLE}" \
   train.force_alignment_enabled="${FORCE_ALIGNMENT_ENABLED}" \
   reward.use_energy="${USE_ENERGY}" \
+  reward.type="polar_mace" \
   reward.mlff_model="${MLFF_MODEL}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \
   reward.force_aggregation="${FORCE_AGGREGATION}" \

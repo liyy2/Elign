@@ -1,0 +1,83 @@
+\section{Hyperparameters}
+
+\begin{table}[H]
+\centering
+\caption{Hyperparameters for RL post-training (QM9)}
+\label{tab:hyperparameter-rl-qm9}
+\small
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}>{\ttfamily}l >{\raggedright\arraybackslash}p{0.5\textwidth} >{\raggedright\arraybackslash}p{0.11\textwidth}}
+\toprule
+Notation & Description & Value \\
+\midrule
+\texttt{train.learning\_rate} & Learning rate for policy optimization & $4\times 10^{-6}$ \\
+\texttt{train.clip\_range} & PPO clipping threshold & $2\times 10^{-3}$ \\
+\texttt{train.train\_micro\_batch\_size} & Micro-batch size for PPO updates & 8 \\
+\texttt{train.gradient\_accumulation\_steps} & Gradient accumulation steps per PPO update & 1 \\
+\texttt{train.epoch\_per\_rollout} & PPO optimization epochs per rollout batch & 1 \\
+\texttt{train.kl\_penalty\_weight} & KL regularization weight (vs.\ reference policy) & 0.08 \\
+\texttt{train.adv\_clip\_max} & Max magnitude for clipped advantages & 5 \\
+\texttt{train.max\_grad\_norm} & Gradient norm clipping threshold & 1.0 \\
+\texttt{dataloader.sample\_group\_size} & Number of group per sample & 4 \\
+\texttt{dataloader.each\_prompt\_sample} & Group size & 6 \\
+\texttt{dataloader.micro\_batch\_size} & Rollout-generation micro-batch size & 24 \\
+\texttt{dataloader.epoches} & Number of rollout/update iterations & 200 \\
+\texttt{model.time\_step} & Diffusion timesteps used during rollouts & 1000 \\
+\texttt{reward.mlff\_model} & MLFF model identifier & \texttt{uma-m-1p1} (\texttt{uma-s-1p1} optional) \\
+\texttt{reward.shaping.mlff\_batch\_size} & Batch size for reward evaluation (chunking) & 32 \\
+\texttt{reward.force\_aggregation} & Aggregation for force errors & \texttt{rms} (\texttt{max} optional) \\
+\texttt{reward.force\_clip\_threshold} & Per-atom force magnitude clip before aggregation & 2.0 \\
+\texttt{reward.force\_adv\_weight} & Weight for force advantages (GRPO mixing) & 1.0 \\
+\texttt{reward.energy\_adv\_weight} & Weight for energy advantages (GRPO mixing) & 0.05 \\
+\texttt{reward.energy\_only\_if\_stable} & Gate energy reward on stability & \texttt{true} \\
+\texttt{reward.stability\_weight} & Stability reward weight & 2.0 \\
+\texttt{reward.energy\_transform\_clip} & Clip transformed energy before negation & 5.0 \\
+\texttt{reward.shaping.gamma} & Discount factor for shaping returns (if enabled) & 1.0 \\
+\texttt{reward.shaping.scheduler.skip\_prefix} & Steps skipped for shaping schedule (if enabled) & 700 \\
+\texttt{train.scheduler.name} & LR scheduler type & \texttt{cosine} \\
+\texttt{train.scheduler.warmup\_steps} & Scheduler warmup steps & 60 \\
+\texttt{train.scheduler.total\_steps} & Scheduler total steps & 1500 \\
+\texttt{train.scheduler.min\_lr\_ratio} & Final LR ratio after decay & 0.3 \\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Hyperparameters for RL post-training (GEOM-Drugs)}
+\label{tab:hyperparameter-rl-geom}
+\small
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}>{\ttfamily}l >{\raggedright\arraybackslash}p{0.5\textwidth} >{\raggedright\arraybackslash}p{0.11\textwidth}}
+\toprule
+Notation & Description & Value \\
+\midrule
+\texttt{train.learning\_rate} & Learning rate for policy optimization & $1\times 10^{-7}$ \\
+\texttt{train.clip\_range} & PPO clipping threshold & 0.03 \\
+\texttt{train.train\_micro\_batch\_size} & Micro-batch size for PPO updates & 16 \\
+\texttt{train.gradient\_accumulation\_steps} & Gradient accumulation steps per PPO update & 8 \\
+\texttt{train.epoch\_per\_rollout} & PPO optimization epochs per rollout batch & 1 \\
+\texttt{train.kl\_penalty\_weight} & KL regularization weight (vs.\ reference policy) & 0.2 \\
+\texttt{train.adv\_clip\_max} & Max magnitude for clipped advantages & 2 \\
+\texttt{train.max\_grad\_norm} & Gradient norm clipping threshold & 0.5 \\
+\texttt{dataloader.sample\_group\_size} & Number of group per sample & 4 \\
+\texttt{dataloader.each\_prompt\_sample} & Group size & 32 \\
+\texttt{dataloader.micro\_batch\_size} & Rollout-generation micro-batch size & 32 \\
+\texttt{dataloader.epoches} & Number of rollout/update iterations & 1000000 \\
+\texttt{model.time\_step} & Diffusion timesteps used during rollouts & 1000 \\
+\texttt{reward.mlff\_model} & MLFF model identifier & \texttt{uma-m-1p1} (\texttt{uma-s-1p1} optional) \\
+\texttt{reward.shaping.mlff\_batch\_size} & Batch size for reward evaluation (chunking) & 16 \\
+\texttt{reward.force\_aggregation} & Aggregation for force errors & \texttt{rms} (\texttt{max} optional) \\
+\texttt{reward.force\_clip\_threshold} & Per-atom force magnitude clip before aggregation & 8.0 \\
+\texttt{reward.force\_adv\_weight} & Weight for force advantages (GRPO mixing) & 0.7 \\
+\texttt{reward.energy\_adv\_weight} & Weight for energy advantages (GRPO mixing) & 0.05 \\
+\texttt{reward.energy\_only\_if\_stable} & Gate energy reward on stability & \texttt{true} \\
+\texttt{reward.stability\_weight} & Stability reward weight & 3.0 \\
+\texttt{reward.energy\_transform\_clip} & Clip transformed energy before negation & 10.0 \\
+\texttt{reward.shaping.gamma} & Discount factor for shaping returns (if enabled) & 1.0 \\
+\texttt{reward.shaping.scheduler.skip\_prefix} & Steps skipped for shaping schedule (if enabled) & 0 \\
+\texttt{train.scheduler.name} & LR scheduler type & \texttt{none} \\
+\texttt{train.scheduler.warmup\_steps} & Scheduler warmup steps & 0 \\
+\texttt{train.scheduler.total\_steps} & Scheduler total steps & 0 \\
+\texttt{train.scheduler.min\_lr\_ratio} & Final LR ratio after decay & 1.0 \\
+\bottomrule
+\end{tabular*}
+\end{table}

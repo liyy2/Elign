@@ -1,0 +1,8 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_strong
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-strong-noforcegate
+
+reward:
+  force_only_if_stable: false

@@ -1,0 +1,19 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard
+
+# Conservative fine-tune recipe to reduce MolStab crashes / valence overbond spikes when
+# resuming from a strong V×U checkpoint.
+train:
+  learning_rate: 5.0e-07
+  clip_range: 0.15
+  kl_penalty_weight: 0.06
+  kl_adaptive: false
+
+reward:
+  force_only_if_stable: true
+  stability_weight: 5.0
+  valence_overbond_weight: 0.15
+  valence_overbond_soft_weight: 0.03

@@ -1,6 +1,7 @@
 import os
 import pickle
 import random
+import signal
 import sys
 from typing import Dict, Optional
 
@@ -24,7 +25,7 @@ for path in (REPO_ROOT, EDM_SOURCE_ROOT):
 
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
-from edm_source.qm9.models import get_model
+from edm_source.qm9.models import get_model, get_latent_diffusion
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.model.edm_model import EDMModel
@@ -83,6 +84,21 @@ def _make_absolute(path_value: Optional[str]) -> Optional[str]:
 @hydra_main(config_path="verl_diffusion/trainer/config", config_name="ddpo_config", version_base=None)
 def main(cfg: DictConfig) -> None:
     """Entry point for DDPO training managed by Hydra."""
+
+    def _raise_keyboard_interrupt(signum, frame):  # type: ignore[no-untyped-def]
+        raise KeyboardInterrupt
+
+    # When launched in the background (e.g., via `nohup ... &`), shells often set SIGINT/SIGQUIT
+    # to be ignored. Reset SIGINT to raise KeyboardInterrupt, and map SIGTERM to the same path so
+    # Slurm cancellations/timeouts save a final checkpoint.
+    try:
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+    except Exception:
+        pass
+    try:
+        signal.signal(signal.SIGTERM, _raise_keyboard_interrupt)
+    except Exception:
+        pass
 
     dist_state = _setup_distributed()
     is_main_process = dist_state["rank"] == 0
@@ -145,6 +161,17 @@ def main(cfg: DictConfig) -> None:
     if not hasattr(edm_config, "aggregation_method"):
         edm_config.aggregation_method = "sum"
 
+    model_cfg = config.get("model") if isinstance(config, dict) else {}
+    backend = "auto"
+    if isinstance(model_cfg, dict):
+        backend = str(model_cfg.get("backend", "auto") or "auto").lower()
+    if backend in {"", "auto"}:
+        backend = "geoldm" if bool(getattr(edm_config, "train_diffusion", False)) else "edm"
+    if backend not in {"edm", "geoldm"}:
+        raise ValueError(f"Unsupported model backend '{backend}'.")
+    if is_main_process:
+        print(f"Using diffusion backend: {backend}")
+
     # Set up device
     edm_config.cuda = not edm_config.no_cuda and torch.cuda.is_available()
     if edm_config.cuda:
@@ -171,9 +198,14 @@ def main(cfg: DictConfig) -> None:
                     "Provide `dataloader.smiles_path` or disable `filters.enable_penalty`."
                 )
     dataloaders, _ = retrieve_dataloaders(edm_config)
-    flow, nodes_dist, prop_dist = get_model(
-        edm_config, edm_config.device, dataset_info, dataloaders["train"]
-    )
+    if backend == "geoldm":
+        flow, nodes_dist, prop_dist = get_latent_diffusion(
+            edm_config, edm_config.device, dataset_info, dataloaders["train"]
+        )
+    else:
+        flow, nodes_dist, prop_dist = get_model(
+            edm_config, edm_config.device, dataset_info, dataloaders["train"]
+        )
 
     # Optional: reweight the node-count distribution used for RL rollouts.
     #
@@ -215,7 +247,7 @@ def main(cfg: DictConfig) -> None:
     flow.to(device)
 
     # Initialize EDM model
-    model = EDMModel(flow, edm_config)
+    model = EDMModel(flow, edm_config, backend=backend)
     model.to(device)
     model.load(model_path=config["model"]["model_path"])
 
@@ -245,12 +277,22 @@ def main(cfg: DictConfig) -> None:
     rollout = EDMRollout(model, config)
 
     reward_cfg = config.get("reward", {}) or {}
-    reward_type = "uma"
+    reward_type = "polar_mace"
     if isinstance(reward_cfg, dict):
         reward_type = str(reward_cfg.get("type", reward_type)).lower()
 
     reward_device = device
     mlff_device = device if device.type == "cuda" else "cpu"
+    if reward_type in {"xtb", "dft", "pyscf"}:
+        reward_device = torch.device("cpu")
+
+    position_scale = None
+    try:
+        norm_values = getattr(edm_config, "normalize_factors", None)
+        if isinstance(norm_values, (list, tuple)) and len(norm_values) > 0:
+            position_scale = float(norm_values[0])
+    except Exception:
+        position_scale = None
 
     if reward_type == "dummy":
         rewarder = DummyReward(
@@ -258,16 +300,24 @@ def main(cfg: DictConfig) -> None:
             stability_value=float(reward_cfg.get("stability_value", 0.0)),
             device=reward_device,
         )
-    elif reward_type in {"uma", "mlff"}:
+    elif reward_type in {"uma", "mlff", "polar_mace"}:
         rewarder = UMAForceReward(
             dataset_info,
             condition=False,
-            mlff_model=reward_cfg.get("mlff_model", "uma-s-1p1"),
+            mlff_model=reward_cfg.get("mlff_model", "polar-1-m"),
+            mlff_backend=reward_cfg.get(
+                "mlff_backend",
+                reward_type if reward_type in {"uma", "polar_mace"} else None,
+            ),
             mlff_predictor=None,
             position_scale=None,
             force_clip_threshold=reward_cfg.get("force_clip_threshold", None),
             device=reward_device,
             mlff_device=mlff_device,
+            mlff_charge=reward_cfg.get("mlff_charge", reward_cfg.get("charge", 0)),
+            mlff_spin=reward_cfg.get("mlff_spin", reward_cfg.get("spin", 1)),
+            mlff_external_field=reward_cfg.get("mlff_external_field", [0.0, 0.0, 0.0]),
+            mlff_default_dtype=reward_cfg.get("mlff_default_dtype", "float32"),
             shaping=reward_cfg.get("shaping", {}),
             use_energy=reward_cfg.get("use_energy", False),
             energy_only_if_stable=reward_cfg.get("energy_only_if_stable", False),
@@ -287,9 +337,46 @@ def main(cfg: DictConfig) -> None:
             energy_transform_clip=reward_cfg.get("energy_transform_clip", None),
             energy_normalize_by_atoms=reward_cfg.get("energy_normalize_by_atoms", False),
             energy_atom_refs=reward_cfg.get("energy_atom_refs", None),
+            min_pair_dist_threshold=reward_cfg.get("min_pair_dist_threshold", 0.9),
+            min_pair_dist_penalty_weight=reward_cfg.get("min_pair_dist_penalty_weight", 0.0),
+            min_pair_dist_penalty_power=reward_cfg.get("min_pair_dist_penalty_power", 1.0),
+        )
+    elif reward_type == "xtb":
+        from verl_diffusion.worker.reward.xtb_force import XTBForceReward
+
+        rewarder = XTBForceReward(
+            dataset_info=dataset_info,
+            position_scale=position_scale,
+            device=reward_device,
+            param=reward_cfg.get("xtb_param", reward_cfg.get("param", "GFN2xTB")),
+            charge=float(reward_cfg.get("charge", 0.0)),
+            uhf=reward_cfg.get("uhf", None),
+            fallback_reward=float(reward_cfg.get("fallback_reward", -5.0)),
+        )
+    elif reward_type in {"dft", "pyscf"}:
+        from verl_diffusion.worker.reward.pyscf_dft_force import PySCFDFTForceReward
+
+        rewarder = PySCFDFTForceReward(
+            dataset_info=dataset_info,
+            position_scale=position_scale,
+            device=reward_device,
+            xc=reward_cfg.get("xc", reward_cfg.get("dft_xc", "pbe")),
+            basis=reward_cfg.get("basis", reward_cfg.get("dft_basis", "sto-3g")),
+            charge=int(reward_cfg.get("charge", 0)),
+            spin=reward_cfg.get("spin", None),
+            max_cycle=int(reward_cfg.get("max_cycle", 50)),
+            conv_tol=float(reward_cfg.get("conv_tol", 1e-6)),
+            grids_level=int(reward_cfg.get("grids_level", 3)),
+            density_fit=bool(reward_cfg.get("density_fit", True)),
+            accept_unconverged=bool(reward_cfg.get("accept_unconverged", True)),
+            min_interatomic_distance=float(reward_cfg.get("min_interatomic_distance", 0.6)),
+            fallback_reward=float(reward_cfg.get("fallback_reward", -5.0)),
+            reward_in_ev_per_a=bool(reward_cfg.get("reward_in_ev_per_a", False)),
         )
     else:
-        raise ValueError(f"Unsupported reward.type '{reward_type}'. Use 'uma' or 'dummy'.")
+        raise ValueError(
+            f"Unsupported reward.type '{reward_type}'. Use 'polar_mace', 'uma', 'xtb', 'dft', or 'dummy'."
+        )
 
     filter_cfg = config.get("filters", {})
     filter_condition = filter_cfg.get("condition", False)
@@ -297,16 +384,28 @@ def main(cfg: DictConfig) -> None:
     filter_enable_penalty = filter_cfg.get("enable_penalty", False)
     filter_penalty_scale = filter_cfg.get("penalty_scale", 0.5)
     filter_invalid_penalty_scale = filter_cfg.get("invalid_penalty_scale", 0.0)
+    filter_invalid_reward_gate_mode = filter_cfg.get("invalid_reward_gate_mode", "hard")
     filter_duplicate_penalty_scale = filter_cfg.get("duplicate_penalty_scale", 0.0)
+    filter_duplicate_penalty_mode = filter_cfg.get("duplicate_penalty_mode", "constant")
+    filter_history_size = filter_cfg.get("history_size", 0)
+    filter_history_penalty_scale = filter_cfg.get("history_penalty_scale", 0.0)
+    filter_history_penalty_mode = filter_cfg.get("history_penalty_mode", "constant")
+    filter_history_penalty_max_multiplier = filter_cfg.get("history_penalty_max_multiplier", None)
     filters = Filter(
-        dataset_info,
-        config["dataloader"]["smiles_path"],
-        filter_condition,
-        filter_enable_filtering,
-        filter_enable_penalty,
-        filter_penalty_scale,
-        filter_invalid_penalty_scale,
-        filter_duplicate_penalty_scale,
+        dataset_info=dataset_info,
+        file_name=config["dataloader"]["smiles_path"],
+        condition=filter_condition,
+        enable_filtering=filter_enable_filtering,
+        enable_penalty=filter_enable_penalty,
+        penalty_scale=filter_penalty_scale,
+        invalid_penalty_scale=filter_invalid_penalty_scale,
+        invalid_reward_gate_mode=filter_invalid_reward_gate_mode,
+        duplicate_penalty_scale=filter_duplicate_penalty_scale,
+        duplicate_penalty_mode=filter_duplicate_penalty_mode,
+        history_size=filter_history_size,
+        history_penalty_scale=filter_history_penalty_scale,
+        history_penalty_mode=filter_history_penalty_mode,
+        history_penalty_max_multiplier=filter_history_penalty_max_multiplier,
     )
     actor = EDMActor(model, config)
 

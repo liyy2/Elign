@@ -1,0 +1,19 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall
+  - _self_
+
+# Variant: push raw RDKit validity (no repair) by emphasizing the worst-case force magnitude
+# (helps fix "one stray atom" failures) and slightly stronger over-bond penalties.
+#
+# Intended use: resume from a strong termforce checkpoint and evaluate on 1024 samples without repair.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush
+
+filters:
+  # Stronger explicit penalty for RDKit-invalid molecules.
+  invalid_penalty_scale: 0.8
+
+reward:
+  # Penalize the worst-offending atom (instead of RMS) to reduce tail instabilities.
+  force_aggregation: max
+  valence_overbond_weight: 0.7
+  valence_overbond_soft_weight: 0.2

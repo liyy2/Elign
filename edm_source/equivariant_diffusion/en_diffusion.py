@@ -960,3 +960,305 @@ class EnVariationalDiffusion(torch.nn.Module):
         print(info)
 
         return info
+
+
+class EnHierarchicalVAE(torch.nn.Module):
+    """
+    The E(n) Hierarchical VAE Module.
+    """
+
+    def __init__(
+        self,
+        encoder: models.EGNN_encoder_QM9,
+        decoder: models.EGNN_decoder_QM9,
+        in_node_nf: int,
+        n_dims: int,
+        latent_node_nf: int,
+        kl_weight: float,
+        norm_values=(1.0, 1.0, 1.0),
+        norm_biases=(None, 0.0, 0.0),
+        include_charges=True,
+    ):
+        super().__init__()
+
+        self.include_charges = include_charges
+
+        self.encoder = encoder
+        self.decoder = decoder
+
+        self.in_node_nf = in_node_nf
+        self.n_dims = n_dims
+        self.latent_node_nf = latent_node_nf
+        self.num_classes = self.in_node_nf - self.include_charges
+        self.kl_weight = kl_weight
+
+        self.norm_values = norm_values
+        self.norm_biases = norm_biases
+        self.register_buffer('buffer', torch.zeros(1))
+
+    def subspace_dimensionality(self, node_mask):
+        number_of_nodes = torch.sum(node_mask.squeeze(2), dim=1)
+        return (number_of_nodes - 1) * self.n_dims
+
+    def compute_reconstruction_error(self, xh_rec, xh):
+        bs, n_nodes, _ = xh.shape
+
+        x_rec = xh_rec[:, :, : self.n_dims]
+        x = xh[:, :, : self.n_dims]
+        error_x = sum_except_batch((x_rec - x) ** 2)
+
+        h_cat_rec = xh_rec[:, :, self.n_dims : self.n_dims + self.num_classes]
+        h_cat = xh[:, :, self.n_dims : self.n_dims + self.num_classes]
+        h_cat_rec = h_cat_rec.reshape(bs * n_nodes, self.num_classes)
+        h_cat = h_cat.reshape(bs * n_nodes, self.num_classes)
+        error_h_cat = F.cross_entropy(h_cat_rec, h_cat.argmax(dim=1), reduction='none')
+        error_h_cat = error_h_cat.reshape(bs, n_nodes, 1)
+        error_h_cat = sum_except_batch(error_h_cat)
+
+        if self.include_charges:
+            h_int_rec = xh_rec[:, :, -self.include_charges :]
+            h_int = xh[:, :, -self.include_charges :]
+            error_h_int = sum_except_batch((h_int_rec - h_int) ** 2)
+        else:
+            error_h_int = 0.0
+
+        error = error_x + error_h_cat + error_h_int
+
+        if self.training:
+            denom = (self.n_dims + self.in_node_nf) * xh.shape[1]
+            error = error / denom
+
+        return error
+
+    def sample_normal(self, mu, sigma, node_mask, fix_noise=False):
+        bs = 1 if fix_noise else mu.size(0)
+        eps = self.sample_combined_position_feature_noise(bs, mu.size(1), node_mask)
+        return mu + sigma * eps
+
+    def compute_loss(self, x, h, node_mask, edge_mask, context):
+        xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
+
+        z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.encode(x, h, node_mask, edge_mask, context)
+
+        zeros, ones = torch.zeros_like(z_h_mu), torch.ones_like(z_h_sigma)
+        loss_kl_h = gaussian_KL(z_h_mu, ones, zeros, ones, node_mask)
+
+        assert z_x_sigma.mean(dim=(1, 2), keepdim=True).expand_as(z_x_sigma).allclose(z_x_sigma, atol=1e-7)
+        zeros, ones = torch.zeros_like(z_x_mu), torch.ones_like(z_x_sigma.mean(dim=(1, 2)))
+        subspace_d = self.subspace_dimensionality(node_mask)
+        loss_kl_x = gaussian_KL_for_dimension(z_x_mu, ones, zeros, ones, subspace_d)
+        loss_kl = loss_kl_h + loss_kl_x
+
+        z_xh_mean = torch.cat([z_x_mu, z_h_mu], dim=2)
+        diffusion_utils.assert_correctly_masked(z_xh_mean, node_mask)
+        z_xh_sigma = torch.cat([z_x_sigma.expand(-1, -1, 3), z_h_sigma], dim=2)
+        z_xh = self.sample_normal(z_xh_mean, z_xh_sigma, node_mask)
+        diffusion_utils.assert_correctly_masked(z_xh, node_mask)
+        diffusion_utils.assert_mean_zero_with_mask(z_xh[:, :, : self.n_dims], node_mask)
+
+        x_recon, h_recon = self.decoder._forward(z_xh, node_mask, edge_mask, context)
+        xh_rec = torch.cat([x_recon, h_recon], dim=2)
+        loss_recon = self.compute_reconstruction_error(xh_rec, xh)
+
+        assert loss_recon.size() == loss_kl.size()
+        loss = loss_recon + self.kl_weight * loss_kl
+
+        assert len(loss.shape) == 1, f'{loss.shape} has more than only batch dim.'
+
+        return loss, {'loss_t': loss.squeeze(), 'rec_error': loss_recon.squeeze()}
+
+    def forward(self, x, h, node_mask=None, edge_mask=None, context=None):
+        loss, _ = self.compute_loss(x, h, node_mask, edge_mask, context)
+        return loss
+
+    def sample_combined_position_feature_noise(self, n_samples, n_nodes, node_mask):
+        z_x = utils.sample_center_gravity_zero_gaussian_with_mask(
+            size=(n_samples, n_nodes, self.n_dims),
+            device=node_mask.device,
+            node_mask=node_mask,
+        )
+        z_h = utils.sample_gaussian_with_mask(
+            size=(n_samples, n_nodes, self.latent_node_nf),
+            device=node_mask.device,
+            node_mask=node_mask,
+        )
+        z = torch.cat([z_x, z_h], dim=2)
+        return z
+
+    def encode(self, x, h, node_mask=None, edge_mask=None, context=None):
+        xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
+        diffusion_utils.assert_mean_zero_with_mask(xh[:, :, : self.n_dims], node_mask)
+
+        z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.encoder._forward(xh, node_mask, edge_mask, context)
+
+        bs, _, _ = z_x_mu.size()
+        sigma_0_x = torch.ones(bs, 1, 1).to(z_x_mu) * 0.0032
+        sigma_0_h = torch.ones(bs, 1, self.latent_node_nf).to(z_h_mu) * 0.0032
+
+        return z_x_mu, sigma_0_x, z_h_mu, sigma_0_h
+
+    def decode(self, z_xh, node_mask=None, edge_mask=None, context=None):
+        x_recon, h_recon = self.decoder._forward(z_xh, node_mask, edge_mask, context)
+        diffusion_utils.assert_mean_zero_with_mask(x_recon, node_mask)
+
+        xh = torch.cat([x_recon, h_recon], dim=2)
+
+        x = xh[:, :, : self.n_dims]
+        diffusion_utils.assert_correctly_masked(x, node_mask)
+
+        h_int = xh[:, :, -1:] if self.include_charges else torch.zeros(0).to(xh)
+        h_cat = xh[:, :, self.n_dims : -1]
+        h_cat = F.one_hot(torch.argmax(h_cat, dim=2), self.num_classes) * node_mask
+        h_int = torch.round(h_int).long() * node_mask
+        h = {'integer': h_int, 'categorical': h_cat}
+
+        return x, h
+
+    @torch.no_grad()
+    def reconstruct(self, x, h, node_mask=None, edge_mask=None, context=None):
+        pass
+
+    def log_info(self):
+        info = None
+        print(info)
+        return info
+
+
+def disabled_train(self, mode=True):
+    return self
+
+
+class EnLatentDiffusion(EnVariationalDiffusion):
+    """
+    The E(n) Latent Diffusion Module.
+    """
+
+    def __init__(self, **kwargs):
+        vae = kwargs.pop('vae')
+        trainable_ae = kwargs.pop('trainable_ae', False)
+        super().__init__(**kwargs)
+
+        self.trainable_ae = trainable_ae
+        self.instantiate_first_stage(vae)
+
+    def unnormalize_z(self, z, node_mask):
+        x, h_cat = z[:, :, 0 : self.n_dims], z[:, :, self.n_dims : self.n_dims + self.num_classes]
+        h_int = z[:, :, self.n_dims + self.num_classes : self.n_dims + self.num_classes + 1]
+        assert h_int.size(2) == self.include_charges
+        output = torch.cat([x, h_cat, h_int], dim=2)
+        return output
+
+    def log_constants_p_h_given_z0(self, h, node_mask):
+        batch_size = h.size(0)
+
+        n_nodes = node_mask.squeeze(2).sum(1)
+        assert n_nodes.size() == (batch_size,)
+        degrees_of_freedom_h = n_nodes * self.n_dims
+
+        zeros = torch.zeros((h.size(0), 1), device=h.device)
+        gamma_0 = self.gamma(zeros)
+        log_sigma_x = 0.5 * gamma_0.view(batch_size)
+
+        return degrees_of_freedom_h * (-log_sigma_x - 0.5 * np.log(2 * np.pi))
+
+    def sample_p_xh_given_z0(self, z0, node_mask, edge_mask, context, fix_noise=False):
+        zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device)
+        gamma_0 = self.gamma(zeros)
+        sigma_x = self.SNR(-0.5 * gamma_0).unsqueeze(1)
+        net_out = self.phi(z0, zeros, node_mask, edge_mask, context)
+
+        mu_x = self.compute_x_pred(net_out, z0, gamma_0)
+        xh = self.sample_normal(mu=mu_x, sigma=sigma_x, node_mask=node_mask, fix_noise=fix_noise)
+
+        x = xh[:, :, : self.n_dims]
+        h = {'integer': xh[:, :, self.n_dims :], 'categorical': torch.zeros(0).to(xh)}
+
+        return x, h
+
+    def log_pxh_given_z0_without_constants(self, x, h, z_t, gamma_0, eps, net_out, node_mask, epsilon=1e-10):
+        log_pxh_given_z_without_constants = -0.5 * self.compute_error(net_out, gamma_0, eps)
+        log_p_xh_given_z = log_pxh_given_z_without_constants
+        return log_p_xh_given_z
+
+    def forward(self, x, h, node_mask=None, edge_mask=None, context=None):
+        z_x_mu, z_x_sigma, z_h_mu, z_h_sigma = self.vae.encode(x, h, node_mask, edge_mask, context)
+        t_zeros = torch.zeros(size=(x.size(0), 1), device=x.device)
+        gamma_0 = self.inflate_batch_array(self.gamma(t_zeros), x)
+        sigma_0 = self.sigma(gamma_0, x)
+
+        z_xh_mean = torch.cat([z_x_mu, z_h_mu], dim=2)
+        diffusion_utils.assert_correctly_masked(z_xh_mean, node_mask)
+        z_xh_sigma = sigma_0
+        z_xh = self.vae.sample_normal(z_xh_mean, z_xh_sigma, node_mask)
+        z_xh = z_xh.detach()
+        diffusion_utils.assert_correctly_masked(z_xh, node_mask)
+
+        if self.trainable_ae:
+            xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
+            x_recon, h_recon = self.vae.decoder._forward(z_xh, node_mask, edge_mask, context)
+            xh_rec = torch.cat([x_recon, h_recon], dim=2)
+            loss_recon = self.vae.compute_reconstruction_error(xh_rec, xh)
+        else:
+            loss_recon = 0
+
+        z_x = z_xh[:, :, : self.n_dims]
+        z_h = z_xh[:, :, self.n_dims :]
+        diffusion_utils.assert_mean_zero_with_mask(z_x, node_mask)
+        z_h = {'categorical': torch.zeros(0).to(z_h), 'integer': z_h}
+
+        if self.training:
+            loss_ld, _ = self.compute_loss(z_x, z_h, node_mask, edge_mask, context, t0_always=False)
+        else:
+            loss_ld, _ = self.compute_loss(z_x, z_h, node_mask, edge_mask, context, t0_always=True)
+
+        neg_log_constants = -self.log_constants_p_h_given_z0(
+            torch.cat([h['categorical'], h['integer']], dim=2), node_mask
+        )
+        if self.training and self.loss_type == 'l2':
+            neg_log_constants = torch.zeros_like(neg_log_constants)
+
+        neg_log_pxh = loss_ld + loss_recon + neg_log_constants
+        return neg_log_pxh
+
+    @torch.no_grad()
+    def sample(self, n_samples, n_nodes, node_mask, edge_mask, context, fix_noise=False):
+        z_x, z_h = super().sample(n_samples, n_nodes, node_mask, edge_mask, context, fix_noise)
+
+        z_xh = torch.cat([z_x, z_h['categorical'], z_h['integer']], dim=2)
+        diffusion_utils.assert_correctly_masked(z_xh, node_mask)
+        x, h = self.vae.decode(z_xh, node_mask, edge_mask, context)
+
+        return x, h
+
+    @torch.no_grad()
+    def sample_chain(self, n_samples, n_nodes, node_mask, edge_mask, context, keep_frames=None):
+        chain_flat = super().sample_chain(n_samples, n_nodes, node_mask, edge_mask, context, keep_frames)
+
+        chain = chain_flat.view(keep_frames, n_samples, *chain_flat.size()[1:])
+        chain_decoded = torch.zeros(
+            size=(*chain.size()[:-1], self.vae.in_node_nf + self.vae.n_dims),
+            device=chain.device,
+        )
+
+        for i in range(keep_frames):
+            z_xh = chain[i]
+            diffusion_utils.assert_mean_zero_with_mask(z_xh[:, :, : self.n_dims], node_mask)
+
+            x, h = self.vae.decode(z_xh, node_mask, edge_mask, context)
+            xh = torch.cat([x, h['categorical'], h['integer']], dim=2)
+            chain_decoded[i] = xh
+
+        chain_decoded_flat = chain_decoded.view(n_samples * keep_frames, *chain_decoded.size()[2:])
+
+        return chain_decoded_flat
+
+    def instantiate_first_stage(self, vae: EnHierarchicalVAE):
+        if not self.trainable_ae:
+            self.vae = vae.eval()
+            self.vae.train = disabled_train
+            for param in self.vae.parameters():
+                param.requires_grad = False
+        else:
+            self.vae = vae.train()
+            for param in self.vae.parameters():
+                param.requires_grad = True

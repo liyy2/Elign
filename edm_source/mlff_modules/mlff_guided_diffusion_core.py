@@ -32,6 +32,7 @@ class MLFFGuidedDiffusion:
         noise_threshold=0.8,
         force_clip_threshold=None,
         displacement_clip=None,
+        compute_energy: bool = False,
         position_scale=None,
         use_wandb=False,
         device='cuda'
@@ -47,6 +48,7 @@ class MLFFGuidedDiffusion:
             noise_threshold: Skip guidance when noise level > threshold (for efficiency)
             force_clip_threshold: Maximum force magnitude allowed (None = no clipping)
             position_scale: Scale factor to convert from normalized to physical positions
+            compute_energy: If True, also query energies during each MLFF evaluation.
             use_wandb: Whether to use Weights & Biases for logging
             device: Device to run computations on
         """
@@ -56,6 +58,7 @@ class MLFFGuidedDiffusion:
         self.noise_threshold = noise_threshold
         self.force_clip_threshold = force_clip_threshold
         self.displacement_clip = displacement_clip
+        self.compute_energy = bool(compute_energy)
         
         # Extract position scale from model's normalize_factors if not provided
         if position_scale is None:
@@ -82,7 +85,8 @@ class MLFFGuidedDiffusion:
             self.force_computer = MLFFForceComputer(
                 mlff_predictor=self.mlff_predictor,
                 position_scale=position_scale,
-                device=device
+                device=device,
+                compute_energy=self.compute_energy,
             )
         else:
             self.force_computer = None
@@ -123,7 +127,13 @@ class MLFFGuidedDiffusion:
         # Apply guidance iterations
         for iteration in range(self.guidance_iterations):
             # Compute MLFF forces (just returns forces tensor)
-            forces = self.force_computer.compute_mlff_forces(z, node_mask, dataset_info)
+            forces_out = self.force_computer.compute_mlff_forces(z, node_mask, dataset_info)
+            # Optionally query energies as well (compute_energy=True). For guidance we only
+            # need forces, but benchmarking often wants to include energy-query overhead.
+            if isinstance(forces_out, (tuple, list)) and len(forces_out) >= 1:
+                forces = forces_out[0]
+            else:
+                forces = forces_out
             
             # Logger computes statistics and logs them (only for valid atoms)
             force_stats = self.logger.log_force_statistics(forces, node_mask)
@@ -215,6 +225,8 @@ class MLFFGuidedDiffusion:
 
             # Compute MLFF forces in normalized space
             forces = self.force_computer.compute_mlff_forces(x, node_mask, dataset_info)
+            if isinstance(forces, (tuple, list)) and len(forces) >= 1:
+                forces = forces[0]
 
             # Optional force clipping (normalized units)
             if self.force_clip_threshold is not None:

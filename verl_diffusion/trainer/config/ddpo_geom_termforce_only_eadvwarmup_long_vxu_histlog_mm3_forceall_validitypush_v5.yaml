@@ -1,0 +1,19 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall_validitypush_v4
+  - _self_
+
+# Variant: increase suffix length (skip_prefix=650) and strengthen de-duplication
+# to improve 1024-sample validity×uniqueness while keeping the v4 stability recipe.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v5
+
+model:
+  skip_prefix: 650
+
+filters:
+  # Stronger within-batch anti-collapse.
+  duplicate_penalty_scale: 0.90
+  # Larger cross-batch memory to improve 1024-sample uniqueness.
+  history_size: 4096
+  # For RDKit-invalid molecules, keep the worse of (force, stability) so invalids still get
+  # a strong negative learning signal in addition to `invalid_penalty_scale`.
+  invalid_reward_gate_mode: min

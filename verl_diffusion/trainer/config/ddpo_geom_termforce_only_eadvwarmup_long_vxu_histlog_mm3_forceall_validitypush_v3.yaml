@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall_validitypush_v2
+  - _self_
+
+# Variant: amplify the RDKit-invalid penalty further to push raw validity toward ~0.98 on 1024-sample evals.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v3
+
+filters:
+  invalid_penalty_scale: 5.0
+  invalid_reward_gate_mode: min
+

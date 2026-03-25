@@ -1,0 +1,69 @@
+poll_minutes: 5
+state_path: outputs/verl/geom_stability_queue/autopilot_state.json
+
+targets:
+  # Bootstrap target so the monitor can start even when no jobs are running yet.
+  # job_id=0 is treated as DONE; the queue then submits experiments below.
+  - name: bootstrap_best1174
+    kind: slurm
+    job_id: 0
+    run_dir: outputs/verl/geom_stability_queue/branch_best1174_sw7_lr1e7_kl015_20260111_022341/branch_best1174_sw7_lr1e7_kl015_seed57
+    monitor_metric: validity_x_uniqueness_x_stability
+    mode: max
+    min_delta: 0.0005
+    smoothing_window: 5
+    warmup_minutes: 0
+    patience_minutes: 9999
+    stall_minutes: 9999
+    stop_signal: INT
+
+queue:
+  enabled: true
+  max_active: 3
+  run_root: outputs/verl/geom_stability_queue/autopilot_20260114
+  resume_checkpoint: outputs/verl/geom_stability_queue/branch_best1174_sw7_lr1e7_kl015_20260111_022341/branch_best1174_sw7_lr1e7_kl015_seed57/eval_checkpoint_1024_seed42_checkpoint_best.pth
+  update_resume_from_best: false
+  max_time_hours: 12.0
+  env:
+    HF_HUB_OFFLINE: "1"
+    VERL_TQDM: "0"
+    HYDRA_FULL_ERROR: "1"
+    PYTHONUNBUFFERED: "1"
+    PYTORCH_CUDA_ALLOC_CONF: "backend:cudaMallocAsync"
+  slurm:
+    partition: gpu
+    gres: gpu:1
+    cpus_per_task: 8
+    mem: 64G
+    time: "13:00:00"
+  common_overrides: []
+  experiments:
+    - name: best_dup070
+      config: ddpo_geom_best1174_sw7_lr1e7_kl015
+      overrides:
+        - seed=101
+        - filters.duplicate_penalty_scale=0.70
+    - name: best_dup080
+      config: ddpo_geom_best1174_sw7_lr1e7_kl015
+      overrides:
+        - seed=102
+        - filters.duplicate_penalty_scale=0.80
+    - name: best_dup070_noshare
+      config: ddpo_geom_best1174_sw7_lr1e7_kl015
+      overrides:
+        - seed=103
+        - filters.duplicate_penalty_scale=0.70
+        - model.share_initial_noise=false
+    - name: best_sw8_dup070
+      config: ddpo_geom_best1174_sw7_lr1e7_kl015
+      overrides:
+        - seed=104
+        - filters.duplicate_penalty_scale=0.70
+        - reward.stability_weight=8.0
+        - reward.valence_overbond_weight=0.6
+    - name: best_dup070_kl012
+      config: ddpo_geom_best1174_sw7_lr1e7_kl015
+      overrides:
+        - seed=105
+        - filters.duplicate_penalty_scale=0.70
+        - train.kl_penalty_weight=0.12

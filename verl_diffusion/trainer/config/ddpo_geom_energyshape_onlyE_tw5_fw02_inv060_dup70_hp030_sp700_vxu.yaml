@@ -1,0 +1,41 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp650_dup70
+  - _self_
+
+# Baseline (high-validity) GEOM recipe + checkpoint selection aligned with V×U.
+#
+# Mirrors the proven "energy shaping (only energy) + low force weight" setup while
+# tracking `checkpoint_best.pth` via `validity_x_uniqueness` for leaderboard selection.
+name: edm-geom-energyshape-onlyE-tw5-fw02-inv060-dup70-hp030-sp700-vxu
+
+best_checkpoint_metric: validity_x_uniqueness
+best_checkpoint_mode: max
+
+model:
+  skip_prefix: 700
+
+train:
+  early_stop_metric: validity_x_uniqueness
+  early_stop_mode: max
+  force_alignment_weight: 0.02
+  inherit_best_metric_on_warmstart: true
+
+filters:
+  enable_filtering: true
+  enable_penalty: false
+  invalid_penalty_scale: 0.6
+  duplicate_penalty_scale: 0.7
+  history_size: 2048
+  history_penalty_scale: 0.3
+  history_penalty_mode: constant
+
+reward:
+  force_weight: 0.2
+  force_only_if_stable: false
+  stability_weight: 8.0
+  valence_overbond_weight: 0.7
+  shaping:
+    enabled: true
+    only_energy_reshape: true
+    terminal_weight: 5.0
+    mlff_batch_size: 64

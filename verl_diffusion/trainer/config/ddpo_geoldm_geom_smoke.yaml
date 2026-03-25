@@ -1,0 +1,65 @@
+defaults:
+  - _self_
+
+name: geoldm-geom-smoke
+seed: 0
+save_path: null
+
+dataloader:
+  sample_group_size: 1
+  each_prompt_sample: 2
+  micro_batch_size: 2
+  epoches: 1
+  geom_data_file: null
+  smiles_path: null
+
+filters:
+  condition: false
+  enable_filtering: false
+  enable_penalty: false
+  penalty_scale: 0.0
+
+model:
+  backend: geoldm
+  config: "./pretrained/geoldm/drugs_latent2/args.pickle"
+  model_path: "./pretrained/geoldm/drugs_latent2/generative_model_ema.npy"
+  time_step: 20
+  share_initial_noise: false
+
+train:
+  adv_clip_max: 5
+  max_grad_norm: 1
+  learning_rate: 0.000001
+  adam_beta1: 0.9
+  adam_beta2: 0.999
+  adam_weight_decay: 0.0
+  adam_epsilon: 0.00000001
+  clip_range: 0.15
+  kl_penalty_weight: 0.0
+  train_micro_batch_size: 2
+  gradient_accumulation_steps: 1
+  force_alignment_enabled: false
+  epoch_per_rollout: 1
+
+reward:
+  type: polar_mace
+  mlff_model: polar-1-m
+  mlff_backend: polar_mace
+  mlff_charge: 0
+  mlff_spin: 1
+  mlff_external_field: [0.0, 0.0, 0.0]
+  mlff_default_dtype: float32
+  use_energy: false
+  force_weight: 1.0
+  energy_weight: 0.0
+  stability_weight: 0.0
+  force_aggregation: rms
+  shaping:
+    enabled: false
+
+wandb:
+  enabled: false
+
+hydra:
+  job:
+    chdir: false

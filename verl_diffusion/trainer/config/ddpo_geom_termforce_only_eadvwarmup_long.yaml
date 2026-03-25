@@ -1,0 +1,22 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup
+  - _self_
+
+# Variant: longer force-only warmup before energy advantages ramp in.
+#
+# Motivation: on GEOM, introducing energy too early can destabilize RDKit validity/uniqueness.
+# This keeps the prior "terminal force only" recipe but delays energy mixing to let stability
+# metrics settle first.
+name: edm-geom-termforce-only-eadvwarmup-long
+
+reward:
+  # Target energy advantage mixing weight once warmup completes.
+  energy_adv_weight: 0.03
+  adv_schedule:
+    enabled: true
+    energy:
+      start: 0.0
+      end: 0.03
+      warmup_epochs: 100
+      ramp_epochs: 100
+

@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup
+  - _self_
+
+# Variant: train on a slightly longer suffix (skip_prefix=650) while keeping the
+# terminal-only + energy-advantage warmup recipe.
+name: edm-geom-termforce-only-eadvwarmup-sp650
+
+model:
+  skip_prefix: 650
+

@@ -1,0 +1,15 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3
+  - _self_
+
+# Variant: validity push without the "max-force" reward change.
+#
+# Motivation: v3 (invalid_penalty_scale=5 + gate=min + force_aggregation=max) improved stability
+# but regressed 1024-sample uniqueness. This keeps the stronger RDKit-invalid signal while
+# preserving the baseline RMS force reward to reduce mode collapse.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-validitypush-v4
+
+filters:
+  invalid_penalty_scale: 1.0
+  invalid_reward_gate_mode: hard
+

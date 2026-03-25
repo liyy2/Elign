@@ -1,0 +1,10 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall_validitypush
+  - _self_
+
+# Variant: stronger RDKit validity push (no repair) for the forceall recipe.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v2
+
+filters:
+  invalid_penalty_scale: 2.0
+  invalid_reward_gate_mode: min

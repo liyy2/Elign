@@ -98,8 +98,20 @@ allowed_bonds = {'H': 1, 'C': 4, 'N': 3, 'O': 2, 'F': 1, 'B': 3, 'Al': 3,
                  'Bi': [3, 5]}
 
 
-def get_bond_order(atom1, atom2, distance, check_exists=False):
+def get_bond_order(
+    atom1,
+    atom2,
+    distance,
+    check_exists=False,
+    margin1_override=None,
+    margin2_override=None,
+    margin3_override=None,
+):
     distance = 100 * distance  # We change the metric
+
+    m1 = margin1 if margin1_override is None else margin1_override
+    m2 = margin2 if margin2_override is None else margin2_override
+    m3 = margin3 if margin3_override is None else margin3_override
 
     # Check exists for large molecules where some atom pairs do not have a
     # typical bond length.
@@ -111,14 +123,14 @@ def get_bond_order(atom1, atom2, distance, check_exists=False):
 
     # margin1, margin2 and margin3 have been tuned to maximize the stability of
     # the QM9 true samples.
-    if distance < bonds1[atom1][atom2] + margin1:
+    if distance < bonds1[atom1][atom2] + m1:
 
         # Check if atoms in bonds2 dictionary.
         if atom1 in bonds2 and atom2 in bonds2[atom1]:
-            thr_bond2 = bonds2[atom1][atom2] + margin2
+            thr_bond2 = bonds2[atom1][atom2] + m2
             if distance < thr_bond2:
                 if atom1 in bonds3 and atom2 in bonds3[atom1]:
-                    thr_bond3 = bonds3[atom1][atom2] + margin3
+                    thr_bond3 = bonds3[atom1][atom2] + m3
                     if distance < thr_bond3:
                         return 3        # Triple
                 return 2            # Double
@@ -132,10 +144,10 @@ def single_bond_only(threshold, length, margin1=5):
     return 0
 
 
-def geom_predictor(p, l, margin1=5, limit_bonds_to_one=False):
+def geom_predictor(p, l, margin1=margin1, limit_bonds_to_one=False):
     """ p: atom pair (couple of str)
         l: bond length (float)"""
-    bond_order = get_bond_order(p[0], p[1], l, check_exists=True)
+    bond_order = get_bond_order(p[0], p[1], l, check_exists=True, margin1_override=margin1)
 
     # If limit_bonds_to_one is enabled, every bond type will return 1.
     if limit_bonds_to_one:

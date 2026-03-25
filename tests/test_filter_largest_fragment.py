@@ -30,47 +30,52 @@ class TestFilterLargestFragment(unittest.TestCase):
 
         # Inject stub so Filter.filter() can run without importing the real QM9
         # rdkit_functions (which depends on edm_source sys.path setup).
+        original_mod = sys.modules.get("edm_source.qm9.rdkit_functions")
         sys.modules["edm_source.qm9.rdkit_functions"] = stub_mod
+        try:
+            dataset_info = {"max_n_nodes": 4}
+            batch_size = 2
+            x = torch.zeros(batch_size, dataset_info["max_n_nodes"], 3)
+            categorical = torch.zeros(batch_size, dataset_info["max_n_nodes"], 1)
+            categorical[:, 0, 0] = 1.0
+            nodesxsample = torch.tensor([1, 1], dtype=torch.long)
 
-        dataset_info = {"max_n_nodes": 4}
-        batch_size = 2
-        x = torch.zeros(batch_size, dataset_info["max_n_nodes"], 3)
-        categorical = torch.zeros(batch_size, dataset_info["max_n_nodes"], 1)
-        categorical[:, 0, 0] = 1.0
-        nodesxsample = torch.tensor([1, 1], dtype=torch.long)
+            data = DataProto(
+                batch=TensorDict(
+                    {
+                        "x": x,
+                        "categorical": categorical,
+                        "nodesxsample": nodesxsample,
+                        "rewards": torch.zeros(batch_size),
+                    },
+                    batch_size=[batch_size],
+                ),
+                meta_info={},
+            )
 
-        data = DataProto(
-            batch=TensorDict(
-                {
-                    "x": x,
-                    "categorical": categorical,
-                    "nodesxsample": nodesxsample,
-                    "rewards": torch.zeros(batch_size),
-                },
-                batch_size=[batch_size],
-            ),
-            meta_info={},
-        )
+            filt = Filter(
+                dataset_info=dataset_info,
+                file_name=None,
+                condition=False,
+                enable_filtering=True,
+                enable_penalty=False,
+                penalty_scale=0.0,
+                invalid_penalty_scale=0.0,
+            )
 
-        filt = Filter(
-            dataset_info=dataset_info,
-            file_name=None,
-            condition=False,
-            enable_filtering=True,
-            enable_penalty=False,
-            penalty_scale=0.0,
-            invalid_penalty_scale=0.0,
-        )
+            random.seed(0)
+            filtered, _filter_ratio, _novelty_ratio, validity, uniqueness, *_rest = filt.filter(data)
 
-        random.seed(0)
-        filtered, _filter_ratio, _novelty_ratio, validity, uniqueness = filt.filter(data)
-
-        self.assertEqual(validity, 1.0)
-        # With largest-fragment canonicalization both samples map to "CC" => 1 unique out of 2.
-        self.assertEqual(uniqueness, 0.5)
-        self.assertEqual(len(filtered), 1)
+            self.assertEqual(validity, 1.0)
+            # With largest-fragment canonicalization both samples map to "CC" => 1 unique out of 2.
+            self.assertEqual(uniqueness, 0.5)
+            self.assertEqual(len(filtered), 1)
+        finally:
+            if original_mod is not None:
+                sys.modules["edm_source.qm9.rdkit_functions"] = original_mod
+            else:
+                sys.modules.pop("edm_source.qm9.rdkit_functions", None)
 
 
 if __name__ == "__main__":
     unittest.main()
-

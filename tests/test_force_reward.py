@@ -1,11 +1,21 @@
 import unittest
 from unittest import mock
+import sys
+import types
 
+import numpy as np
 import torch
 from typing import Optional, Dict
+from ase.calculators.calculator import Calculator, all_changes
 
 from verl_diffusion.protocol import DataProto, TensorDict
 from verl_diffusion.worker.reward.force import UMAForceReward, _resolve_mlff_device
+from edm_source.mlff_modules.mlff_force_computer import MLFFForceComputer
+from edm_source.mlff_modules.mlff_utils import (
+    LoadedMLFFPredictor,
+    get_mlff_predictor,
+    resolve_mlff_backend,
+)
 
 
 class _StubForceComputer:
@@ -63,6 +73,98 @@ class TestResolveMlffDevice(unittest.TestCase):
             _resolve_mlff_device("cuda:abc", "cpu")
         with self.assertRaises(ValueError):
             _resolve_mlff_device("tpu", "cpu")
+
+
+class TestMlffBackendSelection(unittest.TestCase):
+    def test_resolves_backend_from_model_name(self):
+        self.assertEqual(resolve_mlff_backend("polar-1-m"), "polar_mace")
+        self.assertEqual(resolve_mlff_backend("uma-s-1p1"), "uma")
+
+    def test_loads_polar_mace_wrapper(self):
+        calculators_module = types.ModuleType("mace.calculators")
+
+        def fake_mace_polar(*, model, device, default_dtype):
+            return {
+                "model": model,
+                "device": device,
+                "default_dtype": default_dtype,
+            }
+
+        calculators_module.mace_polar = fake_mace_polar
+        mace_module = types.ModuleType("mace")
+        mace_module.calculators = calculators_module
+
+        with mock.patch.dict(
+            sys.modules,
+            {
+                "mace": mace_module,
+                "mace.calculators": calculators_module,
+            },
+        ):
+            predictor = get_mlff_predictor(
+                "polar-1-m",
+                device="cpu",
+                backend="polar_mace",
+                charge=1,
+                spin=2,
+                external_field=[0.1, 0.2, 0.3],
+                default_dtype="float32",
+            )
+
+        self.assertIsNotNone(predictor)
+        self.assertEqual(predictor.backend, "polar_mace")
+        self.assertEqual(predictor.model_name, "polar-1-m")
+        self.assertEqual(predictor.device, "cpu")
+        self.assertEqual(predictor.charge, 1)
+        self.assertEqual(predictor.spin, 2)
+        self.assertEqual(predictor.external_field, (0.1, 0.2, 0.3))
+
+
+class _FakePolarCalculator(Calculator):
+    implemented_properties = ["energy", "forces"]
+
+    def calculate(self, atoms=None, properties=("energy", "forces"), system_changes=all_changes):
+        super().calculate(atoms=atoms, properties=properties, system_changes=system_changes)
+        n_atoms = len(atoms)
+        self.results["energy"] = float(n_atoms)
+        self.results["forces"] = np.full((n_atoms, 3), 0.25, dtype=np.float64)
+
+
+class TestPolarMaceForceComputer(unittest.TestCase):
+    def test_computes_forces_and_energy_via_ase_calculator(self):
+        dataset_info = _make_minimal_qm9_like_dataset_info()
+        predictor = LoadedMLFFPredictor(
+            backend="polar_mace",
+            predictor=_FakePolarCalculator(),
+            device="cpu",
+            model_name="polar-1-m",
+            charge=0,
+            spin=1,
+            external_field=(0.0, 0.0, 0.0),
+            default_dtype="float64",
+        )
+        force_computer = MLFFForceComputer(
+            mlff_predictor=predictor,
+            position_scale=2.0,
+            device="cpu",
+            compute_energy=True,
+        )
+
+        positions = torch.tensor(
+            [[[0.0, 0.0, 0.0], [0.7, 0.0, 0.0], [0.0, 0.0, 0.0]]],
+            dtype=torch.float32,
+        )
+        categorical = torch.zeros(1, 3, len(dataset_info["atom_decoder"]), dtype=torch.float32)
+        categorical[0, 0, 0] = 1.0
+        categorical[0, 1, 1] = 1.0
+        node_mask = torch.tensor([[[1.0], [1.0], [0.0]]], dtype=torch.float32)
+        z = torch.cat([positions, categorical], dim=-1)
+
+        forces, energies = force_computer.compute_mlff_forces(z, node_mask, dataset_info)
+
+        expected_force = torch.full((2, 3), 0.5, dtype=torch.float32)
+        self.assertTrue(torch.allclose(forces[0, :2], expected_force, atol=1e-6))
+        self.assertTrue(torch.allclose(energies, torch.tensor([2.0]), atol=1e-6))
 
 
 class TestUMAForceReward(unittest.TestCase):

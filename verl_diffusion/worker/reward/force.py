@@ -90,7 +90,7 @@ def _resolve_mlff_device(device_like, default_device):
     raise ValueError(f"Unsupported MLFF device specification: {device_like}")
 
 class UMAForceReward(BaseReward):
-    """Reward module for post-training that scores molecules using UMA MLFF forces (+ optional energies).
+    """Reward module for post-training that scores molecules using MLFF forces (+ optional energies).
 
     The reward has three pieces:
 
@@ -114,13 +114,18 @@ class UMAForceReward(BaseReward):
         self,
         dataset_info: dict,
         condition: bool = False,
-        mlff_model: str = "uma-s-1p1",
+        mlff_model: str = "polar-1-m",
+        mlff_backend: Optional[str] = None,
         mlff_predictor: Optional[object] = None,
         force_computer: Optional[object] = None,
         position_scale: Optional[float] = None,
         force_clip_threshold: Optional[float] = None,
         device: Optional[Union[str, torch.device]] = None,
         mlff_device: Optional[Union[str, torch.device]] = None,
+        mlff_charge: int = 0,
+        mlff_spin: int = 1,
+        mlff_external_field: Optional[object] = None,
+        mlff_default_dtype: str = "float32",
         shaping: Optional[dict] = None,
         use_energy: bool = False,
         energy_only_if_stable: bool = False,
@@ -140,6 +145,9 @@ class UMAForceReward(BaseReward):
         energy_transform_clip: Optional[float] = None,
         energy_normalize_by_atoms: bool = False,
         energy_atom_refs: Optional[str] = None,
+        min_pair_dist_threshold: float = 0.9,
+        min_pair_dist_penalty_weight: float = 0.0,
+        min_pair_dist_penalty_power: float = 1.0,
     ):
         super().__init__()
         self.is_main_process = _is_main_process()
@@ -208,6 +216,16 @@ class UMAForceReward(BaseReward):
         self.energy_atom_refs = str(energy_atom_refs) if energy_atom_refs else None
         self._atom_ref_by_type = None
 
+        # Penalize pathologically close atom pairs to prevent "stability via collapsing distances".
+        self.min_pair_dist_threshold = float(min_pair_dist_threshold)
+        self.min_pair_dist_penalty_weight = float(min_pair_dist_penalty_weight or 0.0)
+        self.min_pair_dist_penalty_power = float(min_pair_dist_penalty_power)
+        if self.min_pair_dist_threshold <= 0.0:
+            raise ValueError("min_pair_dist_threshold must be > 0")
+        if self.min_pair_dist_penalty_weight < 0.0:
+            raise ValueError("min_pair_dist_penalty_weight must be >= 0")
+        if self.min_pair_dist_penalty_power <= 0.0:
+            raise ValueError("min_pair_dist_penalty_power must be > 0")
 
         # Reward shaping config
         # Scheduler allows switching between uniform and adaptive sampling of diffusion steps.
@@ -260,7 +278,15 @@ class UMAForceReward(BaseReward):
             if mlff_predictor is not None:
                 self.mlff_predictor = mlff_predictor
             else:
-                self.mlff_predictor = get_mlff_predictor(mlff_model, self.mlff_device)
+                self.mlff_predictor = get_mlff_predictor(
+                    mlff_model,
+                    self.mlff_device,
+                    backend=mlff_backend,
+                    charge=mlff_charge,
+                    spin=mlff_spin,
+                    external_field=mlff_external_field,
+                    default_dtype=mlff_default_dtype,
+                )
 
             if self.mlff_predictor is not None:
                 self.force_computer = MLFFForceComputer(
@@ -506,11 +532,12 @@ class UMAForceReward(BaseReward):
                 force_vectors_flat = None
 
             cur = 0
+            tqdm_enabled = _tqdm_enabled()
             progress_bar = tq(
                 total=flat_total,
                 desc="UMAForce MLFF",
                 leave=False,
-                disable=flat_total <= 1,
+                disable=(flat_total <= 1) or (not self.is_main_process) or (not tqdm_enabled),
                 dynamic_ncols=True,
                 smoothing=0,
             )
@@ -833,9 +860,10 @@ class UMAForceReward(BaseReward):
             # Uses the same bond-length tables as `get_bond_order`, but replaces the hard thresholds
             # with sigmoids. This provides a graded signal even when a pair is just outside the
             # cutoff that would otherwise flip bond order from 1->0.
+            dataset_name = str(self.dataset_info.get("name", ""))
             if (
                 (self.valence_underbond_soft_weight != 0.0 or self.valence_overbond_soft_weight != 0.0)
-                and str(self.dataset_info.get("name", "")).startswith("qm9")
+                and (dataset_name.startswith("qm9") or dataset_name.startswith("geom"))
             ):
                 try:
                     atom_types_list = atom_type_indices.detach().cpu().tolist()
@@ -956,6 +984,29 @@ class UMAForceReward(BaseReward):
             + valence_overbond_soft_bonus
         )
 
+        # Geometry guard: track the closest interatomic distance and optionally penalize collisions.
+        try:
+            pos_phys = positions * float(self.position_scale)
+            valid_nodes = node_mask[..., 0] > 0.5 if node_mask.dim() == 3 else node_mask > 0.5
+            n_nodes = int(pos_phys.shape[1])
+            diff = pos_phys.unsqueeze(2) - pos_phys.unsqueeze(1)  # [B, N, N, 3]
+            dist2 = (diff * diff).sum(dim=-1)  # [B, N, N]
+            pair_mask = valid_nodes.unsqueeze(2) & valid_nodes.unsqueeze(1)
+            dist2 = dist2.masked_fill(~pair_mask, float("inf"))
+            eye = torch.eye(n_nodes, device=dist2.device, dtype=torch.bool).unsqueeze(0)
+            dist2 = dist2.masked_fill(eye, float("inf"))
+            min_dist2 = dist2.amin(dim=-1).amin(dim=-1)
+            min_pair_dist = torch.sqrt(min_dist2.clamp(min=0.0))
+        except Exception:
+            min_pair_dist = torch.full((batch_size,), float("inf"), device=self.device, dtype=force_rewards.dtype)
+
+        min_pair_dist_penalty = torch.zeros_like(force_rewards)
+        if self.min_pair_dist_penalty_weight != 0.0:
+            deficit = (self.min_pair_dist_threshold - min_pair_dist).clamp(min=0.0)
+            if self.min_pair_dist_penalty_power != 1.0:
+                deficit = deficit.pow(self.min_pair_dist_penalty_power)
+            min_pair_dist_penalty = -self.min_pair_dist_penalty_weight * deficit
+
         if self.force_only_if_stable:
             gate = stability_flags.to(dtype=force_rewards.dtype)
             force_rewards = force_rewards * gate
@@ -964,7 +1015,7 @@ class UMAForceReward(BaseReward):
             if rewards_ts is not None and not self.use_energy:
                 rewards_ts = rewards_ts * gate.unsqueeze(1)
 
-        force_rewards = force_rewards + stability_bonus
+        force_rewards = force_rewards + stability_bonus + min_pair_dist_penalty
 
         if self.use_energy:
             energy_gate = torch.ones_like(energy_rewards, device=self.device, dtype=energy_rewards.dtype)
@@ -984,6 +1035,11 @@ class UMAForceReward(BaseReward):
             rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + stability_term
             if force_rewards_ts is not None:
                 force_rewards_ts[:, last_idx] = force_rewards_ts[:, last_idx] + self.terminal_reward_weight * stability_bonus
+            if self.min_pair_dist_penalty_weight != 0.0:
+                mindist_term = self.force_weight * self.terminal_reward_weight * min_pair_dist_penalty
+                rewards_ts[:, last_idx] = rewards_ts[:, last_idx] + mindist_term
+                if force_rewards_ts is not None:
+                    force_rewards_ts[:, last_idx] = force_rewards_ts[:, last_idx] + self.terminal_reward_weight * min_pair_dist_penalty
 
         if rewards_ts is not None:
             if self.use_energy and energy_rewards_ts is not None and force_rewards_ts is not None:
@@ -1021,6 +1077,8 @@ class UMAForceReward(BaseReward):
         result["valence_overbond_soft"] = valence_overbond_soft.detach().cpu()
         result["valence_overbond_soft_rewards"] = valence_overbond_soft_bonus.detach().cpu()
         result["stability_rewards"] = stability_bonus.detach().cpu()
+        result["min_pair_dist"] = min_pair_dist.detach().cpu()
+        result["min_pair_dist_penalty"] = min_pair_dist_penalty.detach().cpu()
 
         if self.is_main_process:
             print("Rewards calculated via UMAForceReward")

@@ -25,7 +25,7 @@ train:
   train_micro_batch_size: 4
 
 reward:
-  mlff_model: uma-s-1p1
+  mlff_model: polar-1-m
   use_energy: false
   stability_weight: 2.0
   shaping:

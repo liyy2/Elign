@@ -106,7 +106,24 @@ class EDMDataLoader:
 
         tensors = {}
         max_n_nodes = self.dataset_info['max_n_nodes']
-        nodesxsample = self.nodes_dist.sample(self.group_sample)
+        dataloader_cfg = self.config.get("dataloader") or {}
+        if isinstance(dataloader_cfg, dict) and dataloader_cfg.get("max_n_nodes") is not None:
+            try:
+                max_n_nodes = int(dataloader_cfg.get("max_n_nodes"))
+            except (TypeError, ValueError):
+                pass
+
+        fixed_nodes = None
+        if isinstance(dataloader_cfg, dict) and dataloader_cfg.get("nodes_dist_fixed") is not None:
+            try:
+                fixed_nodes = int(dataloader_cfg.get("nodes_dist_fixed"))
+            except (TypeError, ValueError):
+                fixed_nodes = None
+
+        if fixed_nodes is not None:
+            nodesxsample = torch.full((self.group_sample,), fixed_nodes, dtype=torch.long)
+        else:
+            nodesxsample = self.nodes_dist.sample(self.group_sample)
         prompt_ids = torch.arange(self.group_sample) + self.rank * self.group_sample
         group_index = prompt_ids.repeat_interleave(self.each_prompt_sample, dim=0)
         group_index = group_index.to(self.device)

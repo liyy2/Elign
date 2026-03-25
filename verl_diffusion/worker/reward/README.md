@@ -119,6 +119,10 @@ The `Filter` module can:
     rollout batch share the same canonical SMILES. When `filters.enable_filtering=true`, the full
     cost `-duplicate_penalty_scale * (count - 1)` is applied to the kept representative so PPO
     observes the collapse signal (otherwise most duplicates would be dropped before learning).
+  - `filters.history_size` + `filters.history_penalty_scale`: rolling anti-collapse penalty across
+    recent rollout batches (helps when collapse only shows up in 1024-sample evals). When enabled,
+    the penalty can be scaled by repeat count using `filters.history_penalty_mode` (`constant`
+    default, `log`, `sqrt`, `linear`), optionally capped by `filters.history_penalty_max_multiplier`.
 
 RDKit SMILES are canonicalized on the **largest fragment** (matching `BasicMolecularMetrics`), so
 models cannot inflate training-time uniqueness by appending many tiny disconnected fragments.
@@ -127,9 +131,13 @@ Penalties are injected into all available reward channels (`rewards`, `force_rew
 `energy_rewards`, plus the corresponding `*_ts` tensors when present) so they always affect learning
 even when DDPOTrainer uses separate force/energy advantages.
 
-When `filters.invalid_penalty_scale > 0`, the filter also **zeros `energy_rewards` for RDKit-invalid
-molecules**, so the energy channel cannot accidentally incentivize invalid chemistry via
-out-of-distribution MLFF energies.
+When `filters.invalid_penalty_scale > 0`, the filter also gates MLFF-driven reward channels for
+RDKit-invalid molecules:
+
+- `energy_rewards` is zeroed (and its `*_ts` trace when present), so the energy channel cannot
+  incentivize invalid chemistry via out-of-distribution MLFF energies.
+- The raw MLFF force term is suppressed while preserving the stability/valence shaping term (when
+  available) so invalid samples still receive a graded chemistry signal instead of a flat zero.
 
 During training, these are logged to W&B:
 

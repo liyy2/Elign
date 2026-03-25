@@ -1,0 +1,64 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign
+  - _self_
+
+name: edm-geom-best1174-sw7-lr1e7-kl015
+
+# Mirror the best-performing 1024-sample checkpoint recipe (`branch_best1174_sw7_lr1e7_kl015`).
+dataloader:
+  epoches: 1000000
+  sample_group_size: 4
+  each_prompt_sample: 32
+  micro_batch_size: 32
+  nodes_dist_focus_min: 20
+  nodes_dist_focus_max: 80
+  nodes_dist_focus_multiplier: 3.0
+
+model:
+  return_suffix_only: true
+  share_initial_noise: true
+  skip_prefix: 700
+
+train:
+  max_time_hours: 12.0
+  train_micro_batch_size: 16
+  gradient_accumulation_steps: 8
+  learning_rate: 1.0e-07
+  kl_penalty_weight: 0.15
+  clip_range: 0.05
+  adv_clip_max: 3.0
+  max_grad_norm: 0.5
+  force_alignment_enabled: true
+  force_alignment_weight: 0.02
+  checkpoint_keep_last: 2
+  checkpoint_use_new_zipfile_serialization: false
+  early_stop_metric: validity_x_uniqueness_x_stability
+  early_stop_mode: max
+  early_stop_patience_minutes: 240
+  early_stop_min_delta: 0.001
+
+filters:
+  enable_filtering: true
+  enable_penalty: false
+  invalid_penalty_scale: 0.45
+  duplicate_penalty_scale: 0.60
+
+reward:
+  force_clip_threshold: 10.0
+  shaping:
+    enabled: false
+  energy_adv_weight: 0.05
+  energy_weight: 0.05
+  stability_weight: 7.0
+  atom_stability_weight: 15.0
+  valence_underbond_weight: 0.2
+  valence_overbond_weight: 0.5
+  valence_underbond_soft_weight: 0.05
+  valence_overbond_soft_weight: 0.15
+  valence_soft_temperature: 0.02
+  force_only_if_stable: false
+
+best_checkpoint_metric: validity_x_uniqueness_x_stability
+best_checkpoint_mode: max
+
+save_interval: 5

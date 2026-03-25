@@ -1,0 +1,37 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp650_dup70
+  - _self_
+
+# Continuation recipe: start from a strong V×U checkpoint and push stability by:
+# - switching to terminal-only reward (no shaping noise)
+# - starting with force-only learning signal (energy advantages ramp in later)
+# - keeping history/duplicate penalties for 1024-sample uniqueness
+name: edm-geom-termforce-only-eadvwarmup
+
+model:
+  # Use the standard suffix-only recipe (aligned with leaderboard evals).
+  skip_prefix: 700
+
+filters:
+  enable_filtering: true
+  enable_penalty: false
+  invalid_penalty_scale: 0.6
+  duplicate_penalty_scale: 0.7
+  history_size: 2048
+  history_penalty_scale: 0.3
+  history_penalty_mode: constant
+
+reward:
+  shaping:
+    enabled: false
+  # Avoid reinforcing unstable low-force geometries.
+  force_only_if_stable: true
+  # Target energy mixing weight once warmup completes.
+  energy_adv_weight: 0.05
+  adv_schedule:
+    enabled: true
+    energy:
+      start: 0.0
+      end: 0.05
+      warmup_epochs: 20
+      ramp_epochs: 20

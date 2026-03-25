@@ -1,0 +1,16 @@
+defaults:
+  - ddpo_geom_best1174_sw7_lr1e7_kl015
+  - _self_
+
+name: edm-geom-best1174-sw9-ob070-dup50-lr1e7-kl015
+
+# Strengthen stability/valence penalties while preserving uniqueness.
+# Intended as a drop-in resume config from the `best1174` snapshot.
+
+filters:
+  duplicate_penalty_scale: 0.50
+
+reward:
+  stability_weight: 9.0
+  valence_overbond_weight: 0.7
+

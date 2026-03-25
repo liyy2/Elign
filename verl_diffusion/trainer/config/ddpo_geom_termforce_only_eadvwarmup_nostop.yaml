@@ -1,0 +1,14 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup
+  - _self_
+
+# Same recipe as `ddpo_geom_termforce_only_eadvwarmup`, but never stop automatically.
+name: edm-geom-termforce-only-eadvwarmup-nostop
+
+train:
+  # Run until the user stops the job (or Slurm time limit), not early-stop / max-time.
+  max_time_hours: null
+  early_stop_metric: null
+  early_stop_patience_minutes: null
+  early_stop_min_delta: 0.0
+

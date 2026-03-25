@@ -1,0 +1,26 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall_validitypush_v7
+  - _self_
+
+# Variant: improve large-sample uniqueness without losing the strong validity/stability recipe.
+#
+# Changes vs v7:
+# - Disable hard filtering so GRPO groups keep multiple samples (avoids "group size 1" collapse).
+# - Apply a duplicate penalty that singles out the best sample and penalizes the rest ("best_only"),
+#   creating within-group learning signal even when a prompt-group collapses to one SMILES.
+# - Strengthen soft valence penalties (targets near-threshold bond artifacts that drive RDKit invalidity).
+# - Skip UMA energy computation until energy advantages ramp in (speed + less noise during warmup).
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v8
+
+filters:
+  enable_filtering: false
+  duplicate_penalty_mode: best_only
+
+reward:
+  dynamic_energy:
+    enabled: true
+  atom_stability_weight: 18.0
+  valence_underbond_weight: 0.3
+  valence_underbond_soft_weight: 0.15
+  valence_overbond_weight: 1.0
+  valence_overbond_soft_weight: 0.5

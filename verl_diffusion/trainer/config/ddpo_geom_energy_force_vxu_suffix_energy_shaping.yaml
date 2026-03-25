@@ -1,0 +1,26 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix
+  - _self_
+
+# Phase 3: enable potential-based reward shaping, but only for the energy channel.
+#
+# This keeps the force objective as a terminal-only reward (less noisy), while using
+# per-timestep energy deltas to provide a denser learning signal on the suffix trajectory.
+
+name: edm-geom-energy-force-vxu-suffix-energy-shaping
+
+reward:
+  shaping:
+    enabled: true
+    only_energy_reshape: true
+    gamma: 1.0
+    terminal_weight: 5
+    mlff_batch_size: 16
+    scheduler:
+      mode: adaptive
+      skip_prefix: 0
+      include_terminal: true
+      adaptive:
+        coarse_stride: 10
+        fine_stride: 2
+        threshold_fraction: 0.25

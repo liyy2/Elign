@@ -25,8 +25,7 @@ First, you need to have access to the UMA models via Hugging Face:
 Install the package for MLFF predictor functionality:
 ```bash
 # For rdkit environment (recommended)
-conda create -c conda-forge -n molecular-diffusion rdkit
-conda activate molecular-diffusion
+conda activate edm
 
 # Install other requirements
 pip install -r e3_diffusion_for_molecules-main/requirements.txt
@@ -207,3 +206,22 @@ terminal step: 999 appended
 ⇒ selected_count = 131 diffusion nodes per prompt.
 MLFF shaping in verl_diffusion/worker/reward/force.py (lines 492-544) therefore flattens B × selected_count = 24 × 131 = 3144 evaluations. With mlff_batch_size=16 (script override), the loop runs ceil(3144 / 16) = 197 UMA force calls.
 PPO training splits the same 24 samples via train_micro_batch_size=4 (post_train_diffusion.sh (line 27), consumed in verl_diffusion/worker/actor/edm_actor.py (lines 499-523)) into exactly 6 optimizer mini-batches per rollout epoch.
+
+## Post-hoc force alignment analysis
+
+To measure how the learned drift deviation (defined as `mu_post - mu_pre`, i.e., **post-trained minus pretrained**) aligns with MLFF forces, run:
+
+```bash
+conda activate edm
+python analyze_force_alignment_posthoc.py \
+  --run-dir outputs/verl_geom/<run_name> \
+  --num-molecules 256 \
+  --device cuda:0 \
+  --mlff-device cuda:0 \
+  --out outputs/verl_geom/<run_name>/force_alignment_posthoc.json
+```
+
+Notes:
+- Defaults to `model.config` (args.pickle), `model.model_path` (pretrained), and `checkpoint_best.pth` (post-trained) from `<run-dir>/config.yaml`.
+- Uses the same reward scheduler settings from `reward.shaping.scheduler` to pick diffusion steps; `--stage fine` matches the training-time force-alignment gating.
+- Use `--disable-mlff` if you only want drift-delta magnitude stats without UMA calls.

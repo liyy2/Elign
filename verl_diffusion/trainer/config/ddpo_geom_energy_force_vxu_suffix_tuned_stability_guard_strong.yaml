@@ -1,0 +1,19 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-strong
+
+# Stronger stability / valence guard for GEOM RL fine-tuning.
+# Intended as a follow-up when V×U is healthy but MolStab is volatile/regressing.
+train:
+  learning_rate: 3.0e-07
+  clip_range: 0.15
+  kl_penalty_weight: 0.06
+  kl_adaptive: false
+
+reward:
+  force_only_if_stable: true
+  stability_weight: 6.0
+  valence_overbond_weight: 0.2
+  valence_overbond_soft_weight: 0.05

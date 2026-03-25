@@ -63,12 +63,22 @@ class TestFilterDuplicatePenalty(unittest.TestCase):
             )
 
             random.seed(0)
-            filtered, _filter_ratio, _novelty_ratio, validity, uniqueness = filt.filter(data)
+            (
+                filtered,
+                _filter_ratio,
+                _novelty_ratio,
+                validity,
+                uniqueness,
+                duplicate_hit_ratio,
+                history_hit_ratio,
+            ) = filt.filter(data)
 
             # Both samples map to the same largest-fragment SMILES ("CC"), i.e. a duplicate batch.
             self.assertEqual(validity, 1.0)
             self.assertEqual(uniqueness, 0.5)
             self.assertEqual(len(filtered), 1)
+            self.assertEqual(duplicate_hit_ratio, 1.0)
+            self.assertEqual(history_hit_ratio, 0.0)
 
             # With enable_filtering=true, we keep a single representative for the duplicate SMILES,
             # so we assign the full duplicate cost to the kept sample: -(count-1) * scale.

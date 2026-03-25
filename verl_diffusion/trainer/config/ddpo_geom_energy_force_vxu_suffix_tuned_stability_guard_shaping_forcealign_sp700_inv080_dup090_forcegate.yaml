@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp700_inv080_dup090
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp700-inv080-dup090-forcegate-ob070-soft20-sw8
+
+reward:
+  force_only_if_stable: true
+  stability_weight: 8.0
+  valence_overbond_weight: 0.7
+  valence_overbond_soft_weight: 0.2

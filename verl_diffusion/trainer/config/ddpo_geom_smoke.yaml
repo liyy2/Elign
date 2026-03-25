@@ -43,9 +43,20 @@ train:
   epoch_per_rollout: 1
 
 reward:
-  type: dummy
-  reward_value: 0.0
-  stability_value: 0.0
+  type: polar_mace
+  mlff_model: polar-1-m
+  mlff_backend: polar_mace
+  mlff_charge: 0
+  mlff_spin: 1
+  mlff_external_field: [0.0, 0.0, 0.0]
+  mlff_default_dtype: float32
+  use_energy: false
+  force_weight: 1.0
+  energy_weight: 0.0
+  stability_weight: 0.0
+  force_aggregation: rms
+  shaping:
+    enabled: false
 
 wandb:
   enabled: false

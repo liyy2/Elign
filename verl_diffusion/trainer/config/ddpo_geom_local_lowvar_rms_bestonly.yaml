@@ -1,0 +1,58 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup
+  - _self_
+
+# Local experimentation config focused on lower-variance GRPO updates:
+# - Keep full prompt-groups (disable hard filtering) to avoid degenerate groups after RDKit filtering.
+# - Penalize duplicates via `best_only` so each group still has an internal learning signal.
+# - Reduce discrete stability bonus magnitude (less +/- jump), rely more on continuous atom/valence shaping.
+# - Use RMS force aggregation + clipping to reduce tail sensitivity.
+name: edm-geom-local-lowvar-rms-bestonly
+
+filters:
+  # Keep prompt groups intact (less GRPO variance vs. filtering down to 1-2 samples).
+  enable_filtering: false
+  duplicate_penalty_mode: best_only
+  # Slightly gentler penalties than the long 1024-sample recipe to avoid huge per-batch reward spikes.
+  duplicate_penalty_scale: 0.50
+  history_penalty_scale: 0.20
+
+reward:
+  # Reward signal smoothing.
+  force_aggregation: rms
+  force_clip_threshold: 8.0
+
+  # Keep force gating to avoid the common "unstable-but-low-force" exploit.
+  force_only_if_stable: true
+
+  # Lower discrete +/- stability jump; rely on continuous shaping terms.
+  stability_weight: 3.0
+  atom_stability_weight: 15.0
+
+  # Energy: ramp in slowly via advantage mixing; skip computing energies until it matters.
+  use_energy: true
+  energy_weight: 0.05
+  energy_adv_weight: 0.02
+  adv_schedule:
+    enabled: true
+    energy:
+      start: 0.0
+      end: 0.02
+      warmup_epochs: 10
+      ramp_epochs: 20
+  dynamic_energy:
+    enabled: true
+    enable_threshold: 0.0
+
+train:
+  # Disable early stopping for local runs; stop via max_time_hours or Ctrl+C.
+  max_time_hours: null
+  early_stop_metric: null
+  early_stop_patience_minutes: null
+  early_stop_min_delta: 0.0
+
+  # Smaller advantage clipping reduces gradient spikes.
+  adv_clip_max: 2.0
+
+  # Prevent unbounded checkpoint growth (disk quota).
+  checkpoint_keep_last: 50

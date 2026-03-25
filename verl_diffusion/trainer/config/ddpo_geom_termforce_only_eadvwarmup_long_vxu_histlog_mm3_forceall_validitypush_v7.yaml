@@ -1,0 +1,10 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall_validitypush_v6
+  - _self_
+
+# Variant: stronger RDKit validity push (aiming for >=98% @ 1024) while keeping the v6
+# overbond-valence penalties and de-duplication recipe.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v7
+
+filters:
+  invalid_penalty_scale: 3.0

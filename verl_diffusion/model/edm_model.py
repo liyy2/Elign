@@ -1,47 +1,39 @@
 import torch
+import os
 from tqdm import tqdm as tq
 from .base import BaseModel
-from edm_source.qm9.models import get_model
-from edm_source.equivariant_diffusion.en_diffusion import EnVariationalDiffusion
 from torch.nn import functional as F
 from verl_diffusion.utils.math import policy_step_logprob
 
-class EDMModel(BaseModel, EnVariationalDiffusion):
-    def __init__(self, model, config):
-        # Initialize EnVariationalDiffusion first since it's a nn.Module
-        # Get configuration from the existing model
-        model_config = {
-            'dynamics': model.dynamics,
-            'in_node_nf': model.in_node_nf,
-            'n_dims': 3,
-            'timesteps': config.diffusion_steps,
-            'noise_schedule': config.diffusion_noise_schedule,  # Default value from the example
-            'noise_precision': config.diffusion_noise_precision,     # Default value
-            'loss_type': config.diffusion_loss_type,          # Default value
-            'norm_values': config.normalize_factors,           # Default value
-            'include_charges': config.include_charges      # Default value
-        }
-        
-        # Initialize EnVariationalDiffusion with the configuration
-        EnVariationalDiffusion.__init__(
-            self,
-            dynamics=model_config['dynamics'],
-            in_node_nf=model_config['in_node_nf'],
-            n_dims=model_config['n_dims'],
-            timesteps=model_config['timesteps'],
-            noise_schedule=model_config['noise_schedule'],
-            noise_precision=model_config['noise_precision'],
-            loss_type=model_config['loss_type'],
-            norm_values=model_config['norm_values'],
-            include_charges=model_config['include_charges']
-        )
 
-        # Initialize BaseModel
+def _tqdm_enabled() -> bool:
+    """Enable tqdm progress bars only when explicitly requested.
+
+    Set `VERL_TQDM=1` to turn them on.
+    """
+    value = os.environ.get("VERL_TQDM", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+class EDMModel(BaseModel, torch.nn.Module):
+    def __init__(self, model, config, backend: str = "auto"):
+        torch.nn.Module.__init__(self)
         BaseModel.__init__(self)
-        # Store the model after parent classes are initialized
         self.model = model
         self.config = config
-        
+        normalized_backend = str(backend or "auto").strip().lower()
+        if normalized_backend in {"", "auto"}:
+            normalized_backend = "geoldm" if hasattr(model, "vae") else "edm"
+        if normalized_backend not in {"edm", "geoldm"}:
+            raise ValueError(f"Unsupported diffusion backend '{backend}'.")
+        self.backend = normalized_backend
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            model = super().__getattr__("model")
+            return getattr(model, name)
+
     def get_mask(self, nodesxsample, batch_size, max_n_nodes):
         """
         Generate node and edge masks based on the number of nodes
@@ -89,8 +81,22 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         return x
     
     def load(self, model_path):
-        flow_state_dict = torch.load(model_path, map_location= self.config.device )
-        self.model.load_state_dict(flow_state_dict)
+        state = torch.load(model_path, map_location=self.config.device)
+        if isinstance(state, dict) and "model_state_dict" in state:
+            state = state["model_state_dict"]
+        if not isinstance(state, dict):
+            raise ValueError(f"Unsupported checkpoint format at {model_path}.")
+
+        keys = list(state.keys())
+        if any(k.startswith("model.") for k in keys):
+            missing, unexpected = self.load_state_dict(state, strict=False)
+        else:
+            missing, unexpected = self.model.load_state_dict(state, strict=False)
+
+        if missing:
+            print(f"[WARN] Missing keys while loading {model_path}: {missing}")
+        if unexpected:
+            print(f"[WARN] Unexpected keys while loading {model_path}: {unexpected}")
         
     @torch.no_grad()
     def sample(
@@ -398,14 +404,18 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
             log_p = self.compute_log_p_zs_given_zt(prev_sample, mu_x, sigma_x, node_mask = node_mask)
         else:
             log_p = self.compute_log_p_zs_given_zt(xh, mu_x, sigma_x, node_mask = node_mask)
-        x = xh[:, :, :self.n_dims]
 
-        h_int = z0[:, :, -1:] if self.include_charges else torch.zeros(0).to(z0.device)
-        x, h_cat, h_int = self.unnormalize(x, z0[:, :, self.n_dims:-1], h_int, node_mask)
+        if self.backend == "geoldm":
+            x, h = self.model.vae.decode(xh, node_mask, edge_mask, context)
+        else:
+            x = xh[:, :, :self.n_dims]
 
-        h_cat = F.one_hot(torch.argmax(h_cat, dim=2), self.num_classes) * node_mask
-        h_int = torch.round(h_int).long() * node_mask
-        h = {'integer': h_int, 'categorical': h_cat}
+            h_int = z0[:, :, -1:] if self.include_charges else torch.zeros(0).to(z0.device)
+            x, h_cat, h_int = self.unnormalize(x, z0[:, :, self.n_dims:-1], h_int, node_mask)
+
+            h_cat = F.one_hot(torch.argmax(h_cat, dim=2), self.num_classes) * node_mask
+            h_int = torch.round(h_int).long() * node_mask
+            h = {'integer': h_int, 'categorical': h_cat}
 
         return x, h, mu_x, sigma_x.squeeze(-1), log_p, zeros, xh
 
@@ -558,7 +568,10 @@ class EDMModel(BaseModel, EnVariationalDiffusion):
         z0_preds = []
         latents.append(z)
         # Iteratively sample p(z_s | z_t) for t = 1, ..., T, with s = t - 1.
-        for s in tq(reversed(range(0, self.T)), desc="sampling", leave=False, unit="step"):
+        step_iter = reversed(range(0, self.T))
+        if _tqdm_enabled():
+            step_iter = tq(step_iter, desc="sampling", leave=False, unit="step")
+        for s in step_iter:
             s_array = torch.full((n_samples, 1), fill_value=s, device=z.device)
             t_array = s_array + 1
             s_array = s_array / self.T

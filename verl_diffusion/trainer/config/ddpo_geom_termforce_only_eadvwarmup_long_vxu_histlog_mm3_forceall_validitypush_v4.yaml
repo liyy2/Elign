@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3_forceall
+  - _self_
+
+# Variant: forceall recipe + moderate validity push, keeping RMS force rewards.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall-validitypush-v4
+
+filters:
+  invalid_penalty_scale: 1.0
+  invalid_reward_gate_mode: hard
+

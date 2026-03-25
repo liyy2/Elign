@@ -1,0 +1,17 @@
+defaults:
+  - ddpo_geom_best1174_sw7_lr1e7_kl015
+  - _self_
+
+name: edm-geom-best1174-histdup-h2048-hp020-sw8-ob080-kl012
+
+train:
+  kl_penalty_weight: 0.12
+
+filters:
+  history_size: 2048
+  history_penalty_scale: 0.2
+  duplicate_penalty_scale: 0.75
+
+reward:
+  stability_weight: 8.0
+  valence_overbond_weight: 0.8

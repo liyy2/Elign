@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_energyshape_onlyE_tw5_fw02_inv060_dup70_hp030_sp700_vxu
+  - _self_
+
+# Variant: use a repeat-count-aware history penalty to boost 1024-sample uniqueness.
+name: edm-geom-energyshape-onlyE-tw5-fw02-inv060-dup70-hp030-sp700-vxu-histlog-mm3
+
+filters:
+  history_penalty_mode: log
+  history_penalty_max_multiplier: 3
+

@@ -12,7 +12,14 @@ from tqdm import tqdm
 from omegaconf import OmegaConf
 from tensordict import TensorDict
 import sys
-sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent
+EDM_SOURCE_ROOT = REPO_ROOT / "edm_source"
+for path in (REPO_ROOT, EDM_SOURCE_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.analyze import check_stability
 from verl_diffusion.protocol import DataProto
@@ -178,6 +185,34 @@ def load_run_config(run_dir: Path) -> Dict[str, Any]:
     with open(config_path, "r") as f:
         data = yaml.safe_load(f) or {}
     return data
+
+
+def resolve_args_pickle_path(
+    args: argparse.Namespace,
+    run_dir: Path,
+    run_config: Dict[str, Any],
+) -> Path:
+    if args.args_pickle:
+        candidate = make_absolute(args.args_pickle, run_dir)
+        if candidate is not None and candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"args.pickle not found at '{candidate}'.")
+
+    candidate = run_dir / "args.pickle"
+    if candidate.exists():
+        return candidate
+
+    model_cfg = run_config.get("model", {}) if isinstance(run_config, dict) else {}
+    config_value = model_cfg.get("config")
+    if config_value:
+        candidate = make_absolute(str(config_value), run_dir)
+        if candidate is not None and candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not locate args.pickle. Pass --args-pickle explicitly, copy args.pickle into --run-dir, "
+        "or ensure config.yaml contains model.config pointing to the EDM args.pickle."
+    )
 
 
 def select_device(device_arg: Optional[str]) -> torch.device:
@@ -369,6 +404,22 @@ def _repair_unstable_samples(
         return {"enabled": False, "reason": "UMAForceReward.force_computer is None"}
 
     unstable_indices = _collect_unstable_indices(samples, dataset_info)
+    # Guard against accidentally *reducing RDKit validity* during stability repair:
+    # only apply stability repair to molecules that are currently RDKit-sanitizable.
+    #
+    # Without this guard, force steps can move borderline geometries across the bond-order
+    # thresholds used by RDKit, turning a previously-valid molecule into an invalid one.
+    rdkit_available = True
+    try:
+        import rdkit  # noqa: F401
+    except Exception:
+        rdkit_available = False
+    if rdkit_available and unstable_indices:
+        unstable_indices = [
+            idx
+            for idx in unstable_indices
+            if sample_largest_fragment_smiles(samples[idx], dataset_info) is not None
+        ]
     unstable_before = len(unstable_indices)
     fixed_per_step: List[int] = []
 
@@ -414,7 +465,15 @@ def _repair_unstable_samples(
             for local_idx, sample_idx in enumerate(chunk_indices):
                 sample = samples[sample_idx]
                 num_atoms = int(sample.get("num_atoms", sample["atom_types"].shape[0]))
+                prev_positions = sample.get("positions")
+                if prev_positions is not None:
+                    prev_positions = prev_positions.detach().cpu().clone()
                 sample["positions"] = updated[local_idx, :num_atoms].clone()
+                if rdkit_available:
+                    smiles = sample_largest_fragment_smiles(sample, dataset_info)
+                    if smiles is None and prev_positions is not None:
+                        # Revert this step if it breaks RDKit validity.
+                        sample["positions"] = prev_positions
 
         new_unstable: List[int] = []
         fixed_this_step = 0
@@ -696,16 +755,23 @@ def init_rewarder(
     reward_cfg = reward_cfg or {}
     shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
     shaping_override = {"enabled": False, "skip_prefix": 0, "scheduler": {"skip_prefix": 0}}
+    reward_type = str(reward_cfg.get("type", "") or "").lower()
+    mlff_backend = reward_cfg.get("mlff_backend", reward_type if reward_type in {"polar_mace", "uma", "mlff"} else None)
 
     rewarder = UMAForceReward(
         dataset_info=dataset_info,
         condition=False,
-        mlff_model=reward_cfg.get("mlff_model", "uma-s-1p1"),
+        mlff_model=reward_cfg.get("mlff_model", "polar-1-m"),
+        mlff_backend=mlff_backend,
         mlff_predictor=None,
         position_scale=None,
         force_clip_threshold=reward_cfg.get("force_clip_threshold"),
         device=device,
         mlff_device=device,
+        mlff_charge=reward_cfg.get("mlff_charge", reward_cfg.get("charge", 0)),
+        mlff_spin=reward_cfg.get("mlff_spin", reward_cfg.get("spin", 1)),
+        mlff_external_field=reward_cfg.get("mlff_external_field", [0.0, 0.0, 0.0]),
+        mlff_default_dtype=reward_cfg.get("mlff_default_dtype", "float32"),
         shaping=shaping_override,
         use_energy=bool(reward_cfg.get("use_energy", False)),
         energy_only_if_stable=bool(reward_cfg.get("energy_only_if_stable", False)),
@@ -840,15 +906,10 @@ def main() -> None:
     if not samples_path.exists():
         raise FileNotFoundError(f"Samples file '{samples_path}' not found.")
 
-    args_pickle_path = (
-        make_absolute(args.args_pickle, run_dir) if args.args_pickle else run_dir / "args.pickle"
-    )
-    if not args_pickle_path.exists():
-        raise FileNotFoundError(f"args.pickle not found at '{args_pickle_path}'.")
-
     run_config = load_run_config(run_dir)
     reward_cfg = run_config.get("reward", {}) if isinstance(run_config, dict) else {}
 
+    args_pickle_path = resolve_args_pickle_path(args, run_dir, run_config)
     edm_config = load_edm_config(args_pickle_path)
     dataset_info = get_dataset_info(edm_config.dataset, edm_config.remove_h)
 

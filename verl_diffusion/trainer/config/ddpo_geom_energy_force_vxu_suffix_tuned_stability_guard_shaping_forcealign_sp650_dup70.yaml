@@ -1,0 +1,46 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp650-dup70
+
+# Goal: push MolStab (and V×U×MolStab) above the ~0.54 plateau by:
+# - training on a slightly longer suffix (skip_prefix=650 instead of 700)
+# - enabling sparse shaping + force-alignment (inherited)
+# - increasing duplicate penalty to preserve uniqueness at 1024 samples
+
+model:
+  skip_prefix: 650
+
+train:
+  max_time_hours: 12.0
+  learning_rate: 1.0e-07
+  clip_range: 0.05
+  kl_penalty_weight: 0.15
+  adv_clip_max: 3.0
+  max_grad_norm: 0.5
+  train_micro_batch_size: 16
+  gradient_accumulation_steps: 8
+  early_stop_patience_minutes: 240
+  early_stop_min_delta: 0.001
+
+filters:
+  invalid_penalty_scale: 0.45
+  duplicate_penalty_scale: 0.70
+
+reward:
+  force_only_if_stable: false
+  force_clip_threshold: 10.0
+  energy_weight: 0.05
+  energy_adv_weight: 0.05
+  stability_weight: 7.0
+  atom_stability_weight: 15.0
+  valence_underbond_weight: 0.2
+  valence_overbond_weight: 0.5
+  valence_underbond_soft_weight: 0.05
+  valence_overbond_soft_weight: 0.15
+  valence_soft_temperature: 0.02
+  shaping:
+    mlff_batch_size: 32
+
+save_interval: 5

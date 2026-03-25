@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp650_inv060_dup090
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp700-inv060-dup090
+
+# Goal: recover V×U at 1024 samples by shortening the learned suffix back to the
+# best-performing baseline (skip_prefix=700) while keeping inv/dup penalties from sp650.
+model:
+  skip_prefix: 700
+

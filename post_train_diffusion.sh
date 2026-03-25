@@ -46,7 +46,7 @@ FORCE_ALIGNMENT_ENABLED=false
 
 # Reward configuration
 USE_ENERGY=true
-MLFF_MODEL="uma-s-1p1"
+MLFF_MODEL="polar-1-m"
 MLFF_BATCH_SIZE=32 # Only used when shaping is enabled
 FORCE_AGGREGATION="rms"
 FORCE_CLIP_THRESHOLD="2.0"
@@ -160,6 +160,7 @@ torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}" run_verl_diffusion.py 
   train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}" \
   filters.enable_filtering="${ENABLE_FILTERING}" \
   reward.use_energy="${USE_ENERGY}" \
+  reward.type="polar_mace" \
   reward.mlff_model="${MLFF_MODEL}" \
   filters.enable_penalty="${ENABLE_NOVELTY_PENALTY}" \
   filters.penalty_scale="${NOVELTY_PENALTY_SCALE}" \

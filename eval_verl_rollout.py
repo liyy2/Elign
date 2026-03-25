@@ -5,14 +5,21 @@ import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import sys
-sys.path.append("/home/yl2428/e3_diffusion_for_molecules-main/edm_source")
+
+REPO_ROOT = Path(__file__).resolve().parent
+EDM_SOURCE_ROOT = REPO_ROOT / "edm_source"
+for path in (REPO_ROOT, EDM_SOURCE_ROOT):
+    path_str = str(path)
+    if path_str not in sys.path:
+        sys.path.insert(0, path_str)
 import torch
 from tqdm import tqdm
 from omegaconf import OmegaConf
+from torch.distributions import Categorical
 
 from edm_source.configs.datasets_config import get_dataset_info
 from edm_source.qm9.dataset import retrieve_dataloaders
-from edm_source.qm9.models import get_model
+from edm_source.qm9.models import get_model, get_latent_diffusion
 from edm_source.qm9.rdkit_functions import retrieve_qm9_smiles
 from verl_diffusion.dataloader.dataloader import EDMDataLoader
 from verl_diffusion.model.edm_model import EDMModel
@@ -69,6 +76,33 @@ def parse_args() -> argparse.Namespace:
         help="Total number of molecules to sample from the policy.",
     )
     parser.add_argument(
+        "--fixed-num-atoms",
+        type=int,
+        default=None,
+        help=(
+            "Force the node-count prior to always sample this many atoms (total nodes). "
+            "Useful for generating baseline/RL samples at roughly the same size."
+        ),
+    )
+    parser.add_argument(
+        "--nodes-focus-min",
+        type=int,
+        default=None,
+        help="Override dataloader.nodes_dist_focus_min for eval sampling.",
+    )
+    parser.add_argument(
+        "--nodes-focus-max",
+        type=int,
+        default=None,
+        help="Override dataloader.nodes_dist_focus_max for eval sampling.",
+    )
+    parser.add_argument(
+        "--nodes-focus-multiplier",
+        type=float,
+        default=None,
+        help="Override dataloader.nodes_dist_focus_multiplier for eval sampling.",
+    )
+    parser.add_argument(
         "--sample-group-size",
         type=int,
         default=None,
@@ -94,14 +128,26 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--share-initial-noise",
+        dest="share_initial_noise",
         action="store_true",
+        default=None,
         help="Force shared initial noise across grouped samples (overrides config).",
+    )
+    parser.add_argument(
+        "--no-share-initial-noise",
+        dest="share_initial_noise",
+        action="store_false",
+        default=None,
+        help="Disable shared initial noise across grouped samples (overrides config).",
     )
     parser.add_argument(
         "--skip-prefix",
         type=int,
-        default=0,
-        help="Number of diffusion steps to treat as fixed prefix (default disables prefix sharing).",
+        default=None,
+        help=(
+            "Number of diffusion steps to treat as fixed prefix. "
+            "Defaults to the training config value (or 0 if unset)."
+        ),
     )
     parser.add_argument(
         "--device",
@@ -114,6 +160,19 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=42,
         help="Base seed for dataloader sampling.",
+    )
+    parser.add_argument(
+        "--geom-data-file",
+        type=str,
+        default=None,
+        help="Optional override for the GEOM `geom_drugs_30.npy` path.",
+    )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="auto",
+        choices=["auto", "edm", "geoldm"],
+        help="Model backend to use. Defaults to auto-detect from args.pickle.",
     )
     return parser.parse_args()
 
@@ -244,6 +303,34 @@ def load_model_weights(model: EDMModel, checkpoint_path: Path, device: torch.dev
         print(f"[WARN] Unexpected keys while loading checkpoint: {unexpected}")
 
 
+def resolve_args_pickle_path(
+    args: argparse.Namespace,
+    run_dir: Path,
+    run_config: Dict[str, Any],
+) -> Path:
+    if args.args_pickle:
+        candidate = make_absolute(args.args_pickle, run_dir)
+        if candidate is not None and candidate.exists():
+            return candidate
+        raise FileNotFoundError(f"Could not locate args.pickle at '{candidate}'.")
+
+    candidate = run_dir / "args.pickle"
+    if candidate.exists():
+        return candidate
+
+    model_cfg = run_config.get("model", {}) if isinstance(run_config, dict) else {}
+    config_value = model_cfg.get("config")
+    if config_value:
+        candidate = make_absolute(str(config_value), run_dir)
+        if candidate is not None and candidate.exists():
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not locate args.pickle. Pass --args-pickle explicitly, copy args.pickle into --run-dir, "
+        "or ensure config.yaml contains model.config pointing to the EDM args.pickle."
+    )
+
+
 def prepare_sampling_config(
     run_config: Dict[str, Any],
     overrides: argparse.Namespace,
@@ -270,9 +357,15 @@ def prepare_sampling_config(
         if overrides.time_step is not None
         else int(model_cfg.get("time_step", 1000))
     )
-    cfg["model"]["share_initial_noise"] = bool(overrides.share_initial_noise)
+    cfg["model"]["share_initial_noise"] = (
+        bool(overrides.share_initial_noise)
+        if overrides.share_initial_noise is not None
+        else bool(model_cfg.get("share_initial_noise", False))
+    )
     cfg["model"]["config"] = model_cfg.get("config")
     cfg["model"]["model_path"] = model_cfg.get("model_path")
+    cfg["model"]["return_suffix_only"] = bool(model_cfg.get("return_suffix_only", False))
+    cfg["model"]["backend"] = str(model_cfg.get("backend", "auto") or "auto")
 
     cfg["dataloader"]["sample_group_size"] = (
         overrides.sample_group_size
@@ -289,13 +382,37 @@ def prepare_sampling_config(
         if overrides.micro_batch_size is not None
         else int(dataloader_cfg.get("micro_batch_size", cfg["dataloader"]["each_prompt_sample"]))
     )
+    # GEOM requires an explicit `.npy` file path for loading conformations.
+    cfg["dataloader"]["geom_data_file"] = dataloader_cfg.get("geom_data_file")
+    if overrides.geom_data_file is not None:
+        cfg["dataloader"]["geom_data_file"] = overrides.geom_data_file
     cfg["dataloader"]["smiles_path"] = dataloader_cfg.get("smiles_path", "qm9/temp/qm9_smiles.pickle")
     cfg["dataloader"]["epoches"] = dataloader_cfg.get("epoches", 1)
+    cfg["dataloader"]["nodes_dist_focus_min"] = (
+        int(overrides.nodes_focus_min)
+        if overrides.nodes_focus_min is not None
+        else dataloader_cfg.get("nodes_dist_focus_min")
+    )
+    cfg["dataloader"]["nodes_dist_focus_max"] = (
+        int(overrides.nodes_focus_max)
+        if overrides.nodes_focus_max is not None
+        else dataloader_cfg.get("nodes_dist_focus_max")
+    )
+    cfg["dataloader"]["nodes_dist_focus_multiplier"] = (
+        float(overrides.nodes_focus_multiplier)
+        if overrides.nodes_focus_multiplier is not None
+        else dataloader_cfg.get("nodes_dist_focus_multiplier", 1.0)
+    )
+    cfg["dataloader"]["nodes_dist_fixed"] = int(overrides.fixed_num_atoms) if overrides.fixed_num_atoms else None
 
     cfg["train"]["force_alignment_enabled"] = False
     cfg["train"]["force_alignment_weight"] = 0.0
 
-    skip_prefix = max(int(overrides.skip_prefix), 0)
+    if overrides.skip_prefix is not None:
+        skip_prefix = max(int(overrides.skip_prefix), 0)
+    else:
+        skip_prefix = max(int(model_cfg.get("skip_prefix", 0) or 0), 0)
+    cfg["model"]["skip_prefix"] = skip_prefix
     cfg["reward"]["shaping"] = {
         "enabled": False,
         "skip_prefix": skip_prefix,
@@ -325,17 +442,6 @@ def main() -> None:
     if not run_dir.exists():
         raise FileNotFoundError(f"Run directory '{run_dir}' does not exist.")
 
-    args_pickle_path = (
-        make_absolute(args.args_pickle, run_dir)
-        if args.args_pickle
-        else make_absolute("args.pickle", run_dir)
-    )
-    if args_pickle_path is None or not args_pickle_path.exists():
-        raise FileNotFoundError(
-            f"Could not locate args.pickle at '{args_pickle_path}'. "
-            "Pass --args-pickle explicitly or copy the EDM args to the run directory."
-        )
-
     checkpoint_path = infer_checkpoint_path(run_dir, args.checkpoint)
     output_path = (
         make_output_path(args.output, run_dir)
@@ -347,8 +453,28 @@ def main() -> None:
     run_config = load_run_config(run_dir)
     sampling_config = prepare_sampling_config(run_config, args)
 
+    args_pickle_path = resolve_args_pickle_path(args, run_dir, run_config)
     edm_config = load_edm_config(args_pickle_path)
-    edm_config.datadir = getattr(edm_config, "datadir", "qm9/temp") or "qm9/temp"
+    backend = str(args.backend or sampling_config["model"].get("backend", "auto") or "auto").lower()
+    if backend in {"", "auto"}:
+        backend = "geoldm" if bool(getattr(edm_config, "train_diffusion", False)) else "edm"
+    if backend not in {"edm", "geoldm"}:
+        raise ValueError(f"Unsupported backend '{backend}'.")
+    print(f"Using diffusion backend: {backend}")
+
+    # Match the training entrypoint (`run_verl_diffusion.py`):
+    # - QM9 uses a processed cache directory.
+    # - GEOM requires an explicit `.npy` path (geom_data_file / geom_data_path).
+    dataset_name = getattr(edm_config, "dataset", "")
+    if isinstance(dataset_name, str) and "qm9" in dataset_name:
+        edm_config.datadir = "qm9/temp"
+
+    dataloader_cfg = sampling_config.get("dataloader") or {}
+    if isinstance(dataloader_cfg, dict):
+        geom_data_file = dataloader_cfg.get("geom_data_file")
+        if geom_data_file:
+            setattr(edm_config, "geom_data_file", geom_data_file)
+            setattr(edm_config, "geom_data_path", geom_data_file)
 
     device = select_device(args.device)
     edm_config.cuda = device.type == "cuda"
@@ -357,12 +483,74 @@ def main() -> None:
     edm_config.device = device
 
     dataset_info = get_dataset_info(edm_config.dataset, edm_config.remove_h)
-    retrieve_qm9_smiles(dataset_info)
+    # Only QM9 needs a dataset SMILES list; GEOM evaluation doesn't.
+    if "qm9" in str(dataset_info.get("name", "")):
+        retrieve_qm9_smiles(dataset_info)
     dataloaders, _ = retrieve_dataloaders(edm_config)
-    flow, nodes_dist, prop_dist = get_model(edm_config, device, dataset_info, dataloaders["train"])
+    if backend == "geoldm":
+        flow, nodes_dist, prop_dist = get_latent_diffusion(edm_config, device, dataset_info, dataloaders["train"])
+    else:
+        flow, nodes_dist, prop_dist = get_model(edm_config, device, dataset_info, dataloaders["train"])
     flow.to(device)
 
-    model = EDMModel(flow, edm_config)
+    # Mirror the RL rollout node-count reweighting so offline eval matches training prompts.
+    dataloader_cfg = sampling_config.get("dataloader") or {}
+    if isinstance(dataloader_cfg, dict) and nodes_dist is not None:
+        focus_min = dataloader_cfg.get("nodes_dist_focus_min")
+        focus_max = dataloader_cfg.get("nodes_dist_focus_max")
+        focus_multiplier = dataloader_cfg.get("nodes_dist_focus_multiplier", 1.0)
+        try:
+            focus_multiplier = float(focus_multiplier) if focus_multiplier is not None else 1.0
+        except (TypeError, ValueError):
+            focus_multiplier = 1.0
+
+        if focus_min is not None and focus_max is not None and focus_multiplier != 1.0:
+            try:
+                focus_min = int(focus_min)
+                focus_max = int(focus_max)
+            except (TypeError, ValueError):
+                focus_min = None
+                focus_max = None
+
+        if focus_min is not None and focus_max is not None and focus_multiplier != 1.0:
+            if hasattr(nodes_dist, "prob") and hasattr(nodes_dist, "n_nodes") and hasattr(nodes_dist, "m"):
+                prob = nodes_dist.prob.detach().clone().to(dtype=torch.float64)
+                n_nodes = nodes_dist.n_nodes.detach().to(dtype=torch.long)
+                mask = (n_nodes >= focus_min) & (n_nodes <= focus_max)
+                if mask.any():
+                    prob[mask] = prob[mask] * focus_multiplier
+                    prob = prob / prob.sum().clamp(min=1e-12)
+                    nodes_dist.prob = prob.to(dtype=torch.float32)
+                    nodes_dist.m = Categorical(nodes_dist.prob)
+                    print(
+                        f"Reweighted n_nodes prior for eval rollouts: "
+                        f"[{focus_min}, {focus_max}] x {focus_multiplier}"
+                    )
+
+        fixed_nodes = dataloader_cfg.get("nodes_dist_fixed")
+        if fixed_nodes is not None:
+            try:
+                fixed_nodes = int(fixed_nodes)
+            except (TypeError, ValueError):
+                fixed_nodes = None
+
+        if fixed_nodes is not None:
+            if hasattr(nodes_dist, "prob") and hasattr(nodes_dist, "n_nodes") and hasattr(nodes_dist, "m"):
+                n_nodes = nodes_dist.n_nodes.detach().to(dtype=torch.long)
+                mask = n_nodes == int(fixed_nodes)
+                if not mask.any():
+                    raise ValueError(
+                        f"--fixed-num-atoms={fixed_nodes} is not supported by this dataset prior "
+                        f"(min={int(n_nodes.min())}, max={int(n_nodes.max())})."
+                    )
+                prob = torch.zeros_like(nodes_dist.prob, dtype=torch.float64)
+                prob[mask] = 1.0
+                prob = prob / prob.sum().clamp(min=1e-12)
+                nodes_dist.prob = prob.to(dtype=torch.float32)
+                nodes_dist.m = Categorical(nodes_dist.prob)
+                print(f"Fixed n_nodes prior for eval rollouts: n_nodes={fixed_nodes}")
+
+    model = EDMModel(flow, edm_config, backend=backend)
     model.to(device)
 
     base_model_path = sampling_config["model"].get("model_path")

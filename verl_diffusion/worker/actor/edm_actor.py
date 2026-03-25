@@ -64,6 +64,35 @@ class EDMActor(BaseActor):
         except (TypeError, ValueError):
             kl_weight = 0.0
         self.kl_penalty_weight = max(0.0, kl_weight)
+        kl_target = self.config["train"].get("kl_target")
+        if kl_target is None:
+            self.kl_target = None
+        else:
+            try:
+                self.kl_target = float(kl_target)
+            except (TypeError, ValueError):
+                self.kl_target = None
+        self.kl_adaptive = bool(self.config["train"].get("kl_adaptive", False))
+        try:
+            self.kl_adaptive_hysteresis = float(self.config["train"].get("kl_adaptive_hysteresis", 1.5) or 1.5)
+        except (TypeError, ValueError):
+            self.kl_adaptive_hysteresis = 1.5
+        self.kl_adaptive_hysteresis = max(1.0, self.kl_adaptive_hysteresis)
+        try:
+            self.kl_adaptive_factor = float(self.config["train"].get("kl_adaptive_factor", 1.5) or 1.5)
+        except (TypeError, ValueError):
+            self.kl_adaptive_factor = 1.5
+        self.kl_adaptive_factor = max(1.0, self.kl_adaptive_factor)
+        try:
+            self.kl_penalty_weight_min = float(self.config["train"].get("kl_penalty_weight_min", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self.kl_penalty_weight_min = 0.0
+        self.kl_penalty_weight_min = max(0.0, self.kl_penalty_weight_min)
+        try:
+            self.kl_penalty_weight_max = float(self.config["train"].get("kl_penalty_weight_max", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            self.kl_penalty_weight_max = 1.0
+        self.kl_penalty_weight_max = max(self.kl_penalty_weight_min, self.kl_penalty_weight_max)
         alignment_cfg = self.config.get("train", {})
         raw_alignment_weight = float(alignment_cfg.get("force_alignment_weight", 0.0))
         enabled_cfg = alignment_cfg.get("force_alignment_enabled")
@@ -93,8 +122,17 @@ class EDMActor(BaseActor):
             self.skip_prefix = 0
         self.active_num_timesteps = self.num_timesteps
 
+    def _should_compute_kl(self) -> bool:
+        if self.kl_penalty_weight > 0.0:
+            return True
+        if not self.kl_adaptive:
+            return False
+        if self.kl_target is None or self.kl_target <= 0.0:
+            return False
+        return True
+
     def _maybe_init_reference_model(self, external_reference):
-        if self.kl_penalty_weight <= 0:
+        if not self._should_compute_kl():
             self.reference_model = None
             return
         ref = external_reference
@@ -109,6 +147,29 @@ class EDMActor(BaseActor):
         device = next(self.model.parameters()).device
         ref.to(device)
         self.reference_model = ref
+
+    def _maybe_adapt_kl_penalty_weight(self, kl_loss: float) -> None:
+        if not self.kl_adaptive:
+            return
+        if self.kl_target is None or self.kl_target <= 0.0:
+            return
+        if self.kl_adaptive_factor <= 1.0 or self.kl_adaptive_hysteresis <= 1.0:
+            return
+
+        upper = self.kl_target * self.kl_adaptive_hysteresis
+        lower = self.kl_target / self.kl_adaptive_hysteresis
+        new_weight = self.kl_penalty_weight
+
+        if kl_loss > upper:
+            if new_weight <= 0.0:
+                new_weight = max(self.kl_penalty_weight_min, 1e-4)
+            else:
+                new_weight = new_weight * self.kl_adaptive_factor
+        elif kl_loss < lower:
+            new_weight = new_weight / self.kl_adaptive_factor
+
+        new_weight = min(max(new_weight, self.kl_penalty_weight_min), self.kl_penalty_weight_max)
+        self.kl_penalty_weight = float(new_weight)
 
     def setup_scheduler(self, total_training_steps: Optional[int] = None) -> None:
         """Initialize the learning rate scheduler if configured."""
@@ -306,7 +367,20 @@ class EDMActor(BaseActor):
             last_lr = self.optimizer.param_groups[0]["lr"]
         metric["lr"] = last_lr
         if info["kl_loss"]:
-            metric["kl_loss"] = float(np.mean(np.array(info["kl_loss"])))
+            kl_value = float(np.mean(np.array(info["kl_loss"])))
+            if dist.is_initialized():
+                try:
+                    device = next(self.model.parameters()).device
+                    kl_tensor = torch.tensor(kl_value, device=device)
+                    dist.all_reduce(kl_tensor, op=dist.ReduceOp.SUM)
+                    world_size = float(dist.get_world_size())
+                    if world_size > 0:
+                        kl_value = float((kl_tensor / world_size).detach().cpu().item())
+                except Exception:
+                    pass
+            metric["kl_loss"] = kl_value
+            self._maybe_adapt_kl_penalty_weight(kl_value)
+        metric["kl_penalty_weight"] = float(self.kl_penalty_weight)
         if info["force_alignment_penalty"]:
             metric["ForceAlignPenalty"] = np.mean(np.array(info["force_alignment_penalty"]))
         if info["force_alignment_cosine"]:
@@ -391,7 +465,7 @@ class EDMActor(BaseActor):
 
         loss = self.loss(advantages, self.clip_range, ratio)
         kl_loss = None
-        if self.reference_model is not None and self.kl_penalty_weight > 0.0:
+        if self.reference_model is not None and self._should_compute_kl():
             with torch.no_grad():
                 _, _, mu_reference, _, _ = self.reference_model.sample_p_zs_given_zt(
                     s_array,
@@ -404,7 +478,8 @@ class EDMActor(BaseActor):
                 )
             kl_per_sample = self._compute_reference_kl(mu_current, mu_reference, sigma_current, node_mask)
             kl_loss = kl_per_sample.mean()
-            loss = loss + self.kl_penalty_weight * kl_loss
+            if self.kl_penalty_weight > 0.0:
+                loss = loss + self.kl_penalty_weight * kl_loss
         clipfrac = torch.mean((torch.abs(ratio - 1.0) > self.clip_range).float())
 
         alignment_penalty = None

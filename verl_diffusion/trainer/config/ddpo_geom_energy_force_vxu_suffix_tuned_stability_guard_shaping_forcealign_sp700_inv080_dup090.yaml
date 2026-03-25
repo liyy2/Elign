@@ -1,0 +1,10 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp700_inv060_dup090
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp700-inv080-dup090
+
+# Slightly stronger invalid penalty to push RDKit validity back toward ~0.95+.
+filters:
+  invalid_penalty_scale: 0.80
+

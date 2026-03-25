@@ -29,7 +29,7 @@ dataloader:
 
 filters:
   condition: false
-  enable_filtering: false
+  enable_filtering: true
   enable_penalty: false
   penalty_scale: 0.0
   # Validity/uniqueness shaping (no dataset SMILES file required).
@@ -57,6 +57,13 @@ train:
   learning_rate: 0.00001
   clip_range: 0.2
   adv_clip_max: 5
+  # Keep KL near the pretraining policy to reduce collapse and over-optimization.
+  kl_target: 0.10
+  kl_adaptive: true
+  kl_adaptive_hysteresis: 1.5
+  kl_adaptive_factor: 2.0
+  kl_penalty_weight_min: 0.02
+  kl_penalty_weight_max: 0.2
   max_grad_norm: 1
   # Keep PPO update memory comfortably under the 30GB cap.
   train_micro_batch_size: 16
@@ -72,8 +79,9 @@ train:
     name: none
 
 reward:
-  type: uma
-  mlff_model: uma-s-1p1
+  type: polar_mace
+  mlff_model: polar-1-m
+  mlff_backend: polar_mace
   use_energy: false
   force_weight: 1.0
   energy_weight: 0.0

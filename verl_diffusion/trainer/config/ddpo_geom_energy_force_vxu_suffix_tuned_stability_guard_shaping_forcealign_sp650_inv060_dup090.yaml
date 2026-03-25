@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp650_dup70
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp650-inv060-dup090
+
+# Attempt to recover V×U at 1024 samples by penalizing invalid chemistry and
+# within-batch SMILES collapse more aggressively (while keeping the sp650+shaping setup).
+filters:
+  invalid_penalty_scale: 0.60
+  duplicate_penalty_scale: 0.90

@@ -1,0 +1,16 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long
+  - _self_
+
+# Variant: track `checkpoint_best.pth` using validity×uniqueness (V×U) instead of
+# V×U×MolStab. Useful when stability is already enforced via reward weights/gating
+# and we want the best checkpoint to reflect the primary leaderboard objective.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu
+
+best_checkpoint_metric: validity_x_uniqueness
+best_checkpoint_mode: max
+
+train:
+  early_stop_metric: validity_x_uniqueness
+  early_stop_mode: max
+  inherit_best_metric_on_warmstart: true

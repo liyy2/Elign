@@ -3,6 +3,7 @@ import torch.distributed as dist
 import queue
 import time
 import threading
+import json
 import ray
 from tqdm import tqdm
 import wandb
@@ -83,6 +84,25 @@ class DDPOTrainer(BaseTrainer):
         shaping_cfg = reward_cfg.get("shaping", {}) if isinstance(reward_cfg, dict) else {}
         self.terminal_adv_weight = float(shaping_cfg.get("terminal_weight", 1.5))
 
+        self._base_force_adv_weight = float(self.force_adv_weight)
+        self._base_energy_adv_weight = float(self.energy_adv_weight)
+        self._base_use_energy = bool(reward_cfg.get("use_energy", False))
+        self._adv_schedule_cfg = reward_cfg.get("adv_schedule") if isinstance(reward_cfg, dict) else None
+        self._adv_schedule_enabled = isinstance(self._adv_schedule_cfg, dict) and bool(
+            self._adv_schedule_cfg.get("enabled", False)
+        )
+        if not self._adv_schedule_enabled:
+            self._adv_schedule_cfg = None
+
+        dynamic_energy_cfg = reward_cfg.get("dynamic_energy", {}) if isinstance(reward_cfg, dict) else {}
+        if not isinstance(dynamic_energy_cfg, dict):
+            dynamic_energy_cfg = {}
+        self._dynamic_energy_enabled = bool(dynamic_energy_cfg.get("enabled", False))
+        try:
+            self._dynamic_energy_threshold = float(dynamic_energy_cfg.get("enable_threshold", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self._dynamic_energy_threshold = 0.0
+
         # Initialize Ray for parallel processing (optional).
         ray_cfg = self.config.get("ray", {})
         ray_enabled = False
@@ -93,6 +113,14 @@ class DDPOTrainer(BaseTrainer):
 
         if ray_enabled and self.is_main_process and not ray.is_initialized():
             ray.init()
+
+        timing_cfg = self.config.get("timing", {}) if isinstance(self.config, dict) else {}
+        if not isinstance(timing_cfg, dict):
+            timing_cfg = {}
+        self.timing_enabled = bool(timing_cfg.get("enabled", False))
+        self.timing_jsonl_path = timing_cfg.get("jsonl_path") or timing_cfg.get("path")
+        self._timing_lock = threading.Lock()
+        self._reset_timing_state()
 
         # Initialize wandb if enabled in config
         wandb_cfg = config.get("wandb")
@@ -108,14 +136,144 @@ class DDPOTrainer(BaseTrainer):
             wandb_enabled = True
 
         if wandb_enabled and self.is_main_process:
-            wandb.init(
-                project=project,
-                name=name,
-                config=config
-            )
-            self.wandb_enabled = True
+            try:
+                api_key = os.environ.get("WANDB_API_KEY", "") or ""
+                api_key = api_key.strip()
+                if api_key and len(api_key) < 30:
+                    print(
+                        f"[WARN] WANDB_API_KEY looks unusually short (len={len(api_key)}). "
+                        "W&B will not log online. Set a full API key (typically 40 chars) or run "
+                        "`conda run -n edm wandb login` / `wandb login` inside the `edm` env.",
+                        flush=True,
+                    )
+                wandb_mode = (os.environ.get("WANDB_MODE", "") or "").strip().lower()
+                if wandb_mode in {"offline", "disabled"}:
+                    print(
+                        f"[WARN] WANDB_MODE={wandb_mode!r}. Runs will stay local under the run's `wandb/` folder "
+                        "until you set WANDB_MODE=online and run `wandb sync`.",
+                        flush=True,
+                    )
+                wandb.init(
+                    project=project,
+                    name=name,
+                    config=config,
+                )
+                self.wandb_enabled = True
+            except Exception as exc:
+                print(f"[WARN] wandb.init failed ({type(exc).__name__}: {exc}); disabling wandb logging.")
+                self.wandb_enabled = False
         else:
             self.wandb_enabled = False
+
+    @staticmethod
+    def _schedule_weight(schedule_cfg: dict, epoch: int, default_value: float) -> float:
+        if not isinstance(schedule_cfg, dict):
+            return float(default_value)
+
+        start_epoch = schedule_cfg.get("start_epoch", 0)
+        warmup_epochs = schedule_cfg.get("warmup_epochs", 0)
+        ramp_epochs = schedule_cfg.get("ramp_epochs", 0)
+        try:
+            start_epoch = int(start_epoch or 0)
+        except (TypeError, ValueError):
+            start_epoch = 0
+        try:
+            warmup_epochs = int(warmup_epochs or 0)
+        except (TypeError, ValueError):
+            warmup_epochs = 0
+        try:
+            ramp_epochs = int(ramp_epochs or 0)
+        except (TypeError, ValueError):
+            ramp_epochs = 0
+
+        try:
+            start_value = float(schedule_cfg.get("start", default_value))
+        except (TypeError, ValueError):
+            start_value = float(default_value)
+        try:
+            end_value = float(schedule_cfg.get("end", default_value))
+        except (TypeError, ValueError):
+            end_value = float(default_value)
+
+        if epoch < start_epoch:
+            return float(default_value)
+
+        rel_epoch = epoch - start_epoch
+        if rel_epoch < warmup_epochs:
+            return float(start_value)
+
+        if ramp_epochs <= 0:
+            return float(end_value)
+
+        progress = (rel_epoch - warmup_epochs) / float(ramp_epochs)
+        progress = max(0.0, min(1.0, progress))
+        return float(start_value + progress * (end_value - start_value))
+
+    def _apply_adv_schedule(self, epoch: int) -> None:
+        if not self._adv_schedule_cfg:
+            return
+
+        use_absolute_epoch = bool(self._adv_schedule_cfg.get("use_absolute_epoch", False))
+        if use_absolute_epoch:
+            effective_epoch = int(epoch)
+        else:
+            epoch0 = getattr(self, "_adv_schedule_epoch0", None)
+            if epoch0 is None:
+                epoch0 = int(epoch)
+                setattr(self, "_adv_schedule_epoch0", epoch0)
+            effective_epoch = int(epoch) - int(epoch0)
+
+        force_cfg = self._adv_schedule_cfg.get("force") or self._adv_schedule_cfg.get("force_adv") or {}
+        energy_cfg = self._adv_schedule_cfg.get("energy") or self._adv_schedule_cfg.get("energy_adv") or {}
+
+        self.force_adv_weight = self._schedule_weight(force_cfg, effective_epoch, self._base_force_adv_weight)
+        self.energy_adv_weight = self._schedule_weight(energy_cfg, effective_epoch, self._base_energy_adv_weight)
+        self._apply_dynamic_energy(epoch)
+
+    def _apply_dynamic_energy(self, epoch: int) -> None:
+        """Optionally skip UMA energy computation until energy advantages become active.
+
+        Motivation: in long warmup schedules (energy_adv_weight=0), computing energies can be wasted work and can
+        introduce noise in logs. With `reward.dynamic_energy.enabled=true`, we automatically toggle
+        `UMAForceReward.use_energy` + its MLFF force computer's `compute_energy` flag based on the current
+        scheduled `energy_adv_weight`.
+        """
+        if not getattr(self, "_dynamic_energy_enabled", False):
+            return
+        if not getattr(self, "_base_use_energy", False):
+            return
+
+        rewarder = getattr(self, "rewarder", None)
+        if rewarder is None or not hasattr(rewarder, "use_energy"):
+            return
+
+        energy_adv_weight = float(getattr(self, "energy_adv_weight", 0.0))
+        threshold = float(getattr(self, "_dynamic_energy_threshold", 0.0))
+        want_energy = energy_adv_weight > threshold
+        current = bool(getattr(rewarder, "use_energy", False))
+        if want_energy == current:
+            return
+
+        try:
+            rewarder.use_energy = want_energy
+            force_computer = getattr(rewarder, "force_computer", None)
+            if force_computer is not None and hasattr(force_computer, "compute_energy"):
+                force_computer.compute_energy = want_energy
+            if self.is_main_process:
+                print(
+                    f"[dynamic_energy] epoch={epoch} energy_adv_weight={energy_adv_weight:.4g} -> use_energy={want_energy}",
+                    flush=True,
+                )
+        except Exception as exc:
+            if self.is_main_process:
+                print(f"[dynamic_energy] failed to toggle energy computation: {exc}", flush=True)
+
+    def _reset_timing_state(self) -> None:
+        """(Re)initialize timing accumulators used for benchmark runs."""
+        self._timing_rollout_generate_sec = 0.0
+        self._timing_reward_compute_sec = 0.0
+        self._timing_reward_compute_calls = 0
+        self._timing_last_process_batch = {}
     
     def _reward_worker(self):
         """Reward calculation worker thread function"""
@@ -130,8 +288,13 @@ class DDPOTrainer(BaseTrainer):
                     break
                 
                 # Calculate rewards
-
+                t0 = time.monotonic()
                 result = self.rewarder.calculate_rewards(sample)
+                dt = time.monotonic() - t0
+                if self.timing_enabled:
+                    with self._timing_lock:
+                        self._timing_reward_compute_sec += float(dt)
+                        self._timing_reward_compute_calls += 1
             
                 
                 # Store results
@@ -205,6 +368,8 @@ class DDPOTrainer(BaseTrainer):
         self.reward_results = []  # Clear previous results
         reward_thread = threading.Thread(target=self._reward_worker, daemon=True)
         reward_thread.start()
+        if self.timing_enabled:
+            self._reset_timing_state()
         
         try:
             batch_size = prompts.batch.batch_size[0]
@@ -222,11 +387,15 @@ class DDPOTrainer(BaseTrainer):
             # Initialize a list to store all sample results as DataProto objects
             sample_results = []
             # Process each mini-batch
+            t_batch_start = time.monotonic()
             for chunk_idx, batch in enumerate(batch_prompts):
             
                 
                 # Generate sample using rollout
+                t0 = time.monotonic()
                 sample = self.rollout.generate_minibatch(batch)
+                if self.timing_enabled:
+                    self._timing_rollout_generate_sec += float(time.monotonic() - t0)
                 
                 # Add batch identifier
                 sample_results.append(sample) 
@@ -237,7 +406,9 @@ class DDPOTrainer(BaseTrainer):
                 
             
             # Wait for all samples in this batch to complete reward calculation
+            t_wait_start = time.monotonic()
             self.samples_queue.join()
+            reward_wait_sec = time.monotonic() - t_wait_start
             
             # Processing complete, send termination signal to reward worker
             self.samples_queue.put(None)
@@ -249,6 +420,18 @@ class DDPOTrainer(BaseTrainer):
             sample_results = DataProto.concat(sample_results)
             reward_results = DataProto.concat(self.reward_results)
             reward_results = reward_results.to(self.device)
+            if self.timing_enabled:
+                with self._timing_lock:
+                    reward_compute_sec = float(self._timing_reward_compute_sec)
+                    reward_calls = int(self._timing_reward_compute_calls)
+                self._timing_last_process_batch = {
+                    "process_batch_sec": float(time.monotonic() - t_batch_start),
+                    "rollout_generate_sec": float(self._timing_rollout_generate_sec),
+                    "reward_wait_sec": float(reward_wait_sec),
+                    "reward_compute_sec": reward_compute_sec,
+                    "reward_compute_calls": reward_calls,
+                    "batch_size": int(batch_size),
+                }
             return sample_results.union(reward_results)
             
         except Exception as e:
@@ -440,25 +623,95 @@ class DDPOTrainer(BaseTrainer):
         if not self.is_main_process:
             return
 
-        def atomic_torch_save(obj, path: str) -> None:
-            tmp_path = f"{path}.tmp"
-            torch.save(obj, tmp_path)
-            os.replace(tmp_path, path)
+        train_cfg = self.config.get("train") if isinstance(self.config, dict) else (self.config.get("train") or {})
+        if not isinstance(train_cfg, dict):
+            train_cfg = {}
 
-        def atomic_write_yaml(obj, path: str) -> None:
+        def _as_int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_float(value, default):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                return default
+
+        def _as_bool(value, default=False):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return default
+
+        save_retries = max(1, _as_int(train_cfg.get("checkpoint_save_retries"), 3))
+        save_retry_delay = max(0.0, _as_float(train_cfg.get("checkpoint_save_retry_delay_seconds"), 2.0))
+        fail_on_save_error = _as_bool(train_cfg.get("fail_on_checkpoint_save_error"), default=False)
+        use_new_zip = _as_bool(train_cfg.get("checkpoint_use_new_zipfile_serialization"), default=False)
+
+        def atomic_torch_save(obj, path: str, label: str) -> bool:
             tmp_path = f"{path}.tmp"
-            if isinstance(obj, dict):
-                with open(tmp_path, "w") as f:
-                    yaml.safe_dump(obj, f)
-                    f.flush()
-                    os.fsync(f.fileno())
-            else:
-                obj.to_yaml(tmp_path)
-            os.replace(tmp_path, path)
+            last_exc = None
+            for attempt in range(1, save_retries + 1):
+                try:
+                    torch.save(obj, tmp_path, _use_new_zipfile_serialization=use_new_zip)
+                    os.replace(tmp_path, path)
+                    return True
+                except Exception as exc:
+                    last_exc = exc
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    if attempt < save_retries and save_retry_delay > 0.0:
+                        time.sleep(save_retry_delay * attempt)
+
+            msg = f"Warning: failed to save {label} to {path} after {save_retries} attempts: {last_exc}"
+            print(msg, flush=True)
+            if fail_on_save_error and last_exc is not None:
+                raise last_exc
+            return False
+
+        def atomic_write_yaml(obj, path: str, label: str) -> bool:
+            tmp_path = f"{path}.tmp"
+            last_exc = None
+            for attempt in range(1, save_retries + 1):
+                try:
+                    if isinstance(obj, dict):
+                        with open(tmp_path, "w") as f:
+                            yaml.safe_dump(obj, f)
+                            f.flush()
+                            os.fsync(f.fileno())
+                    else:
+                        obj.to_yaml(tmp_path)
+                    os.replace(tmp_path, path)
+                    return True
+                except Exception as exc:
+                    last_exc = exc
+                    try:
+                        if os.path.exists(tmp_path):
+                            os.remove(tmp_path)
+                    except Exception:
+                        pass
+                    if attempt < save_retries and save_retry_delay > 0.0:
+                        time.sleep(save_retry_delay * attempt)
+
+            msg = f"Warning: failed to write {label} to {path} after {save_retries} attempts: {last_exc}"
+            print(msg, flush=True)
+            if fail_on_save_error and last_exc is not None:
+                raise last_exc
+            return False
 
         # Save config
         config_path = os.path.join(self.save_path, "config.yaml")
-        atomic_write_yaml(self.config, config_path)
+        atomic_write_yaml(self.config, config_path, "config")
         
         # Save checkpoint
         checkpoint = {
@@ -467,6 +720,9 @@ class DDPOTrainer(BaseTrainer):
             'actor_state_dict': self.actor.model.state_dict(),
             'optimizer_state_dict': self.actor.optimizer.state_dict(),
             'metrics': metrics,
+            # Bump this whenever we change the semantics/fields of `metrics` in checkpoints.
+            # Used to avoid carrying over incompatible "best metric" values across code changes.
+            'metrics_schema_version': 2,
         }
         lr_scheduler = getattr(self.actor, "lr_scheduler", None)
         if lr_scheduler is not None:
@@ -476,10 +732,35 @@ class DDPOTrainer(BaseTrainer):
                 checkpoint["scheduler_state_dict"] = None
         
         # Save latest checkpoint
-        atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_latest.pth"))
+        atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_latest.pth"), "checkpoint_latest")
         
         # Save epoch checkpoint
-        atomic_torch_save(checkpoint, os.path.join(self.save_path, f"checkpoint_epoch_{epoch}.pth"))
+        saved_epoch = atomic_torch_save(
+            checkpoint,
+            os.path.join(self.save_path, f"checkpoint_epoch_{epoch}.pth"),
+            f"checkpoint_epoch_{epoch}",
+        )
+
+        # Optional pruning: keep only the most recent N epoch checkpoints.
+        keep_last = _as_int(train_cfg.get("checkpoint_keep_last"), 0)
+        if saved_epoch and keep_last > 0:
+            try:
+                entries = []
+                for name in os.listdir(self.save_path):
+                    if not (name.startswith("checkpoint_epoch_") and name.endswith(".pth")):
+                        continue
+                    epoch_str = name[len("checkpoint_epoch_") : -len(".pth")]
+                    if not epoch_str.isdigit():
+                        continue
+                    entries.append((int(epoch_str), os.path.join(self.save_path, name)))
+                entries.sort(key=lambda item: item[0])
+                for _, ckpt_path in entries[:-keep_last]:
+                    try:
+                        os.remove(ckpt_path)
+                    except Exception as exc:
+                        print(f"Warning: failed to prune old checkpoint {ckpt_path}: {exc}", flush=True)
+            except Exception as exc:
+                print(f"Warning: failed to prune epoch checkpoints in {self.save_path}: {exc}", flush=True)
         
         # Save best checkpoint if metrics are provided
         if metrics is not None:
@@ -495,8 +776,9 @@ class DDPOTrainer(BaseTrainer):
                     atomic_torch_save(
                         self.model.state_dict(),
                         os.path.join(self.save_path, "generative_model_ema.npy"),
+                        "generative_model_ema",
                     )
-                    atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_best.pth"))
+                    atomic_torch_save(checkpoint, os.path.join(self.save_path, "checkpoint_best.pth"), "checkpoint_best")
             else:
                 print(f"Warning: Metric '{self.best_checkpoint_metric}' not found in metrics. "
                       "Skipping best-checkpoint update.")
@@ -511,13 +793,138 @@ class DDPOTrainer(BaseTrainer):
         self.actor.model.load_state_dict(checkpoint['actor_state_dict'])
         self.actor.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self._apply_train_hparams_to_optimizer()
+        # Refresh the KL reference model after loading a resume checkpoint.
+        #
+        # The actor initializes its frozen reference model during construction, which happens
+        # before `resume=true` checkpoints are loaded inside `fit()`. When resuming with a
+        # KL penalty enabled, we almost always want the reference to match the resumed policy
+        # (trust-region around the checkpoint) rather than the original pretrained weights.
+        maybe_refresh_ref = getattr(self.actor, "_maybe_init_reference_model", None)
+        if callable(maybe_refresh_ref):
+            try:
+                maybe_refresh_ref(None)
+            except Exception as exc:
+                if self.is_main_process:
+                    print(f"Warning: failed to refresh KL reference model after resume: {exc}")
         
-        if 'metrics' in checkpoint:
-            metric_value = checkpoint['metrics'].get(self.best_checkpoint_metric)
-            if metric_value is not None:
-                self.best_metric_value = metric_value
+        metrics = checkpoint.get("metrics") if isinstance(checkpoint, dict) else None
+        schema_version = checkpoint.get("metrics_schema_version") if isinstance(checkpoint, dict) else None
+
+        def _as_bool(value, default=False):
+            if value is None:
+                return default
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on"}
+            return default
+
+        def _is_new_schema(schema, metrics_dict):
+            if schema is not None:
+                try:
+                    return int(schema) >= 2
+                except (TypeError, ValueError):
+                    return False
+            if isinstance(metrics_dict, dict):
+                # Heuristic for older checkpoints saved before we added `metrics_schema_version`.
+                return ("molecule_stability_filtered" in metrics_dict) or ("atom_stability_filtered" in metrics_dict)
+            return False
+
+        train_cfg = self.config.get("train") if isinstance(self.config, dict) else {}
+        if not isinstance(train_cfg, dict):
+            train_cfg = {}
+        inherit_best_on_warmstart = _as_bool(train_cfg.get("inherit_best_metric_on_warmstart"), False)
+        use_new_zip = _as_bool(train_cfg.get("checkpoint_use_new_zipfile_serialization"), default=False)
+
+        metric_value = metrics.get(self.best_checkpoint_metric) if isinstance(metrics, dict) else None
+        loaded_is_new_schema = _is_new_schema(schema_version, metrics)
+
+        best_path = os.path.join(self.save_path, "checkpoint_best.pth")
+        has_existing_best = os.path.exists(best_path)
+
+        # "Warmstart" = resuming from a checkpoint that lives outside the current save_path.
+        warmstart = False
+        try:
+            save_root = os.path.realpath(self.save_path)
+            ckpt_real = os.path.realpath(checkpoint_path)
+            warmstart = os.path.commonpath([save_root, ckpt_real]) != save_root
+        except Exception:
+            warmstart = True
+
+        best_metric_from_disk = None
+        best_schema_from_disk = None
+        best_metrics_from_disk = None
+        if has_existing_best:
+            try:
+                best_payload = torch.load(best_path, map_location="cpu")
+                if isinstance(best_payload, dict):
+                    best_metrics_from_disk = best_payload.get("metrics")
+                    best_schema_from_disk = best_payload.get("metrics_schema_version")
+                    if isinstance(best_metrics_from_disk, dict):
+                        best_metric_from_disk = best_metrics_from_disk.get(self.best_checkpoint_metric)
+            except Exception:
+                best_metric_from_disk = None
+                best_schema_from_disk = None
+                best_metrics_from_disk = None
+
+        if best_metric_from_disk is not None and _is_new_schema(best_schema_from_disk, best_metrics_from_disk):
+            try:
+                self.best_metric_value = float(best_metric_from_disk)
+            except (TypeError, ValueError):
+                self.best_metric_value = float("-inf") if self.best_checkpoint_mode == "max" else float("inf")
+        elif warmstart and not has_existing_best and not inherit_best_on_warmstart:
+            # When starting a brand-new run from another run's checkpoint, don't inherit the
+            # previous run's best metric value (often a noisy small-batch spike). This allows
+            # `checkpoint_best.pth` to track improvements within the current run.
+            self.best_metric_value = float("-inf") if self.best_checkpoint_mode == "max" else float("inf")
+        else:
+            # Default behavior: inherit the metric value from the loaded checkpoint if compatible.
+            if not loaded_is_new_schema:
+                self.best_metric_value = float("-inf") if self.best_checkpoint_mode == "max" else float("inf")
+                metric_value = None
+            elif metric_value is not None:
+                try:
+                    self.best_metric_value = float(metric_value)
+                except (TypeError, ValueError):
+                    self.best_metric_value = float("-inf") if self.best_checkpoint_mode == "max" else float("inf")
+                    metric_value = None
             else:
-                self.best_metric_value = float('-inf') if self.best_checkpoint_mode == "max" else float('inf')
+                self.best_metric_value = float("-inf") if self.best_checkpoint_mode == "max" else float("inf")
+
+        # If we're resuming into a directory without a best checkpoint yet, seed it from the
+        # loaded checkpoint (only for compatible metrics schemas). Warmstarts default to *not*
+        # seeding so `checkpoint_best.pth` can reflect this run's best metric.
+        if (
+            self.is_main_process
+            and loaded_is_new_schema
+            and metric_value is not None
+            and (not warmstart or inherit_best_on_warmstart)
+        ):
+            os.makedirs(self.save_path, exist_ok=True)
+            if not os.path.exists(best_path):
+                def _best_effort_seed(obj, path: str, label: str) -> None:
+                    tmp_path = f"{path}.tmp"
+                    last_exc = None
+                    for attempt in range(1, 4):
+                        try:
+                            torch.save(obj, tmp_path, _use_new_zipfile_serialization=use_new_zip)
+                            os.replace(tmp_path, path)
+                            return
+                        except Exception as exc:
+                            last_exc = exc
+                            try:
+                                if os.path.exists(tmp_path):
+                                    os.remove(tmp_path)
+                            except Exception:
+                                pass
+                            time.sleep(2.0 * attempt)
+                    print(f"Warning: failed to seed {label} to {path}: {last_exc}", flush=True)
+
+                _best_effort_seed(checkpoint, best_path, "checkpoint_best")
+                ema_path = os.path.join(self.save_path, "generative_model_ema.npy")
+                _best_effort_seed(self.model.state_dict(), ema_path, "generative_model_ema")
 
         return checkpoint
 
@@ -660,17 +1067,55 @@ class DDPOTrainer(BaseTrainer):
                     break
 
                 last_epoch = epoch
+                t_epoch_start = time.monotonic() if self.timing_enabled else None
 
+                # Apply advantage schedule *before* rollouts so dynamic-energy policies can skip
+                # unnecessary UMA energy computation during force-only warmup phases.
+                self._apply_adv_schedule(epoch)
+
+                t0 = time.monotonic()
                 samples = self.process_batch(epoch, prompts)
+                process_wall_sec = time.monotonic() - t0
                 if not isinstance(samples, DataProto) or len(samples) == 0:
                     if self.is_main_process:
                         print(f"Skipping epoch {epoch} because batch processing failed or returned empty samples.")
                     continue
+                raw_samples = samples
+                raw_molecule_stability = None
+                raw_atom_stability = None
+                raw_valence_underbond = None
+                raw_valence_overbond = None
+                raw_valence_underbond_soft = None
+                raw_valence_overbond_soft = None
+                if "stability" in raw_samples.batch:
+                    raw_molecule_stability = raw_samples.batch["stability"].mean().item()
+                if "atom_stability" in raw_samples.batch:
+                    raw_atom_stability = raw_samples.batch["atom_stability"].mean().item()
+                if "valence_underbond" in raw_samples.batch:
+                    raw_valence_underbond = raw_samples.batch["valence_underbond"].mean().item()
+                if "valence_overbond" in raw_samples.batch:
+                    raw_valence_overbond = raw_samples.batch["valence_overbond"].mean().item()
+                if "valence_underbond_soft" in raw_samples.batch:
+                    raw_valence_underbond_soft = raw_samples.batch["valence_underbond_soft"].mean().item()
+                if "valence_overbond_soft" in raw_samples.batch:
+                    raw_valence_overbond_soft = raw_samples.batch["valence_overbond_soft"].mean().item()
                 rdkit_validity = None
                 rdkit_uniqueness = None
+                duplicate_hit_ratio = None
+                history_hit_ratio = None
                 if self.filters is not None:
                     filter_out = self.filters.filter(samples)
-                    if isinstance(filter_out, (list, tuple)) and len(filter_out) == 5:
+                    if isinstance(filter_out, (list, tuple)) and len(filter_out) == 7:
+                        (
+                            samples,
+                            filter_ratio,
+                            novelty_penalty_ratio,
+                            rdkit_validity,
+                            rdkit_uniqueness,
+                            duplicate_hit_ratio,
+                            history_hit_ratio,
+                        ) = filter_out
+                    elif isinstance(filter_out, (list, tuple)) and len(filter_out) == 5:
                         samples, filter_ratio, novelty_penalty_ratio, rdkit_validity, rdkit_uniqueness = filter_out
                     elif isinstance(filter_out, (list, tuple)) and len(filter_out) == 4:
                         samples, filter_ratio, novelty_penalty_ratio, rdkit_validity = filter_out
@@ -682,42 +1127,91 @@ class DDPOTrainer(BaseTrainer):
                     if self.is_main_process:
                         print(f"Skipping epoch {epoch} because filtering removed all samples.")
                     continue
+                t0 = time.monotonic()
                 samples = self.compute_advantage(samples)
+                compute_advantage_sec = time.monotonic() - t0
+
+                t0 = time.monotonic()
                 metrics = self.actor.update_policy(samples, epoch_callback=None)
+                update_policy_sec = time.monotonic() - t0
                 metrics["epoch"] = epoch + 1
                 # `reward` is the mean of the final scalar signal used for policy updates,
                 # i.e. the force and energy components after weighting plus any shaping bonus.
                 # `force_reward_mean` logs the unweighted force term, while
                 # `weighted_force_reward_mean` reflects that same term after its configured weight.
                 metrics["reward"] = samples.batch["rewards"].mean().item()
+                if self.timing_enabled and t_epoch_start is not None:
+                    epoch_wall_sec = float(time.monotonic() - t_epoch_start)
+                    nodesxsample = None
+                    try:
+                        nodesxsample = prompts.batch.get("nodesxsample") if prompts.batch is not None else None
+                    except Exception:
+                        nodesxsample = None
+                    if isinstance(nodesxsample, torch.Tensor):
+                        try:
+                            metrics["timing/nodes_mean"] = float(nodesxsample.float().mean().item())
+                            metrics["timing/nodes_min"] = int(nodesxsample.min().item())
+                            metrics["timing/nodes_max"] = int(nodesxsample.max().item())
+                        except Exception:
+                            pass
+                    metrics["timing/time_step"] = float(getattr(self, "num_timesteps", 0) or 0)
+                    metrics["timing/process_batch_wall_sec"] = float(process_wall_sec)
+                    metrics["timing/compute_advantage_sec"] = float(compute_advantage_sec)
+                    metrics["timing/update_policy_sec"] = float(update_policy_sec)
+                    metrics["timing/epoch_wall_sec"] = float(epoch_wall_sec)
+
+                    pb_timing = getattr(self, "_timing_last_process_batch", {}) or {}
+                    for key, value in pb_timing.items():
+                        metrics[f"timing/{key}"] = value
+                metrics["force_adv_weight"] = float(getattr(self, "force_adv_weight", 1.0))
+                metrics["energy_adv_weight"] = float(getattr(self, "energy_adv_weight", 1.0))
+                metrics["adv_schedule_enabled"] = 1.0 if self._adv_schedule_cfg else 0.0
+                schedule_epoch0 = getattr(self, "_adv_schedule_epoch0", None)
+                if schedule_epoch0 is not None:
+                    metrics["adv_schedule_epoch"] = float(epoch - int(schedule_epoch0))
                 metrics["filter_ratio"] = filter_ratio
                 metrics["novelty_penalty_ratio"] = novelty_penalty_ratio
-                metrics["molecule_stability"] = samples.batch['stability'].mean().item()
+                # Log stability/valence on the *unfiltered* rollout batch to keep metrics
+                # consistent with RDKit validity/uniqueness (which are computed pre-filter).
+                if raw_molecule_stability is not None:
+                    metrics["molecule_stability"] = raw_molecule_stability
+                if raw_atom_stability is not None:
+                    metrics["atom_stability"] = raw_atom_stability
+                if raw_valence_underbond is not None:
+                    metrics["valence_underbond"] = raw_valence_underbond
+                if raw_valence_overbond is not None:
+                    metrics["valence_overbond"] = raw_valence_overbond
+                if raw_valence_underbond_soft is not None:
+                    metrics["valence_underbond_soft"] = raw_valence_underbond_soft
+                if raw_valence_overbond_soft is not None:
+                    metrics["valence_overbond_soft"] = raw_valence_overbond_soft
+
+                # Also track filtered stability separately (what PPO actually trains on).
+                if "stability" in samples.batch:
+                    metrics["molecule_stability_filtered"] = samples.batch["stability"].mean().item()
                 if "atom_stability" in samples.batch:
-                    metrics["atom_stability"] = samples.batch["atom_stability"].mean().item()
-                if "valence_underbond" in samples.batch:
-                    metrics["valence_underbond"] = samples.batch["valence_underbond"].mean().item()
-                if "valence_overbond" in samples.batch:
-                    metrics["valence_overbond"] = samples.batch["valence_overbond"].mean().item()
-                if "valence_underbond_soft" in samples.batch:
-                    metrics["valence_underbond_soft"] = samples.batch["valence_underbond_soft"].mean().item()
-                if "valence_overbond_soft" in samples.batch:
-                    metrics["valence_overbond_soft"] = samples.batch["valence_overbond_soft"].mean().item()
+                    metrics["atom_stability_filtered"] = samples.batch["atom_stability"].mean().item()
                 if rdkit_validity is not None:
                     metrics["rdkit_validity"] = float(rdkit_validity)
                 if rdkit_uniqueness is not None:
                     metrics["rdkit_uniqueness"] = float(rdkit_uniqueness)
-                if "rdkit_valid_mask" in samples.batch and "stability" in samples.batch:
-                    rdkit_valid_mask = samples.batch["rdkit_valid_mask"].to(samples.batch["stability"].device)
+                if duplicate_hit_ratio is not None:
+                    metrics["duplicate_hit_ratio"] = float(duplicate_hit_ratio)
+                if history_hit_ratio is not None:
+                    metrics["history_hit_ratio"] = float(history_hit_ratio)
+                # Compute stability_given_rdkit_valid on the pre-filter batch (rdkit_valid_mask is added before filtering).
+                if "rdkit_valid_mask" in raw_samples.batch and "stability" in raw_samples.batch:
+                    rdkit_valid_mask = raw_samples.batch["rdkit_valid_mask"].to(raw_samples.batch["stability"].device)
                     valid_denom = rdkit_valid_mask.sum().item()
                     if valid_denom > 0:
-                        stable_valid = (samples.batch["stability"] * rdkit_valid_mask).sum().item() / valid_denom
+                        stable_valid = (raw_samples.batch["stability"] * rdkit_valid_mask).sum().item() / valid_denom
                         metrics["stability_given_rdkit_valid"] = stable_valid
                 if rdkit_validity is not None and rdkit_uniqueness is not None:
                     metrics["validity_x_uniqueness"] = float(rdkit_validity) * float(rdkit_uniqueness)
-                    metrics["validity_x_uniqueness_x_stability"] = (
-                        metrics["validity_x_uniqueness"] * metrics["molecule_stability"]
-                    )
+                    if raw_molecule_stability is not None:
+                        metrics["validity_x_uniqueness_x_stability"] = (
+                            metrics["validity_x_uniqueness"] * raw_molecule_stability
+                        )
 
                 # Collect force and energy reward statistics if available
                 if "force_rewards" in samples.batch:
@@ -752,6 +1246,27 @@ class DDPOTrainer(BaseTrainer):
                     metrics["advantage_std"] = samples.batch["advantages"].std().item()
 
                 metrics = self._sync_metrics(metrics)
+                if self.timing_enabled and self.timing_jsonl_path and self.is_main_process:
+                    jsonl_path = str(self.timing_jsonl_path)
+                    if not os.path.isabs(jsonl_path):
+                        jsonl_path = os.path.join(self.save_path, jsonl_path)
+
+                    def _jsonable(value):
+                        if isinstance(value, (int, float, str, bool)) or value is None:
+                            return value
+                        if isinstance(value, np.generic):
+                            return value.item()
+                        if isinstance(value, torch.Tensor) and value.numel() == 1:
+                            return value.item()
+                        return str(value)
+
+                    payload = {str(k): _jsonable(v) for k, v in (metrics or {}).items()}
+                    payload["epoch_index"] = int(epoch)
+                    try:
+                        with open(jsonl_path, "a", encoding="utf-8") as f:
+                            f.write(json.dumps(payload) + "\n")
+                    except Exception as exc:
+                        print(f"[timing] failed to append {jsonl_path}: {exc}", flush=True)
 
                 # Save checkpoints.
                 #

@@ -1,0 +1,12 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu
+  - _self_
+
+# Variant: keep the "terminal force only + long energy-adv warmup" stability recipe, but
+# strengthen cross-batch de-duplication for better 1024-sample uniqueness.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3
+
+filters:
+  history_penalty_mode: log
+  history_penalty_max_multiplier: 3
+

@@ -1,6 +1,8 @@
 import pickle
 import random
-from typing import Dict, List, Optional, Tuple
+import math
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -17,7 +19,13 @@ class Filter:
         enable_penalty=True,
         penalty_scale=0.1,
         invalid_penalty_scale: float = 0.0,
+        invalid_reward_gate_mode: str = "hard",
         duplicate_penalty_scale: float = 0.0,
+        duplicate_penalty_mode: str = "constant",
+        history_size: int = 0,
+        history_penalty_scale: float = 0.0,
+        history_penalty_mode: str = "constant",
+        history_penalty_max_multiplier: Optional[float] = None,
     ):
         self.dataset_info = dataset_info
         self.file_name = file_name
@@ -26,7 +34,39 @@ class Filter:
         self.enable_penalty = bool(enable_penalty)
         self.penalty_scale = float(penalty_scale)
         self.invalid_penalty_scale = float(invalid_penalty_scale or 0.0)
+        gate_mode = str(invalid_reward_gate_mode or "hard").strip().lower()
+        if gate_mode not in {"hard", "min"}:
+            gate_mode = "hard"
+        self.invalid_reward_gate_mode = gate_mode
         self.duplicate_penalty_scale = float(duplicate_penalty_scale or 0.0)
+        dup_mode = str(duplicate_penalty_mode or "constant").strip().lower()
+        if dup_mode in {"best", "best_only", "keep_best", "leave_one_out"}:
+            dup_mode = "best_only"
+        elif dup_mode not in {"constant", "uniform"}:
+            dup_mode = "constant"
+        if dup_mode == "uniform":
+            dup_mode = "constant"
+        self.duplicate_penalty_mode = dup_mode
+
+        try:
+            history_size_int = int(history_size or 0)
+        except (TypeError, ValueError):
+            history_size_int = 0
+        self.history_size = max(0, history_size_int)
+        self.history_penalty_scale = float(history_penalty_scale or 0.0)
+        history_penalty_mode = str(history_penalty_mode or "constant").strip().lower()
+        if history_penalty_mode not in {"constant", "log", "sqrt", "linear"}:
+            history_penalty_mode = "constant"
+        self.history_penalty_mode = history_penalty_mode
+        try:
+            max_mult = float(history_penalty_max_multiplier) if history_penalty_max_multiplier is not None else None
+        except (TypeError, ValueError):
+            max_mult = None
+        if max_mult is not None and max_mult <= 0.0:
+            max_mult = None
+        self.history_penalty_max_multiplier = max_mult
+        self._recent_smiles: Deque[str] = deque()
+        self._recent_smiles_counts: Dict[str, int] = {}
 
         dataset_smiles_list: List[str] = []
         if self.enable_penalty_requires_smiles(self.enable_penalty) and not file_name:
@@ -35,6 +75,40 @@ class Filter:
             with open(file_name, "rb") as f:
                 dataset_smiles_list = pickle.load(f)
         self.dataset_smiles = set(dataset_smiles_list)
+
+    def _remember_smiles(self, smiles: str) -> None:
+        if self.history_size <= 0:
+            return
+        self._recent_smiles.append(smiles)
+        self._recent_smiles_counts[smiles] = self._recent_smiles_counts.get(smiles, 0) + 1
+        while len(self._recent_smiles) > self.history_size:
+            popped = self._recent_smiles.popleft()
+            remaining = self._recent_smiles_counts.get(popped, 0) - 1
+            if remaining <= 0:
+                self._recent_smiles_counts.pop(popped, None)
+            else:
+                self._recent_smiles_counts[popped] = remaining
+
+    def _seen_recently(self, smiles: str) -> bool:
+        return self._recent_smiles_counts.get(smiles, 0) > 0
+
+    def _history_penalty_multiplier(self, count: int) -> float:
+        if count <= 0:
+            return 0.0
+
+        if self.history_penalty_mode == "linear":
+            mult = float(count)
+        elif self.history_penalty_mode == "sqrt":
+            mult = math.sqrt(float(count))
+        elif self.history_penalty_mode == "log":
+            # Normalize so count=1 maps to multiplier=1 (log2 scaling).
+            mult = math.log1p(float(count)) / math.log(2.0)
+        else:
+            mult = 1.0
+
+        if self.history_penalty_max_multiplier is not None:
+            mult = min(mult, float(self.history_penalty_max_multiplier))
+        return float(mult)
 
     @staticmethod
     def enable_penalty_requires_smiles(enable_penalty: bool) -> bool:
@@ -120,7 +194,7 @@ class Filter:
                 energy_rewards_ts[:, -1] = energy_rewards_ts[:, -1] + penalty
                 data.batch["energy_rewards_ts"] = energy_rewards_ts
         
-    def filter(self, data: DataProto) -> tuple[DataProto, float, float, float, float]:
+    def filter(self, data: DataProto) -> tuple[DataProto, float, float, float, float, float, float]:
         # The filter relies on RDKit for SMILES-based deduplication and penalties.
         try:
             import rdkit  # noqa: F401
@@ -168,21 +242,86 @@ class Filter:
 
         # Important: invalid RDKit molecules can sometimes achieve artificially "good" MLFF
         # scores (forces or energies) due to out-of-distribution artifacts. When we explicitly
-        # optimize RDKit validity (invalid_penalty_scale > 0), gate *all* reward channels to
-        # valid molecules so the policy cannot be reinforced by invalid chemistry.
+        # optimize RDKit validity (invalid_penalty_scale > 0), gate MLFF-driven reward channels
+        # to valid molecules so the policy cannot be reinforced by invalid chemistry.
+        #
+        # NOTE: we preserve the stability/valence shaping term (when available) for RDKit-invalid
+        # samples to keep a graded learning signal even when a prompt-group temporarily collapses
+        # to invalid chemistry.
         if self.invalid_penalty_scale > 0.0:
+            inv_mask = (1.0 - rdkit_valid_mask).to(dtype=rdkit_valid_mask.dtype)
+            stability_rewards = data.batch.get("stability_rewards")
+            has_stability_rewards = (
+                isinstance(stability_rewards, torch.Tensor)
+                and stability_rewards.ndim == 1
+                and stability_rewards.shape[0] == rdkit_valid_mask.shape[0]
+            )
+
+            stability_for_invalid = None
+            if has_stability_rewards:
+                stability_on_device = stability_rewards.to(device=base_tensor.device, dtype=base_tensor.dtype)
+                stability_for_invalid = torch.minimum(stability_on_device, torch.zeros_like(stability_on_device))
+
             if "force_rewards" in data.batch:
-                data.batch["force_rewards"] = data.batch["force_rewards"] * rdkit_valid_mask
+                force_rewards = data.batch["force_rewards"]
+                if isinstance(force_rewards, torch.Tensor) and force_rewards.ndim == 1:
+                    if stability_for_invalid is not None:
+                        stability_for_invalid = stability_for_invalid.to(
+                            device=force_rewards.device, dtype=force_rewards.dtype
+                        )
+                        if self.invalid_reward_gate_mode == "min":
+                            invalid_force = torch.minimum(force_rewards, stability_for_invalid)
+                        else:
+                            invalid_force = stability_for_invalid
+                        data.batch["force_rewards"] = force_rewards * rdkit_valid_mask + invalid_force * inv_mask
+                    else:
+                        data.batch["force_rewards"] = force_rewards * rdkit_valid_mask
             if "weighted_force_rewards" in data.batch:
-                data.batch["weighted_force_rewards"] = data.batch["weighted_force_rewards"] * rdkit_valid_mask
+                weighted_force_rewards = data.batch["weighted_force_rewards"]
+                if isinstance(weighted_force_rewards, torch.Tensor) and weighted_force_rewards.ndim == 1:
+                    if stability_for_invalid is not None and "force_rewards" in data.batch:
+                        gated_force_rewards = data.batch["force_rewards"]
+                        ratio = None
+                        try:
+                            denom_mask = (rdkit_valid_mask > 0.0) & (gated_force_rewards.abs() > 1e-12)
+                            if denom_mask.any():
+                                ratio = (weighted_force_rewards[denom_mask] / gated_force_rewards[denom_mask]).median()
+                        except Exception:
+                            ratio = None
+
+                        if isinstance(ratio, torch.Tensor) and torch.isfinite(ratio).item():
+                            ratio = ratio.to(dtype=weighted_force_rewards.dtype)
+                            invalid_weighted = ratio * gated_force_rewards
+                            data.batch["weighted_force_rewards"] = (
+                                weighted_force_rewards * rdkit_valid_mask + invalid_weighted * inv_mask
+                            )
+                        else:
+                            data.batch["weighted_force_rewards"] = weighted_force_rewards * rdkit_valid_mask
+                    else:
+                        data.batch["weighted_force_rewards"] = weighted_force_rewards * rdkit_valid_mask
             if "force_rewards_ts" in data.batch:
-                force_rewards_ts = data.batch["force_rewards_ts"]
+                original_force_rewards_ts = data.batch["force_rewards_ts"]
+                force_rewards_ts = original_force_rewards_ts
                 if (
                     isinstance(force_rewards_ts, torch.Tensor)
                     and force_rewards_ts.ndim == 2
                     and force_rewards_ts.shape[0] == rdkit_valid_mask.shape[0]
                 ):
-                    data.batch["force_rewards_ts"] = force_rewards_ts * rdkit_valid_mask.unsqueeze(1)
+                    force_rewards_ts = force_rewards_ts * rdkit_valid_mask.unsqueeze(1)
+                    if stability_for_invalid is not None:
+                        force_rewards_ts = force_rewards_ts.clone()
+                        stability_for_invalid_ts = stability_for_invalid.to(
+                            device=force_rewards_ts.device, dtype=force_rewards_ts.dtype
+                        )
+                        if self.invalid_reward_gate_mode == "min":
+                            terminal_orig = original_force_rewards_ts[:, -1].to(
+                                device=force_rewards_ts.device, dtype=force_rewards_ts.dtype
+                            )
+                            terminal_gated = torch.minimum(terminal_orig, stability_for_invalid_ts)
+                        else:
+                            terminal_gated = stability_for_invalid_ts
+                        force_rewards_ts[:, -1] = force_rewards_ts[:, -1] + terminal_gated * inv_mask
+                    data.batch["force_rewards_ts"] = force_rewards_ts
 
             if "energy_rewards" in data.batch:
                 data.batch["energy_rewards"] = data.batch["energy_rewards"] * rdkit_valid_mask
@@ -221,6 +360,7 @@ class Filter:
             and not self.enable_penalty
             and self.invalid_penalty_scale <= 0.0
             and self.duplicate_penalty_scale <= 0.0
+            and (self.history_penalty_scale <= 0.0 or self.history_size <= 0)
         ):
             return data, 1.0, 1.0, rdkit_validity, rdkit_uniqueness
 
@@ -302,15 +442,68 @@ class Filter:
                     kept_idx = kept_indices[0]
                     duplicate_penalty[kept_idx] = -self.duplicate_penalty_scale * (count - 1)
             else:
-                for indices in smiles_indices.values():
-                    count = len(indices)
-                    if count <= 1:
-                        continue
-                    per_sample_penalty = -self.duplicate_penalty_scale * (count - 1) / count
-                    idx_tensor = torch.tensor(indices, device=base_tensor.device, dtype=torch.long)
-                    duplicate_penalty.index_fill_(0, idx_tensor, per_sample_penalty)
+                if self.duplicate_penalty_mode == "best_only":
+                    reward_tensor = None
+                    if "force_rewards" in data.batch:
+                        reward_tensor = data.batch["force_rewards"]
+                    elif "rewards" in data.batch:
+                        reward_tensor = data.batch["rewards"]
+
+                    rewards_cpu = None
+                    if reward_tensor is not None and isinstance(reward_tensor, torch.Tensor):
+                        rewards_cpu = reward_tensor.detach().cpu().tolist()
+
+                    for indices in smiles_indices.values():
+                        count = len(indices)
+                        if count <= 1:
+                            continue
+                        if rewards_cpu is not None:
+                            best_idx = max(indices, key=lambda idx: rewards_cpu[idx])
+                        else:
+                            best_idx = random.choice(indices)
+                        for idx in indices:
+                            if idx == best_idx:
+                                continue
+                            duplicate_penalty[idx] = -self.duplicate_penalty_scale
+                else:
+                    for indices in smiles_indices.values():
+                        count = len(indices)
+                        if count <= 1:
+                            continue
+                        per_sample_penalty = -self.duplicate_penalty_scale * (count - 1) / count
+                        idx_tensor = torch.tensor(indices, device=base_tensor.device, dtype=torch.long)
+                        duplicate_penalty.index_fill_(0, idx_tensor, per_sample_penalty)
 
             self._add_terminal_penalty(data, duplicate_penalty)
+
+        # Optional: penalize repeats across recent rollout batches (helps improve large-sample uniqueness).
+        #
+        # Unlike `duplicate_penalty_scale` (within-batch), this uses a rolling memory of recent SMILES to
+        # discourage cross-batch mode collapse (which tends to show up only in 1024-sample evaluations).
+        if self.history_penalty_scale > 0.0 and self.history_size > 0 and self._recent_smiles_counts:
+            base_tensor = data.batch["rewards"] if "rewards" in data.batch else data.batch["x"]
+            history_penalty = torch.zeros(
+                len(all_smiles),
+                device=base_tensor.device,
+                dtype=base_tensor.dtype,
+            )
+            if self.enable_filtering:
+                keep_set = set(indices_to_keep.tolist())
+                for idx in keep_set:
+                    smiles = all_smiles[idx]
+                    if smiles is None:
+                        continue
+                    count = self._recent_smiles_counts.get(smiles, 0)
+                    if count > 0:
+                        history_penalty[idx] = -self.history_penalty_scale * self._history_penalty_multiplier(count)
+            else:
+                for idx, smiles in enumerate(all_smiles):
+                    if smiles is None:
+                        continue
+                    count = self._recent_smiles_counts.get(smiles, 0)
+                    if count > 0:
+                        history_penalty[idx] = -self.history_penalty_scale * self._history_penalty_multiplier(count)
+            self._add_terminal_penalty(data, history_penalty)
             
         # Apply penalty if enabled
         if self.enable_penalty:
@@ -324,59 +517,68 @@ class Filter:
             base_ref = data.batch["rewards"] if "rewards" in data.batch else data.batch["x"]
             base_device = base_ref.device
             invalid_idx = torch.tensor(none_indices, device=base_device, dtype=torch.long)
-            valid_mask = rdkit_valid_mask > 0.0
-
-            def _apply_min_margin(key: str) -> None:
-                if key not in data.batch:
-                    return
-                tensor = data.batch[key]
-                if not isinstance(tensor, torch.Tensor) or tensor.ndim != 1:
-                    return
-                if valid_mask.any():
-                    min_valid = tensor[valid_mask].min()
-                else:
-                    min_valid = tensor.min()
-                target = min_valid - self.invalid_penalty_scale
-                out = tensor.clone()
-                out.index_fill_(0, invalid_idx, target)
-                data.batch[key] = out
-
-            def _apply_min_margin_ts(key: str) -> None:
-                if key not in data.batch:
-                    return
-                tensor = data.batch[key]
-                if not isinstance(tensor, torch.Tensor) or tensor.ndim != 2:
-                    return
-                if valid_mask.any():
-                    min_valid = tensor[valid_mask, -1].min()
-                else:
-                    min_valid = tensor[:, -1].min()
-                target = min_valid - self.invalid_penalty_scale
-                out = tensor.clone()
-                out[invalid_idx, -1] = target
-                data.batch[key] = out
-
-            # Apply the invalid penalty in a reward-scale-aware way:
-            # push invalid samples slightly below the *worst* valid reward in each channel.
-            _apply_min_margin("rewards")
-            _apply_min_margin("force_rewards")
-            _apply_min_margin("energy_rewards")
-            _apply_min_margin("weighted_force_rewards")
-            _apply_min_margin("weighted_energy_rewards")
-            _apply_min_margin_ts("rewards_ts")
-            _apply_min_margin_ts("force_rewards_ts")
-            _apply_min_margin_ts("energy_rewards_ts")
+            invalid_penalty = torch.zeros(
+                len(all_smiles),
+                device=base_device,
+                dtype=base_ref.dtype,
+            )
+            invalid_penalty.index_fill_(0, invalid_idx, -self.invalid_penalty_scale)
+            self._add_terminal_penalty(data, invalid_penalty)
             
         # filter 
         if self.enable_filtering:
             filtered_data_proto = DataProto.select_idxs(data, indices_to_keep)
         else:
             filtered_data_proto = data
+
+        duplicate_hit_ratio = 0.0
+        history_hit_ratio = 0.0
+        if isinstance(indices_to_keep, np.ndarray) and indices_to_keep.size > 0:
+            keep_set = {int(idx) for idx in indices_to_keep.tolist()}
+            kept_valid = [idx for idx in keep_set if all_smiles[idx] is not None]
+            kept_valid_count = len(kept_valid)
+            if kept_valid_count > 0:
+                duplicate_hit_count = 0
+                for idx in kept_valid:
+                    smiles = all_smiles[idx]
+                    if smiles is None:
+                        continue
+                    if len(smiles_indices.get(smiles, [])) > 1:
+                        duplicate_hit_count += 1
+                duplicate_hit_ratio = duplicate_hit_count / kept_valid_count
+
+                if self.history_size > 0 and self._recent_smiles_counts:
+                    history_hit_count = 0
+                    for idx in kept_valid:
+                        smiles = all_smiles[idx]
+                        if smiles is None:
+                            continue
+                        if self._seen_recently(smiles):
+                            history_hit_count += 1
+                    history_hit_ratio = history_hit_count / kept_valid_count
+
+        # Update novelty memory with the (kept) unique SMILES for cross-batch de-dup penalties.
+        if self.history_penalty_scale > 0.0 and self.history_size > 0:
+            unique_kept_smiles = {
+                all_smiles[int(idx)]
+                for idx in indices_to_keep.tolist()
+                if all_smiles[int(idx)] is not None
+            }
+            for smiles in unique_kept_smiles:
+                self._remember_smiles(smiles)
         
         # Calculate filtering ratio
         total_samples = len(all_smiles)
         kept_samples = len(indices_to_keep)
         filtering_ratio = kept_samples / total_samples if total_samples > 0 else 0.0
         
-        return filtered_data_proto, filtering_ratio, novelty_penalty_ratio, rdkit_validity, rdkit_uniqueness
+        return (
+            filtered_data_proto,
+            filtering_ratio,
+            novelty_penalty_ratio,
+            rdkit_validity,
+            rdkit_uniqueness,
+            duplicate_hit_ratio,
+            history_hit_ratio,
+        )
     

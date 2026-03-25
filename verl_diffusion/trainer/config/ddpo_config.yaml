@@ -40,12 +40,34 @@ filters:
   # Optional extra penalty applied only to RDKit-invalid molecules (smiles == None).
   # Use this when you want to optimize validity without also penalizing in-dataset molecules.
   invalid_penalty_scale: 0.0
+  # When `invalid_penalty_scale > 0`, gate MLFF reward channels for RDKit-invalid samples.
+  # Options:
+  # - hard (default): replace MLFF rewards with (negative) stability/valence penalties only.
+  # - min: keep the more-negative of (MLFF reward, stability penalty) so invalid samples
+  #   never receive a better reward than stability penalties, but extreme-force invalid
+  #   geometries can still be punished more strongly.
+  invalid_reward_gate_mode: hard
   # Optional penalty applied when multiple samples in the *same rollout batch* share the
   # same canonical SMILES. This helps prevent mode collapse (uniqueness → ~0).
   # Set to 0 to disable.
   duplicate_penalty_scale: 0.0
+  # Optional: penalize duplicates across recent rollouts (history-based).
+  # Set `history_size>0` to keep a rolling SMILES buffer and apply
+  # `history_penalty_scale` when a sample repeats within that window.
+  history_size: 0
+  history_penalty_scale: 0.0
+  # Optional: scale the history penalty by how often a SMILES appears in the
+  # rolling buffer. Options:
+  # - constant (default): fixed penalty per repeated SMILES
+  # - log: log2-scaled penalty (count=1 -> multiplier 1, count=2 -> ~1.585)
+  # - sqrt: sqrt(count)-scaled penalty
+  # - linear: count-scaled penalty
+  history_penalty_mode: constant
+  # Optional cap on the history penalty multiplier (null disables capping).
+  history_penalty_max_multiplier: null
 
 model:
+  backend: auto
   config: "./pretrained/edm/edm_qm9/args.pickle"
   model_path: "./pretrained/edm/edm_qm9/generative_model_ema.npy"
   time_step: 1000
@@ -61,6 +83,14 @@ train:
   adam_epsilon: 0.00000001
   clip_range: 0.15
   kl_penalty_weight: 0.0
+  # Optional: adaptive KL control. When enabled, the actor scales `kl_penalty_weight`
+  # to keep `kl_loss` near `kl_target` (with hysteresis).
+  kl_target: null
+  kl_adaptive: false
+  kl_adaptive_hysteresis: 1.5
+  kl_adaptive_factor: 1.5
+  kl_penalty_weight_min: 0.0
+  kl_penalty_weight_max: 1.0
   # Number of generated samples consumed per optimizer step when updating the policy.
   # If the rollout batch is larger, it is chunked into blocks of this size for training.
   train_micro_batch_size: 512
@@ -87,8 +117,13 @@ train:
   early_stop_min_delta: 0.0
 
 reward:
-  type: uma
-  mlff_model: uma-s-1p1
+  type: polar_mace
+  mlff_model: polar-1-m
+  mlff_backend: polar_mace
+  mlff_charge: 0
+  mlff_spin: 1
+  mlff_external_field: [0.0, 0.0, 0.0]
+  mlff_default_dtype: float32
   # Optional per-atom force clipping (in the same units as the MLFF forces).
   # Use this if a few extreme-force atoms dominate the reward and kill exploration.
   force_clip_threshold: null

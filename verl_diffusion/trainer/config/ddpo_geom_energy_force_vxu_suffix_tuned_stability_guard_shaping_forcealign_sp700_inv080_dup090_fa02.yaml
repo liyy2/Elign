@@ -1,0 +1,8 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard_shaping_forcealign_sp700_inv080_dup090
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign-sp700-inv080-dup090-fa02
+
+train:
+  force_alignment_weight: 0.02

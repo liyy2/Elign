@@ -26,8 +26,23 @@ filters:
   enable_filtering: false
   enable_penalty: false
   penalty_scale: 0.5
+  # Optional: penalize duplicates across recent rollouts (history-based).
+  # Set `history_size>0` to keep a rolling SMILES buffer and apply
+  # `history_penalty_scale` when a sample repeats within that window.
+  history_size: 0
+  history_penalty_scale: 0.0
+  # Optional: scale the history penalty by how often a SMILES appears in the
+  # rolling buffer. Options:
+  # - constant (default): fixed penalty per repeated SMILES
+  # - log: log2-scaled penalty (count=1 -> multiplier 1, count=2 -> ~1.585)
+  # - sqrt: sqrt(count)-scaled penalty
+  # - linear: count-scaled penalty
+  history_penalty_mode: constant
+  # Optional cap on the history penalty multiplier (null disables capping).
+  history_penalty_max_multiplier: null
 
 model:
+  backend: auto
   config: "./pretrained/edm/edm_geom_drugs/args.pickle"
   model_path: "./pretrained/edm/edm_geom_drugs/generative_model_ema.npy"
   time_step: 1000
@@ -43,6 +58,14 @@ train:
   adam_epsilon: 0.00000001
   clip_range: 0.15
   kl_penalty_weight: 0.0
+  # Optional: adaptive KL control. When enabled, the actor scales `kl_penalty_weight`
+  # to keep `kl_loss` near `kl_target` (with hysteresis).
+  kl_target: null
+  kl_adaptive: false
+  kl_adaptive_hysteresis: 1.5
+  kl_adaptive_factor: 1.5
+  kl_penalty_weight_min: 0.0
+  kl_penalty_weight_max: 1.0
   train_micro_batch_size: 256
   gradient_accumulation_steps: 1
   force_alignment_enabled: true
@@ -59,8 +82,13 @@ train:
     stable_ratio: 0.9
 
 reward:
-  type: uma
-  mlff_model: uma-s-1p1
+  type: polar_mace
+  mlff_model: polar-1-m
+  mlff_backend: polar_mace
+  mlff_charge: 0
+  mlff_spin: 1
+  mlff_external_field: [0.0, 0.0, 0.0]
+  mlff_default_dtype: float32
   force_clip_threshold: null
   use_energy: false
   force_weight: 1.0

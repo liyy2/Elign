@@ -1,0 +1,41 @@
+defaults:
+  - ddpo_geom_energy_force_vxu_suffix_tuned_stability_guard
+  - _self_
+
+name: edm-geom-energy-force-vxu-suffix-tuned-stability-guard-shaping-forcealign
+
+# Resume recipe for pushing MolStab above the V×U×MolStab plateau:
+# - Enable sparse reward shaping (force + energy) for a denser learning signal without exploding MLFF cost.
+# - Add a small force-alignment regularizer on fine-stage steps to discourage PPO updates that fight MLFF forces.
+# - Increase rollout group size to reduce GRPO variance (and reduce metric noise).
+
+dataloader:
+  each_prompt_sample: 32
+  # Keep this aligned with `each_prompt_sample` so prompt-groups stay intact for shared-prefix rollouts.
+  micro_batch_size: 32
+
+train:
+  # Total batch = sample_group_size * each_prompt_sample = 4 * 32 = 128.
+  # With train_micro_batch_size=16, use 8 accumulation steps to keep ~1 optimizer step per rollout batch.
+  gradient_accumulation_steps: 8
+  force_alignment_enabled: true
+  force_alignment_weight: 0.05
+  force_alignment_min_force: 0.0001
+  force_alignment_min_delta: 0.0001
+
+reward:
+  shaping:
+    enabled: true
+    only_energy_reshape: false
+    gamma: 1.0
+    terminal_weight: 5.0
+    mlff_batch_size: 64
+    scheduler:
+      mode: adaptive
+      # Index into the returned (suffix-only) trajectory.
+      skip_prefix: 0
+      include_terminal: true
+      adaptive:
+        coarse_stride: 50
+        fine_stride: 5
+        threshold_fraction: 0.25

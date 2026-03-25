@@ -1,0 +1,9 @@
+defaults:
+  - ddpo_geom_best1174_histdup_h2048_hp020_sw8_ob080_kl012
+  - _self_
+
+name: edm-geom-best1174-histdup-h2048-hp020-sw8-ob080-kl012-forcegate-soft20
+
+reward:
+  force_only_if_stable: true
+  valence_overbond_soft_weight: 0.2

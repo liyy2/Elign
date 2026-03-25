@@ -37,7 +37,7 @@ train:
   early_stop_min_delta: 0.001
 
 reward:
-  mlff_model: uma-s-1p1
+  mlff_model: polar-1-m
   force_clip_threshold: 2.0
   use_energy: true
   energy_only_if_stable: true
@@ -51,4 +51,3 @@ reward:
 
 best_checkpoint_metric: validity_x_uniqueness
 best_checkpoint_mode: max
-

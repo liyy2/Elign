@@ -220,3 +220,18 @@ force_output_1000_step.npy
 # Third-party vendored deps (installed via pip/conda in most setups).
 fairchem/
 codex_attempts/
+
+# Local research artifacts and generated benchmark outputs.
+benchmarks/**/*.json
+benchmarks/**/*.pdf
+benchmarks/**/*.png
+benchmarks/**/*.jpg
+benchmarks/**/*.jpeg
+benchmarks/**/*.svg
+codex_attempts_geom/attempt_*/
+codex_attempts_geom/series_plan_*.yaml
+codex_attempts_geom/series_plan_*.pid
+codex_scripts/__pycache__/
+geom_drugs_30.npy
+geom_permutation.npy
+pretrained/geoldm/

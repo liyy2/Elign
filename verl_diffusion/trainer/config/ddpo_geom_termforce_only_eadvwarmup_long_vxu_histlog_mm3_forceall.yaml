@@ -1,0 +1,11 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3
+  - _self_
+
+# Variant: keep the strong "terminal force only + long energy-adv warmup + history log" recipe,
+# but allow the force term to act on QM9-unstable (yet RDKit-valid) molecules so it can directly
+# relax geometries instead of relying only on the discrete stability/valence penalties.
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-forceall
+
+reward:
+  force_only_if_stable: false

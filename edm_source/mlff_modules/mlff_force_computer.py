@@ -1,238 +1,275 @@
 """
-MLFF Force Computer Module
-Handles force computation using MLFF predictors for molecular configurations.
-ONLY computes forces - no logging or statistics.
+MLFF force computation utilities.
 """
 
 import logging
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 from ase import Atoms
-from fairchem.core.datasets.atomic_data import AtomicData
-from fairchem.core.datasets import data_list_collater
+
+try:
+    from fairchem.core.datasets.atomic_data import AtomicData
+    from fairchem.core.datasets import data_list_collater
+except Exception:
+    AtomicData = None
+    data_list_collater = None
 
 logger = logging.getLogger(__name__)
 
 
 class MLFFForceComputer:
     """Handles force computation using MLFF predictors."""
-    
-    def __init__(self, mlff_predictor, position_scale=1.0, device='cuda', compute_energy=False):
-        """
-        Initialize the MLFF force computer.
-        
-        Args:
-            mlff_predictor: The MLFF predictor model (e.g., UMA)
-            position_scale: Scale factor to convert from normalized to physical positions
-            device: Device to run computations on
-            compute_energy: Whether to compute energy in addition to forces (default: False)
-        """
+
+    def __init__(self, mlff_predictor, position_scale=1.0, device="cuda", compute_energy=False):
         self.mlff_predictor = mlff_predictor
         self.position_scale = position_scale
         self.device = device
         self.compute_energy = compute_energy
-        
-        # Default molecule cell size for molecular systems
+
         self.molecule_cell_size = 50.0
-        
-        # Default task name for MLFF predictor
-        self.task_name = "omol"  # For molecular systems
-        # Fallback magnitude (in normalized force units) assigned when MLFF evaluation fails.
-        # This should be large enough to act as a penalty via the force aggregation reward.
+        self.task_name = "omol"
         self.fallback_force_magnitude = 5.0
-        
+
+    def _predictor_backend(self) -> str:
+        return str(getattr(self.mlff_predictor, "backend", "uma")).lower()
+
+    def _extract_atomic_numbers(
+        self,
+        valid_features: torch.Tensor,
+        dataset_info: Dict,
+    ) -> torch.Tensor:
+        num_classes = len(dataset_info["atom_decoder"])
+        atom_decoder = dataset_info["atom_decoder"]
+        atomic_number_map = {"H": 1, "C": 6, "N": 7, "O": 8, "F": 9}
+
+        if valid_features.shape[1] >= num_classes:
+            valid_categorical = valid_features[:, :num_classes]
+        else:
+            valid_categorical = valid_features
+        atom_type_indices = torch.argmax(valid_categorical, dim=1)
+        atom_type_indices_cpu = atom_type_indices.cpu()
+
+        if "atomic_nb" in dataset_info:
+            atomic_numbers = torch.tensor(
+                [dataset_info["atomic_nb"][idx] for idx in atom_type_indices_cpu],
+                dtype=torch.long,
+            )
+        else:
+            atomic_numbers = torch.tensor(
+                [atomic_number_map.get(atom_decoder[idx], 1) for idx in atom_type_indices_cpu],
+                dtype=torch.long,
+            )
+        return atomic_numbers
+
+    def _build_ase_atoms(
+        self,
+        z: torch.Tensor,
+        node_mask: torch.Tensor,
+        dataset_info: Dict,
+        batch_idx: int,
+    ) -> Optional[Atoms]:
+        positions = z[:, :, :3]
+        positions_scaled = positions * self.position_scale
+        features = z[:, :, 3:]
+
+        mask = node_mask[batch_idx, :, 0].bool()
+        valid_positions = positions_scaled[batch_idx, mask]
+        valid_features = features[batch_idx, mask]
+        if valid_positions.shape[0] == 0:
+            return None
+
+        atomic_numbers = self._extract_atomic_numbers(valid_features, dataset_info)
+        atoms = Atoms(
+            numbers=atomic_numbers.detach().cpu().numpy(),
+            positions=valid_positions.detach().cpu().numpy(),
+            cell=np.eye(3) * self.molecule_cell_size,
+            pbc=False,
+        )
+
+        charge = int(getattr(self.mlff_predictor, "charge", 0))
+        spin = int(getattr(self.mlff_predictor, "spin", 1))
+        external_field = tuple(getattr(self.mlff_predictor, "external_field", (0.0, 0.0, 0.0)))
+
+        atoms.info["charge"] = charge
+        atoms.info["spin"] = spin
+        atoms.info["external_field"] = list(external_field)
+        return atoms
+
     def diffusion_to_atomic_data(
         self,
         z: torch.Tensor,
         node_mask: torch.Tensor,
         dataset_info: Dict,
         batch_size: int,
-    ) -> List[Tuple[int, AtomicData]]:
-        """
-        Convert diffusion state to AtomicData format for MLFF.
-        
-        Args:
-            z: Diffusion state tensor [batch_size, max_n_nodes, n_dims + n_features]
-            node_mask: Valid node mask [batch_size, max_n_nodes, 1]
-            dataset_info: Dataset information including atom decoder
-            batch_size: Number of molecules in batch
-            
-        Returns:
-            List of AtomicData objects
-        """
-        positions = z[:, :, :3]  # Extract positions [batch_size, max_n_nodes, 3]
-        
-        # Scale positions to physical units (Angstroms)
-        positions_scaled = positions * self.position_scale
-        
-        # Get per-node features (categorical one-hot [+ optional charge])
-        features = z[:, :, 3:]  # [batch_size, max_n_nodes, n_features]
-        # Determine number of categorical channels from dataset info
-        num_classes = len(dataset_info['atom_decoder'])
-        
-        # Convert one-hot encoded features to atomic numbers
-        atom_decoder = dataset_info['atom_decoder']
-        atomic_data_list: List[Tuple[int, AtomicData]] = []
-        
-        # Create a mapping from atomic symbols to atomic numbers
-        # QM9 contains H, C, N, O, F (F is rare with only ~2300 occurrences)
-        atomic_number_map = {
-            'H': 1, 'C': 6, 'N': 7, 'O': 8, 'F': 9
-        }
-        
-        for batch_idx in range(batch_size):
-            # Get valid atoms for this molecule
-            mask = node_mask[batch_idx, :, 0].bool()
-            valid_positions = positions_scaled[batch_idx, mask]  # [n_valid_nodes, 3]
-            valid_features = features[batch_idx, mask]  # [n_valid_nodes, n_features]
-            
-            if valid_positions.shape[0] == 0:
-                continue
-            
-            # Convert categorical features to atom types
-            # Only use the first num_classes channels for argmax (exclude charge channel if present)
-            if valid_features.shape[1] >= num_classes:
-                valid_categorical = valid_features[:, :num_classes]
-            else:
-                # Fallback: if features are shorter than expected, use all
-                valid_categorical = valid_features
-            atom_type_indices = torch.argmax(valid_categorical, dim=1)  # [n_valid_nodes]
-            
-            # Map atom types to atomic numbers
-            atom_type_indices_cpu = atom_type_indices.cpu()
-            
-            if 'atomic_nb' in dataset_info:
-                # For GEOM dataset
-                atomic_numbers = torch.tensor([dataset_info['atomic_nb'][idx] for idx in atom_type_indices_cpu])
-            else:
-                # For QM9 dataset - map through decoder
-                atomic_numbers = torch.tensor([
-                    atomic_number_map.get(atom_decoder[idx], 1) 
-                    for idx in atom_type_indices_cpu
-                ])
-            
-            # Create ASE atoms object
-            atoms = Atoms(
-                numbers=atomic_numbers.detach().cpu().numpy(),
-                positions=valid_positions.detach().cpu().numpy(),
-                cell=np.eye(3) * self.molecule_cell_size,
-                pbc=False
+    ) -> List[Tuple[int, "AtomicData"]]:
+        if AtomicData is None:
+            logger.warning(
+                "FAIRChem is unavailable, so batched UMA-style MLFF inference cannot run."
             )
-            
-            # Set charge and spin for molecular systems
-            atoms.info['charge'] = 0  # Default charge
-            atoms.info['spin'] = 1    # Default spin multiplicity
-            
-            # Convert to AtomicData
+            return []
+
+        atomic_data_list: List[Tuple[int, AtomicData]] = []
+        for batch_idx in range(batch_size):
+            atoms = self._build_ase_atoms(z, node_mask, dataset_info, batch_idx)
+            if atoms is None:
+                continue
             try:
                 atomic_data = AtomicData.from_ase(
                     atoms,
-                    r_edges=True,
+                    # NOTE: `r_edges=True` requires `pymatgen` for neighbor construction and will
+                    # raise at runtime if the dependency is missing. UMA's predictor can operate
+                    # without precomputed edges, so we keep `r_edges=False` to avoid falling back
+                    # to the constant-force penalty for every sample.
+                    r_edges=False,
                     radius=6.0,
                     max_neigh=50,
                     task_name=self.task_name,
-                    r_data_keys=["charge", "spin"]
+                    r_data_keys=["charge", "spin"],
                 )
-                edge_index = getattr(atomic_data, "edge_index", None)
-                if edge_index is None or edge_index.numel() == 0:
-                    continue
                 atomic_data_list.append((batch_idx, atomic_data))
             except Exception:
                 continue
-        
+
         return atomic_data_list
-    
-    def compute_mlff_forces(self, z: torch.Tensor, node_mask: torch.Tensor, 
-                           dataset_info: Dict):
-        """
-        Compute forces (and optionally energies) using MLFF predictor.
-        
-        Args:
-            z: Current molecular configuration [batch_size, max_n_nodes, n_dims + n_features]
-            node_mask: Valid node mask [batch_size, max_n_nodes, 1]
-            dataset_info: Dataset information including atom decoder
-            
-        Returns:
-            If compute_energy=False: Forces tensor [batch_size, max_n_nodes, 3]
-            If compute_energy=True: Tuple of (forces tensor [batch_size, max_n_nodes, 3], energies tensor [batch_size])
-        """
+
+    def _compute_with_batched_predictor(
+        self,
+        z: torch.Tensor,
+        node_mask: torch.Tensor,
+        dataset_info: Dict,
+    ):
         batch_size, max_n_nodes, _ = z.shape
-        
-        # Initialize fallback forces; valid systems will overwrite these entries.
         forces = torch.zeros((batch_size, max_n_nodes, 3), device=self.device)
         forces[:, :, 0] = self.fallback_force_magnitude
         if self.compute_energy:
             energies = torch.zeros(batch_size, device=self.device)
-        
-        # Convert to atomic data format (keep mapping to original batch indices)
+
         atomic_data_pairs = self.diffusion_to_atomic_data(z, node_mask, dataset_info, batch_size)
-        
         if not atomic_data_pairs:
             return (forces, energies) if self.compute_energy else forces
 
         batch_indices, atomic_data_list = zip(*atomic_data_pairs)
         batch_indices = list(batch_indices)
         atomic_data_list = list(atomic_data_list)
-        
-        # Batch the atomic data using FAIRChem's collater
+
+        if data_list_collater is None:
+            logger.warning(
+                "FAIRChem collater is unavailable, returning fallback MLFF forces."
+            )
+            return (forces, energies) if self.compute_energy else forces
+
         try:
             batch = data_list_collater(atomic_data_list, otf_graph=True)
             batch = batch.to(self.device)
         except Exception as exc:
             logger.warning(
-                "MLFFForceComputer: failed to collate atomic data for MLFF inference (%s). Returning fallback forces.",
+                "MLFFForceComputer: failed to collate atomic data for MLFF inference (%s). "
+                "Returning fallback forces.",
                 exc,
             )
             return (forces, energies) if self.compute_energy else forces
-        
-        # Compute forces (and energy) using MLFF
+
         try:
             with torch.no_grad():
                 predictions = self.mlff_predictor.predict(batch)
-            
-            # Extract forces
-            if 'forces' in predictions:
-                mlff_forces = predictions['forces']  # [total_atoms, 3]
-                
-                # Map forces back to original batch structure
+
+            if "forces" in predictions:
+                mlff_forces = predictions["forces"]
                 atom_idx = 0
                 for slot_idx, atomic_data in enumerate(atomic_data_list):
                     n_atoms = atomic_data.natoms.item()
-                    batch_forces = mlff_forces[atom_idx:atom_idx + n_atoms]  # [n_atoms, 3]
-                    
-                    # Get valid node indices for this batch
+                    batch_forces = mlff_forces[atom_idx : atom_idx + n_atoms]
                     original_idx = int(batch_indices[slot_idx])
                     mask = node_mask[original_idx, :, 0].bool()
                     valid_indices = torch.where(mask)[0]
-                    
+
                     if len(valid_indices) == n_atoms:
-                        # Ensure batch_forces is on the same device as forces
                         batch_forces = batch_forces.to(forces.device)
                         forces[original_idx, valid_indices] = batch_forces
-                        
                     atom_idx += n_atoms
-                
-                # Scale forces back to normalized space
-                # If x_phys = x_norm * position_scale, then F_norm = dE/dx_norm = (dE/dx_phys) * position_scale
+
                 forces = forces * self.position_scale
-            
-            # Extract energy only if requested
-            if self.compute_energy and 'energy' in predictions:
-                mlff_energy = predictions['energy']  # [num_systems] or [num_systems, 1]
+
+            if self.compute_energy and "energy" in predictions:
+                mlff_energy = predictions["energy"]
                 if mlff_energy.dim() > 1:
                     mlff_energy = mlff_energy.squeeze(-1)
-                # Map energies back to batch (accounting for skipped systems)
                 for slot_idx in range(len(atomic_data_list)):
                     original_idx = int(batch_indices[slot_idx])
                     energies[original_idx] = mlff_energy[slot_idx].item()
-            
+
             return (forces, energies) if self.compute_energy else forces
-            
+
         except Exception as exc:
             logger.warning(
                 "MLFFForceComputer: MLFF predictor execution failed (%s). Returning fallback forces.",
                 exc,
             )
             return (forces, energies) if self.compute_energy else forces
+
+    def _compute_with_ase_calculator(
+        self,
+        z: torch.Tensor,
+        node_mask: torch.Tensor,
+        dataset_info: Dict,
+    ):
+        batch_size, max_n_nodes, _ = z.shape
+        forces = torch.zeros((batch_size, max_n_nodes, 3), device=self.device)
+        forces[:, :, 0] = self.fallback_force_magnitude
+        if self.compute_energy:
+            energies = torch.zeros(batch_size, device=self.device)
+
+        calculator = getattr(self.mlff_predictor, "calculator", None)
+        if calculator is None:
+            calculator = getattr(self.mlff_predictor, "predictor", self.mlff_predictor)
+
+        for batch_idx in range(batch_size):
+            atoms = self._build_ase_atoms(z, node_mask, dataset_info, batch_idx)
+            if atoms is None:
+                continue
+
+            try:
+                atoms.calc = calculator
+                if self.compute_energy:
+                    energies[batch_idx] = float(atoms.get_potential_energy())
+                batch_forces = atoms.get_forces()
+                batch_forces = torch.as_tensor(
+                    batch_forces,
+                    device=forces.device,
+                    dtype=forces.dtype,
+                )
+
+                mask = node_mask[batch_idx, :, 0].bool()
+                valid_indices = torch.where(mask)[0]
+                if len(valid_indices) == batch_forces.shape[0]:
+                    forces[batch_idx, valid_indices] = batch_forces
+            except Exception as exc:
+                logger.warning(
+                    "MLFFForceComputer: Polar MACE evaluation failed for sample %s (%s). "
+                    "Using fallback forces.",
+                    batch_idx,
+                    exc,
+                )
+
+        forces = forces * self.position_scale
+        return (forces, energies) if self.compute_energy else forces
+
+    def compute_mlff_forces(self, z: torch.Tensor, node_mask: torch.Tensor, dataset_info: Dict):
+        """
+        Compute forces (and optionally energies) using the configured MLFF backend.
+
+        Args:
+            z: Current molecular configuration [batch_size, max_n_nodes, n_dims + n_features]
+            node_mask: Valid node mask [batch_size, max_n_nodes, 1]
+            dataset_info: Dataset information including atom decoder
+
+        Returns:
+            If compute_energy=False: forces tensor [batch_size, max_n_nodes, 3]
+            If compute_energy=True: tuple of (forces tensor, energies tensor)
+        """
+        backend = self._predictor_backend()
+        if backend == "polar_mace":
+            return self._compute_with_ase_calculator(z, node_mask, dataset_info)
+        return self._compute_with_batched_predictor(z, node_mask, dataset_info)

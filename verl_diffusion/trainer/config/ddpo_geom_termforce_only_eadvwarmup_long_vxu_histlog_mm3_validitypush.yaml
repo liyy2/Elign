@@ -1,0 +1,15 @@
+defaults:
+  - ddpo_geom_termforce_only_eadvwarmup_long_vxu_histlog_mm3
+  - _self_
+
+# Variant: same as the "termforce longwarmup (vxu + hmlog-mm3)" recipe but with a stronger
+# validity push (see notes in the corresponding forceall variant).
+name: edm-geom-termforce-only-eadvwarmup-long-vxu-histlog-mm3-validitypush
+
+filters:
+  invalid_penalty_scale: 0.8
+
+reward:
+  force_aggregation: max
+  valence_overbond_weight: 0.7
+  valence_overbond_soft_weight: 0.2

@@ -42,6 +42,7 @@ def create_mlff_guided_model(
     noise_threshold=0.8,
     force_clip_threshold=None,
     displacement_clip=None,
+    compute_energy: bool = False,
     position_scale=None,
     use_wandb=False,
     device='cuda'
@@ -70,6 +71,7 @@ def create_mlff_guided_model(
         noise_threshold=noise_threshold,
         force_clip_threshold=force_clip_threshold,
         displacement_clip=displacement_clip,
+        compute_energy=compute_energy,
         position_scale=position_scale,
         use_wandb=use_wandb,
         device=device
@@ -96,6 +98,7 @@ def enhanced_sampling_with_mlff(
     noise_threshold=0.8,
     force_clip_threshold=None,
     displacement_clip=None,
+    compute_energy: bool = False,
     fix_noise=False,
     position_scale=None,
     use_wandb=False
@@ -129,6 +132,7 @@ def enhanced_sampling_with_mlff(
             noise_threshold=noise_threshold,
             force_clip_threshold=force_clip_threshold,
             displacement_clip=displacement_clip,
+            compute_energy=compute_energy,
             position_scale=position_scale,
             use_wandb=use_wandb,
             device=device
