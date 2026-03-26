@@ -88,6 +88,7 @@ class MLFFEnergyConfig:
     external_field: Sequence[float] = (0.0, 0.0, 0.0)
     default_dtype: str = "float32"
     position_scale: float = 1.0
+    microbatch_size: Optional[int] = 2
 
 
 class MLFFEnergyOracle:
@@ -150,18 +151,30 @@ class MLFFEnergyOracle:
             raise ValueError(
                 f"Expected {len(self.atomic_numbers)} atoms, got {positions.shape[1]}"
             )
-        one_hot = self._build_feature_tensor(positions)
-        z = torch.cat([positions, one_hot], dim=-1)
-        node_mask = torch.ones(
-            positions.shape[0],
-            positions.shape[1],
-            1,
-            device=positions.device,
-            dtype=positions.dtype,
-        )
+        batch_size = int(positions.shape[0])
+        microbatch_size = self.config.microbatch_size
+        if microbatch_size is None or int(microbatch_size) <= 0:
+            microbatch_size = batch_size
+        microbatch_size = min(int(microbatch_size), batch_size)
+
+        energy_chunks = []
         with torch.no_grad():
-            _, energies = self._force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
-        return energies.to(device=positions.device, dtype=positions.dtype)
+            for start in range(0, batch_size, microbatch_size):
+                end = min(batch_size, start + microbatch_size)
+                position_chunk = positions[start:end]
+                one_hot = self._build_feature_tensor(position_chunk)
+                z = torch.cat([position_chunk, one_hot], dim=-1)
+                node_mask = torch.ones(
+                    position_chunk.shape[0],
+                    position_chunk.shape[1],
+                    1,
+                    device=position_chunk.device,
+                    dtype=position_chunk.dtype,
+                )
+                _, energies = self._force_computer.compute_mlff_forces(z, node_mask, self.dataset_info)
+                energy_chunks.append(energies.to(device=positions.device, dtype=positions.dtype))
+
+        return torch.cat(energy_chunks, dim=0)
 
 
 def atomic_numbers_from_metadata(metadata: dict) -> list[int]:

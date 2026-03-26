@@ -19,6 +19,17 @@ _ELEMENT_TO_Z = {
     "CL": 17,
 }
 
+_COVALENT_RADII = {
+    1: 0.31,
+    6: 0.76,
+    7: 0.71,
+    8: 0.66,
+    9: 0.57,
+    15: 1.07,
+    16: 1.05,
+    17: 1.02,
+}
+
 
 @dataclass(frozen=True)
 class AtomRecord:
@@ -41,6 +52,7 @@ class TopologyInfo:
     chain_ids: List[str]
     elements: List[str]
     atomic_numbers: List[int]
+    bond_pairs: List[Tuple[int, int]]
     phi_indices: Tuple[int, int, int, int]
     psi_indices: Tuple[int, int, int, int]
 
@@ -60,6 +72,7 @@ class TopologyInfo:
             chain_ids=list(payload["chain_ids"]),  # type: ignore[arg-type]
             elements=list(payload["elements"]),  # type: ignore[arg-type]
             atomic_numbers=[int(v) for v in payload["atomic_numbers"]],  # type: ignore[arg-type]
+            bond_pairs=[tuple(int(x) for x in pair) for pair in payload.get("bond_pairs", [])],  # type: ignore[arg-type]
             phi_indices=tuple(int(v) for v in payload["phi_indices"]),  # type: ignore[arg-type]
             psi_indices=tuple(int(v) for v in payload["psi_indices"]),  # type: ignore[arg-type]
         )
@@ -99,16 +112,87 @@ def _parse_residue_id(res_seq: str, insertion_code: str) -> int:
     return residue_id * 100 + ord(insertion_code[0])
 
 
+def _parse_conect_pairs(
+    lines: Sequence[str],
+    serial_to_index: Dict[int, int],
+) -> List[Tuple[int, int]]:
+    bond_pairs = set()
+    for line in lines:
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        try:
+            source_serial = int(fields[1])
+        except ValueError:
+            continue
+        source_idx = serial_to_index.get(source_serial)
+        if source_idx is None:
+            continue
+        for raw_neighbor in fields[2:]:
+            try:
+                neighbor_serial = int(raw_neighbor)
+            except ValueError:
+                continue
+            target_idx = serial_to_index.get(neighbor_serial)
+            if target_idx is None or target_idx == source_idx:
+                continue
+            bond_pairs.add(tuple(sorted((int(source_idx), int(target_idx)))))
+    return sorted(bond_pairs)
+
+
+def _infer_distance_bonds(
+    atomic_numbers: Sequence[int],
+    coordinates: np.ndarray,
+    *,
+    scale: float = 1.25,
+    min_distance: float = 0.4,
+) -> List[Tuple[int, int]]:
+    coords = np.asarray(coordinates, dtype=np.float64)
+    n_atoms = int(coords.shape[0])
+    bond_pairs = set()
+    for i in range(n_atoms):
+        zi = int(atomic_numbers[i])
+        ri = _COVALENT_RADII.get(zi)
+        if ri is None:
+            continue
+        for j in range(i + 1, n_atoms):
+            zj = int(atomic_numbers[j])
+            rj = _COVALENT_RADII.get(zj)
+            if rj is None:
+                continue
+            distance = float(np.linalg.norm(coords[i] - coords[j]))
+            if distance < min_distance:
+                continue
+            if distance <= scale * (ri + rj):
+                bond_pairs.add((i, j))
+    return sorted(bond_pairs)
+
+
+def _resolve_bond_pairs(
+    atoms: Sequence[AtomRecord],
+    coordinates: np.ndarray,
+    conect_pairs: Sequence[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    inferred = set(_infer_distance_bonds([atom.atomic_number for atom in atoms], coordinates))
+    inferred.update(tuple(sorted((int(i), int(j)))) for i, j in conect_pairs)
+    return sorted(inferred)
+
+
 def parse_pdb(pdb_path: str | Path) -> Tuple[TopologyInfo, np.ndarray]:
     """Parse atom metadata and coordinates from a PDB file."""
 
     atoms: List[AtomRecord] = []
     coordinates: List[List[float]] = []
+    serial_to_index: Dict[int, int] = {}
+    conect_lines: List[str] = []
 
     path = Path(pdb_path)
     with path.open("r", encoding="utf-8") as handle:
         for line in handle:
             record = line[:6].strip().upper()
+            if record == "CONECT":
+                conect_lines.append(line)
+                continue
             if record not in {"ATOM", "HETATM"}:
                 continue
             atom_name = line[12:16].strip()
@@ -133,11 +217,18 @@ def parse_pdb(pdb_path: str | Path) -> Tuple[TopologyInfo, np.ndarray]:
                 atomic_number=atomic_number,
             )
             atoms.append(atom)
+            serial_to_index[atom.serial] = atom.index
             coordinates.append(coord)
 
     if not atoms:
         raise ValueError(f"No ATOM/HETATM records found in '{path}'.")
 
+    coords = np.asarray(coordinates, dtype=np.float32)
+    bond_pairs = _resolve_bond_pairs(
+        atoms,
+        coords,
+        conect_pairs=_parse_conect_pairs(conect_lines, serial_to_index),
+    )
     phi_indices, psi_indices = infer_phi_psi_indices(atoms)
     topology = TopologyInfo(
         atoms=atoms,
@@ -147,10 +238,11 @@ def parse_pdb(pdb_path: str | Path) -> Tuple[TopologyInfo, np.ndarray]:
         chain_ids=[atom.chain_id for atom in atoms],
         elements=[atom.element for atom in atoms],
         atomic_numbers=[atom.atomic_number for atom in atoms],
+        bond_pairs=bond_pairs,
         phi_indices=phi_indices,
         psi_indices=psi_indices,
     )
-    return topology, np.asarray(coordinates, dtype=np.float32)
+    return topology, coords
 
 
 def _group_residues(atoms: Sequence[AtomRecord]) -> List[Tuple[Tuple[str, int, str], Dict[str, int]]]:

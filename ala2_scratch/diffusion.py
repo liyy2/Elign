@@ -118,6 +118,15 @@ class DiffusionSample:
     x0_preds: Optional[torch.Tensor] = None
 
 
+@dataclass
+class DiffusionRollout:
+    """Detached reverse-diffusion trajectory for replay-style RL updates."""
+
+    positions: torch.Tensor
+    z_chain: torch.Tensor
+    timesteps: torch.Tensor
+
+
 class CoordinateDiffusion:
     """Coordinate-only diffusion wrapper aligned with the original EDM formulas."""
 
@@ -334,11 +343,13 @@ class CoordinateDiffusion:
         node_mask: torch.Tensor,
         fix_noise: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device, dtype=z0.dtype)
-        gamma_0 = self.gamma(zeros)
-        sigma_x = self.snr(-0.5 * gamma_0).unsqueeze(1)
-        eps_0 = model(z0, zeros.view(z0.shape[0]), node_features, node_mask=node_mask)
-        mu_x = self.compute_x_pred(eps_0, z0, self._inflate_batch_array(gamma_0, z0), node_mask)
+        mu_x, log_var = self.p_x_given_z0_params(
+            model,
+            z0,
+            node_features,
+            node_mask=node_mask,
+        )
+        sigma_x = torch.exp(0.5 * log_var).view(z0.size(0), 1, 1)
         noise_batch = 1 if fix_noise else z0.shape[0]
         noise_mask = node_mask[:1] if fix_noise else node_mask
         noise = self.sample_position_noise(noise_batch, z0.device, noise_mask)
@@ -346,8 +357,223 @@ class CoordinateDiffusion:
             noise = noise.expand(z0.shape[0], -1, -1)
         x = mu_x + sigma_x * noise
         x = self.unnormalize_positions(x, node_mask)
-        log_var = torch.log((sigma_x.squeeze(1) ** 2).clamp(min=1e-20))
         return x, mu_x, log_var
+
+    def p_x_given_z0_params(
+        self,
+        model: Ala2EGNNDenoiser,
+        z0: torch.Tensor,
+        node_features: torch.Tensor,
+        *,
+        node_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros(size=(z0.size(0), 1), device=z0.device, dtype=z0.dtype)
+        gamma_0 = self.gamma(zeros)
+        sigma_x = self.snr(-0.5 * gamma_0).unsqueeze(1)
+        eps_0 = model(z0, zeros.view(z0.shape[0]), node_features, node_mask=node_mask)
+        mu_x = self.compute_x_pred(eps_0, z0, self._inflate_batch_array(gamma_0, z0), node_mask)
+        log_var = torch.log((sigma_x.squeeze(1) ** 2).clamp(min=1e-20))
+        return mu_x, log_var
+
+    def sample_rollout(
+        self,
+        model: Optional[Ala2EGNNDenoiser] = None,
+        *,
+        batch_size: int,
+        node_features: Optional[torch.Tensor] = None,
+        static_features: Optional[torch.Tensor] = None,
+        device: Optional[torch.device | str] = None,
+        num_nodes: Optional[int] = None,
+        n_nodes: Optional[int] = None,
+        node_mask: Optional[torch.Tensor] = None,
+        initial_noise: Optional[torch.Tensor] = None,
+        move_to_cpu: bool = False,
+    ) -> DiffusionRollout:
+        model = model or self.model
+        if model is None:
+            raise ValueError("CoordinateDiffusion.sample_rollout requires a model.")
+        if node_features is None:
+            node_features = static_features
+        if node_features is None:
+            raise ValueError("CoordinateDiffusion.sample_rollout requires node_features/static_features.")
+        if num_nodes is not None and int(num_nodes) != self.n_nodes:
+            raise ValueError(f"Expected num_nodes={self.n_nodes}, got {num_nodes}")
+        if n_nodes is not None and int(n_nodes) != self.n_nodes:
+            raise ValueError(f"Expected n_nodes={self.n_nodes}, got {n_nodes}")
+
+        if device is None:
+            if torch.is_tensor(node_features):
+                device = node_features.device
+            elif self.device is not None:
+                device = self.device
+            else:
+                device = "cpu"
+        device = torch.device(device)
+        if node_mask is None:
+            reference = torch.zeros(batch_size, self.n_nodes, 3, device=device)
+            node_mask = self._full_node_mask(batch_size, x=reference)
+        else:
+            if node_mask.dim() == 2:
+                node_mask = node_mask.unsqueeze(-1)
+            node_mask = node_mask.to(device=device, dtype=torch.float32)
+
+        with torch.no_grad():
+            if initial_noise is None:
+                z_t = self.sample_position_noise(batch_size, device, node_mask)
+            else:
+                z_t = initial_noise.to(device=device, dtype=torch.float32)
+                if z_t.shape != (batch_size, self.n_nodes, 3):
+                    raise ValueError(
+                        f"Expected initial_noise shape {(batch_size, self.n_nodes, 3)}, got {tuple(z_t.shape)}"
+                    )
+                z_t = _remove_mean_with_mask(z_t, node_mask)
+
+            z_history = [z_t.detach()]
+            for s_int in reversed(range(0, self.timesteps)):
+                s = torch.full((batch_size, 1), fill_value=s_int, device=device, dtype=torch.float32) / self.timesteps
+                t = s + (1.0 / self.timesteps)
+                mu, sigma, _x0_pred, _eps_t = self.p_mean_variance(
+                    model,
+                    z_t,
+                    s,
+                    t,
+                    node_features,
+                    node_mask=node_mask,
+                )
+                noise = self.sample_position_noise(batch_size, device, node_mask)
+                z_prev = mu + sigma * noise
+                z_prev = _remove_mean_with_mask(z_prev, node_mask)
+                z_history.append(z_prev.detach())
+                z_t = z_prev
+
+            positions, _mu_x, _log_var_x = self.sample_p_x_given_z0(
+                model,
+                z_t,
+                node_features,
+                node_mask=node_mask,
+            )
+
+        z_chain = torch.stack(z_history, dim=1)
+        timestep_tensor = torch.arange(
+            self.timesteps,
+            -1,
+            -1,
+            device=device,
+            dtype=torch.long,
+        ).view(1, self.timesteps + 1).expand(batch_size, -1)
+        if move_to_cpu:
+            z_chain = z_chain.cpu()
+            positions = positions.detach().cpu()
+            timestep_tensor = timestep_tensor.cpu()
+        else:
+            positions = positions.detach()
+        return DiffusionRollout(
+            positions=positions,
+            z_chain=z_chain,
+            timesteps=timestep_tensor,
+        )
+
+    def replay_log_probs(
+        self,
+        model: Optional[Ala2EGNNDenoiser] = None,
+        *,
+        rollout: Optional[DiffusionRollout] = None,
+        positions: Optional[torch.Tensor] = None,
+        z_chain: Optional[torch.Tensor] = None,
+        node_features: Optional[torch.Tensor] = None,
+        static_features: Optional[torch.Tensor] = None,
+        node_mask: Optional[torch.Tensor] = None,
+        device: Optional[torch.device | str] = None,
+        skip_prefix: int = 0,
+        tail_steps: Optional[int] = None,
+    ) -> dict[str, torch.Tensor]:
+        model = model or self.model
+        if model is None:
+            raise ValueError("CoordinateDiffusion.replay_log_probs requires a model.")
+        if rollout is not None:
+            positions = rollout.positions
+            z_chain = rollout.z_chain
+        if node_features is None:
+            node_features = static_features
+        if positions is None or z_chain is None or node_features is None:
+            raise ValueError("Replay requires rollout/positions, z_chain, and node_features.")
+
+        if device is None:
+            if torch.is_tensor(node_features):
+                device = node_features.device
+            elif self.device is not None:
+                device = self.device
+            else:
+                device = "cpu"
+        device = torch.device(device)
+        positions = positions.to(device=device, dtype=torch.float32)
+        z_chain = z_chain.to(device=device, dtype=torch.float32)
+        batch_size = int(z_chain.shape[0])
+        if z_chain.shape[1] != self.timesteps + 1:
+            raise ValueError(
+                f"Expected z_chain length {self.timesteps + 1}, got {tuple(z_chain.shape)}"
+            )
+        if node_mask is None:
+            node_mask = self._full_node_mask(batch_size, x=positions)
+        elif node_mask.dim() == 2:
+            node_mask = node_mask.unsqueeze(-1)
+        node_mask = node_mask.to(device=device, dtype=positions.dtype)
+
+        log_prob_steps = []
+        for idx in range(self.timesteps):
+            t_int = self.timesteps - idx
+            s_int = t_int - 1
+            s = torch.full((batch_size, 1), fill_value=s_int, device=device, dtype=torch.float32) / self.timesteps
+            t = torch.full((batch_size, 1), fill_value=t_int, device=device, dtype=torch.float32) / self.timesteps
+            z_t = z_chain[:, idx]
+            z_prev = z_chain[:, idx + 1]
+            mu, sigma, _x0_pred, _eps_t = self.p_mean_variance(
+                model,
+                z_t,
+                s,
+                t,
+                node_features,
+                node_mask=node_mask,
+            )
+            log_var = torch.log((sigma.squeeze(1) ** 2).clamp(min=1e-20))
+            log_prob_steps.append(
+                _centered_gaussian_log_prob(
+                    z_prev.detach(),
+                    mu,
+                    log_var,
+                    node_mask,
+                )
+            )
+
+        z0 = z_chain[:, -1]
+        mu_x, log_var_x = self.p_x_given_z0_params(
+            model,
+            z0,
+            node_features,
+            node_mask=node_mask,
+        )
+        x_normalized = self.normalize_positions(positions, node_mask)
+        log_prob_steps.append(
+            _centered_gaussian_log_prob(
+                x_normalized.detach(),
+                mu_x,
+                log_var_x,
+                node_mask,
+            )
+        )
+
+        trajectory_log_probs = torch.stack(log_prob_steps, dim=1)
+        if skip_prefix > 0:
+            trajectory_log_probs = trajectory_log_probs[:, min(skip_prefix, trajectory_log_probs.shape[1]) :]
+        if tail_steps is not None:
+            tail_steps = max(1, int(tail_steps))
+            trajectory_log_probs = trajectory_log_probs[:, -tail_steps:]
+        return {
+            "trajectory_log_probs": trajectory_log_probs,
+            "log_prob_mean": trajectory_log_probs.mean(dim=1),
+            "log_prob_sum": trajectory_log_probs.sum(dim=1),
+        }
+
 
     def sample(
         self,
@@ -527,6 +753,7 @@ class CoordinateDiffusion:
             "log_probs": sample.log_prob_sum
             if sample.log_prob_sum is not None
             else torch.zeros(batch_size, device=sample.x0.device, dtype=sample.x0.dtype),
+            "trajectory_log_probs": sample.log_probs,
             "chain": sample.chain,
             "timesteps": sample.timesteps,
         }

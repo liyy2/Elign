@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Mapping, Optional, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -93,6 +93,10 @@ class Ala2EGNNDenoiser(nn.Module):
         atom_index_embed_dim: Optional[int] = None,
         time_embedding_dim: Optional[int] = None,
         time_embed_dim: Optional[int] = None,
+        bond_pairs: Optional[Sequence[Sequence[int]]] = None,
+        graph_type: str = "complete",
+        graph_knn_k: int = 0,
+        graph_knn_exclude_bonds: bool = True,
         **_: Any,
     ) -> None:
         super().__init__()
@@ -130,11 +134,31 @@ class Ala2EGNNDenoiser(nn.Module):
         self.n_nodes = int(n_nodes)
         self.node_feature_dim = int(node_feature_dim)
         self.index_embed_dim = resolved_index_embed_dim
+        self.graph_type = str(graph_type).lower()
+        self.graph_knn_k = max(int(graph_knn_k), 0)
+        self.graph_knn_exclude_bonds = bool(graph_knn_exclude_bonds)
         self._nan_warning_count = 0
         self.device = device or "cpu"
+        if self.graph_type not in {"complete", "bonded", "knn", "hybrid"}:
+            raise ValueError(f"Unsupported graph_type '{graph_type}'.")
         self.atom_index_embedding = (
             nn.Embedding(self.n_nodes, self.index_embed_dim) if self.index_embed_dim > 0 else None
         )
+        bond_adjacency = torch.zeros(self.n_nodes, self.n_nodes, dtype=torch.bool)
+        if bond_pairs is not None:
+            for pair in bond_pairs:
+                if len(pair) != 2:
+                    raise ValueError(f"Bond pairs must have length 2, got {pair!r}.")
+                i, j = int(pair[0]), int(pair[1])
+                if i == j:
+                    continue
+                if not (0 <= i < self.n_nodes and 0 <= j < self.n_nodes):
+                    raise ValueError(
+                        f"Bond pair {(i, j)} is out of range for n_nodes={self.n_nodes}."
+                    )
+                bond_adjacency[i, j] = True
+                bond_adjacency[j, i] = True
+        self.register_buffer("bond_adjacency", bond_adjacency, persistent=False)
         effective_node_feature_dim = self.node_feature_dim + self.index_embed_dim
         self.egnn = EGNN(
             in_node_nf=effective_node_feature_dim + 1,
@@ -182,6 +206,40 @@ class Ala2EGNNDenoiser(nn.Module):
         self._edge_cache[key] = (row_tensor, col_tensor)
         return row_tensor, col_tensor
 
+    def _build_graph_adjacency(
+        self,
+        x_t: torch.Tensor,
+        node_mask_3d: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, n_nodes, _ = x_t.shape
+        valid_nodes = node_mask_3d.squeeze(-1) > 0.5
+        adjacency = torch.zeros(batch_size, n_nodes, n_nodes, dtype=torch.bool, device=x_t.device)
+
+        if self.graph_type in {"bonded", "hybrid"} and torch.any(self.bond_adjacency):
+            adjacency |= self.bond_adjacency.unsqueeze(0)
+
+        if self.graph_type in {"knn", "hybrid"} and self.graph_knn_k > 0:
+            coords = _remove_mean_with_mask(x_t, node_mask_3d)
+            distances = torch.cdist(coords, coords)
+            pair_mask = valid_nodes.unsqueeze(1) & valid_nodes.unsqueeze(2)
+            distances = distances.masked_fill(~pair_mask, float("inf"))
+            diag = torch.eye(n_nodes, dtype=torch.bool, device=x_t.device).unsqueeze(0)
+            distances = distances.masked_fill(diag, float("inf"))
+            if self.graph_knn_exclude_bonds and torch.any(self.bond_adjacency):
+                distances = distances.masked_fill(self.bond_adjacency.unsqueeze(0), float("inf"))
+            max_neighbors = int((torch.isfinite(distances)).sum(dim=-1).max().item()) if distances.numel() > 0 else 0
+            k = min(self.graph_knn_k, max_neighbors)
+            if k > 0:
+                knn_dist, knn_idx = torch.topk(distances, k=k, dim=-1, largest=False)
+                valid_knn = torch.isfinite(knn_dist)
+                batch_idx = torch.arange(batch_size, device=x_t.device).view(batch_size, 1, 1).expand_as(knn_idx)
+                row_idx = torch.arange(n_nodes, device=x_t.device).view(1, n_nodes, 1).expand_as(knn_idx)
+                adjacency[batch_idx[valid_knn], row_idx[valid_knn], knn_idx[valid_knn]] = True
+
+        adjacency &= pair_mask
+        adjacency &= ~torch.eye(n_nodes, dtype=torch.bool, device=x_t.device).unsqueeze(0)
+        return adjacency
+
     def forward(
         self,
         x_t: torch.Tensor,
@@ -224,17 +282,23 @@ class Ala2EGNNDenoiser(nn.Module):
         timesteps = _normalize_timesteps(t=t, batch_size=batch_size, device=x_t.device).view(batch_size, 1)
         x_in = _remove_mean_with_mask(x_t, node_mask_3d)
         node_mask_flat = node_mask_3d.reshape(batch_size * n_nodes, 1)
-        edge_mask = (node_mask_3d.squeeze(-1).unsqueeze(1) * node_mask_3d.squeeze(-1).unsqueeze(2))
-        diag_mask = ~torch.eye(n_nodes, dtype=torch.bool, device=x_t.device).unsqueeze(0)
-        edge_mask = (edge_mask * diag_mask).reshape(batch_size * n_nodes * n_nodes, 1).to(dtype=x_t.dtype)
-        edges = self._get_edges(batch_size=batch_size, device=x_t.device)
-        keep = edge_mask.view(-1) > 0.5
-        if torch.any(keep):
-            edges = (edges[0][keep], edges[1][keep])
-            edge_mask = edge_mask[keep]
+        if self.graph_type == "complete":
+            edge_mask = (node_mask_3d.squeeze(-1).unsqueeze(1) * node_mask_3d.squeeze(-1).unsqueeze(2))
+            diag_mask = ~torch.eye(n_nodes, dtype=torch.bool, device=x_t.device).unsqueeze(0)
+            edge_mask = (edge_mask * diag_mask).reshape(batch_size * n_nodes * n_nodes, 1).to(dtype=x_t.dtype)
+            edges = self._get_edges(batch_size=batch_size, device=x_t.device)
+            keep = edge_mask.view(-1) > 0.5
+            if torch.any(keep):
+                edges = (edges[0][keep], edges[1][keep])
+                edge_mask = edge_mask[keep]
+            else:
+                edges = (edges[0][:0], edges[1][:0])
+                edge_mask = edge_mask[:0]
         else:
-            edges = (edges[0][:0], edges[1][:0])
-            edge_mask = edge_mask[:0]
+            adjacency = self._build_graph_adjacency(x_in, node_mask_3d)
+            batch_idx, row_idx, col_idx = torch.where(adjacency)
+            edges = (batch_idx * n_nodes + row_idx, batch_idx * n_nodes + col_idx)
+            edge_mask = torch.ones((edges[0].shape[0], 1), device=x_t.device, dtype=x_t.dtype)
 
         xh = torch.cat([x_in, node_features], dim=-1).reshape(batch_size * n_nodes, -1) * node_mask_flat
         x = xh[:, :3].clone()
@@ -312,6 +376,10 @@ def build_model(
         atom_index_embed_dim=model_cfg.get("atom_index_embed_dim"),
         time_embedding_dim=model_cfg.get("time_embedding_dim"),
         time_embed_dim=model_cfg.get("time_embed_dim"),
+        bond_pairs=None if metadata is None else metadata.get("bond_pairs"),
+        graph_type=str(model_cfg.get("graph_type", "complete")),
+        graph_knn_k=int(model_cfg.get("graph_knn_k", 0)),
+        graph_knn_exclude_bonds=bool(model_cfg.get("graph_knn_exclude_bonds", True)),
     )
 
 

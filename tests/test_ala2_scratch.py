@@ -89,6 +89,7 @@ class TestAla2ScratchEval(unittest.TestCase):
             self.assertEqual(payload["num_atoms"], 22)
 
     def test_prepare_data_reports_successful_loading_and_processing(self):
+        from ala2_scratch.topology import topology_from_json
         from ala2_scratch.prepare_data import prepare_ala2_dataset
 
         pdb_text = """\
@@ -148,6 +149,8 @@ END
             self.assertEqual(tuple(summary["phi_indices"]), (0, 1, 2, 3))
             self.assertEqual(tuple(summary["psi_indices"]), (1, 2, 3, 4))
             self.assertAlmostEqual(float(summary["position_scale"]), 1.0, places=6)
+            topology = topology_from_json(topology_path)
+            self.assertEqual(topology.bond_pairs, [(0, 1), (1, 2), (2, 3), (3, 4)])
 
     def test_prepare_data_auto_scales_nm_trajectory_to_angstroms(self):
         from ala2_scratch.data import load_processed_dataset

@@ -713,6 +713,7 @@ def evaluate_checkpoint(
     processed = load_processed_dataset(dataset_path, topology_path)
     metadata = {
         "atomic_numbers": processed.topology.atomic_numbers,
+        "bond_pairs": processed.topology.bond_pairs,
         "phi_indices": processed.topology.phi_indices,
         "psi_indices": processed.topology.psi_indices,
     }

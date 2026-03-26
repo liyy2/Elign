@@ -10,6 +10,7 @@ import json
 import math
 import os
 import random
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -17,6 +18,7 @@ from typing import Any, Dict, Iterable, Optional, Tuple
 import torch
 import wandb
 
+from ala2_scratch.data import load_processed_dataset
 from ala2_scratch.mlff_energy import (
     MLFFEnergyConfig,
     MLFFEnergyOracle,
@@ -45,6 +47,16 @@ def _save_json(path: str | Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def _state_dict_to_cpu(module: torch.nn.Module) -> dict[str, Any]:
+    cpu_state = {}
+    for key, value in module.state_dict().items():
+        if torch.is_tensor(value):
+            cpu_state[key] = value.detach().cpu()
+        else:
+            cpu_state[key] = value
+    return cpu_state
 
 
 def _parse_value(raw: str) -> Any:
@@ -282,7 +294,11 @@ def _parse_sample_output(sample_output: Any) -> Tuple[torch.Tensor, torch.Tensor
             if value is not None:
                 log_probs = value
                 break
-        extra = {k: v for k, v in sample_output.items() if k not in {"samples", "positions", "x0", "log_probs", "log_prob_sum", "trajectory_log_probs"}}
+        extra = {
+            k: v
+            for k, v in sample_output.items()
+            if k not in {"samples", "positions", "x0", "log_probs", "log_prob_sum"}
+        }
         if positions is None or log_probs is None:
             raise ValueError("Sample dictionary must contain positions and log_probs.")
         return positions, log_probs, extra
@@ -330,6 +346,72 @@ def _sample_with_policy(
         except Exception as exc:
             last_error = exc
     raise RuntimeError(f"All sampling entrypoints failed: {last_error}") from last_error
+
+
+def _sample_rollout_no_grad(
+    diffusion,
+    *,
+    batch_size: int,
+    node_features: torch.Tensor,
+    num_nodes: int,
+) -> Any:
+    sample_fn = getattr(diffusion, "sample_rollout", None)
+    if sample_fn is None:
+        raise AttributeError("Diffusion object does not expose `sample_rollout`.")
+    with torch.no_grad():
+        return sample_fn(
+            batch_size=batch_size,
+            node_features=node_features,
+            num_nodes=num_nodes,
+            move_to_cpu=True,
+        )
+
+
+def _replay_policy_log_probs(
+    diffusion,
+    *,
+    rollout: Any,
+    node_features: torch.Tensor,
+    skip_prefix: int = 0,
+    tail_steps: Optional[int] = None,
+) -> torch.Tensor:
+    replay_fn = getattr(diffusion, "replay_log_probs", None)
+    if replay_fn is None:
+        raise AttributeError("Diffusion object does not expose `replay_log_probs`.")
+    replay_output = replay_fn(
+        rollout=rollout,
+        node_features=node_features,
+        skip_prefix=skip_prefix,
+        tail_steps=tail_steps,
+    )
+    if isinstance(replay_output, dict):
+        for key in ("log_prob_mean", "log_probs", "log_prob_sum"):
+            value = replay_output.get(key)
+            if isinstance(value, torch.Tensor):
+                return value
+        raise ValueError("Replay output dict must contain a tensor log-prob entry.")
+    if isinstance(replay_output, torch.Tensor):
+        return replay_output
+    raise TypeError(f"Unsupported replay output type: {type(replay_output)!r}")
+
+
+def _slice_rollout(rollout: Any, start: int, end: int) -> Any:
+    rollout_cls = type(rollout)
+    return rollout_cls(
+        positions=rollout.positions[start:end],
+        z_chain=rollout.z_chain[start:end],
+        timesteps=rollout.timesteps[start:end],
+    )
+
+
+def _index_rollout(rollout: Any, indices: torch.Tensor) -> Any:
+    rollout_cls = type(rollout)
+    index_tensor = indices.detach().to(device=rollout.positions.device, dtype=torch.long)
+    return rollout_cls(
+        positions=rollout.positions.index_select(0, index_tensor),
+        z_chain=rollout.z_chain.index_select(0, index_tensor),
+        timesteps=rollout.timesteps.index_select(0, index_tensor),
+    )
 
 
 def _load_metadata(cfg: dict) -> dict:
@@ -387,12 +469,24 @@ def _save_checkpoint(
     payload = {
         "step": int(step),
         "config": cfg,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _state_dict_to_cpu(model),
         "metrics": metrics,
     }
     if isinstance(diffusion, torch.nn.Module):
-        payload["diffusion_state_dict"] = diffusion.state_dict()
-    torch.save(payload, path)
+        payload["diffusion_state_dict"] = _state_dict_to_cpu(diffusion)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    os.close(fd)
+    tmp_path = Path(tmp_name)
+    try:
+        torch.save(payload, tmp_path, _use_new_zipfile_serialization=False)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 def _maybe_log_checkpoint(run, path: Path, alias: str) -> None:
@@ -508,6 +602,8 @@ def main() -> None:
     train_cfg = cfg.get("train", {})
     total_steps = int(train_cfg.get("steps", 1000))
     batch_size = int(train_cfg.get("batch_size", 16))
+    sampling_microbatch_size = int(train_cfg.get("sampling_microbatch_size", batch_size))
+    replay_microbatch_size = int(train_cfg.get("rollout_microbatch_size", batch_size))
     lr = float(train_cfg.get("lr", 1e-5))
     weight_decay = float(train_cfg.get("weight_decay", 0.0))
     grad_clip = float(train_cfg.get("grad_clip", 1.0))
@@ -519,10 +615,34 @@ def main() -> None:
     reward_scale = float(train_cfg.get("reward_scale", 1.0))
     temperature_kelvin = float(train_cfg.get("temperature_kelvin", 300.0))
     energy_offset = train_cfg.get("energy_offset")
+    logprob_skip_prefix = int(train_cfg.get("logprob_skip_prefix", 0))
+    logprob_tail_steps = train_cfg.get("logprob_tail_steps")
+    reward_baseline_mode = str(train_cfg.get("reward_baseline_mode", "batch_mean")).strip().lower()
+    reward_baseline_momentum = float(train_cfg.get("reward_baseline_momentum", 0.95))
+    anchor_weight = float(train_cfg.get("anchor_weight", 0.0))
+    anchor_batch_size = int(train_cfg.get("anchor_batch_size", batch_size))
+    replay_subset_size = train_cfg.get("replay_subset_size")
+    replay_subset_mode = str(train_cfg.get("replay_subset_mode", "abs_advantage")).strip().lower()
     beta = float(train_cfg.get("beta", beta_from_temperature(temperature_kelvin)))
 
     trainable = _get_trainable_module(model, diffusion)
     optimizer = torch.optim.Adam(trainable.parameters(), lr=lr, weight_decay=weight_decay)
+
+    anchor_positions: Optional[torch.Tensor] = None
+    if anchor_weight > 0.0:
+        dataset_path = cfg.get("data", {}).get("dataset_path")
+        topology_path = (
+            cfg.get("data", {}).get("topology_path")
+            or cfg.get("data", {}).get("metadata_path")
+        )
+        split_path = cfg.get("data", {}).get("split_path")
+        if not dataset_path or not topology_path:
+            raise ValueError("Anchor loss requires data.dataset_path and data.topology_path/metadata_path.")
+        processed = load_processed_dataset(dataset_path, topology_path, split_path=split_path)
+        anchor_positions = torch.as_tensor(
+            processed.positions[processed.split_indices["train"]],
+            dtype=torch.float32,
+        )
 
     run = _init_wandb(cfg)
     if run is not None:
@@ -533,40 +653,196 @@ def main() -> None:
     best_metric_mode = train_cfg.get("best_metric_mode", "max")
     best_metric_value = -math.inf if best_metric_mode == "max" else math.inf
     best_checkpoint_path = save_dir / "checkpoint_best.pt"
+    running_energy_baseline: Optional[torch.Tensor] = None
 
     train_start = time.time()
     for step in range(1, total_steps + 1):
         trainable.train()
         optimizer.zero_grad(set_to_none=True)
 
-        positions, log_probs, sample_info = _sample_with_policy(
-            diffusion,
-            batch_size=batch_size,
-            node_features=node_features,
-            num_nodes=len(atomic_numbers),
-        )
-        if not isinstance(positions, torch.Tensor):
-            raise TypeError("Sampled positions must be a torch.Tensor.")
-        if not isinstance(log_probs, torch.Tensor):
-            raise TypeError("Sampled log_probs must be a torch.Tensor.")
-        positions = positions.to(device=device, dtype=torch.float32)
-        log_probs = log_probs.to(device=device, dtype=torch.float32).view(-1)
+        sampling_batch_size = min(max(1, sampling_microbatch_size), batch_size)
+        sampling_batch_count = max(1, math.ceil(batch_size / sampling_batch_size))
+        reward_chunks = []
+        energy_chunks = []
+        advantage_chunks = []
+        logprob_chunks = []
+        sample_metric_totals: Dict[str, float] = {}
+        policy_loss_value = 0.0
 
-        energies = oracle(positions).view(-1)
-        energy_baseline = torch.as_tensor(float(energy_offset), device=device) if energy_offset is not None else energies.mean().detach()
-        rewards = -reward_scale * beta * (energies - energy_baseline)
+        rollout_chunks = []
+        for microbatch_idx in range(sampling_batch_count):
+            current_batch_size = min(sampling_batch_size, batch_size - microbatch_idx * sampling_batch_size)
+            if current_batch_size <= 0:
+                continue
+            rollout = _sample_rollout_no_grad(
+                diffusion,
+                batch_size=current_batch_size,
+                node_features=node_features,
+                num_nodes=len(atomic_numbers),
+            )
+            positions = rollout.positions.to(device=device, dtype=torch.float32)
+            energies = oracle(positions).view(-1).detach().cpu()
+            rollout_chunks.append(
+                {
+                    "batch_size": current_batch_size,
+                    "rollout": rollout,
+                    "energies": energies,
+                }
+            )
+            energy_chunks.append(energies)
+
+        if not rollout_chunks:
+            raise RuntimeError("No rollout chunks were produced for policy optimization.")
+
+        all_energies = torch.cat(energy_chunks, dim=0).to(device=device, dtype=torch.float32)
+        if reward_baseline_mode == "batch_mean":
+            energy_baseline = (
+                torch.as_tensor(float(energy_offset), device=device, dtype=all_energies.dtype)
+                if energy_offset is not None
+                else all_energies.mean().detach()
+            )
+        elif reward_baseline_mode == "fixed":
+            if energy_offset is None:
+                raise ValueError("train.energy_offset is required when reward_baseline_mode='fixed'.")
+            energy_baseline = torch.as_tensor(float(energy_offset), device=device, dtype=all_energies.dtype)
+        elif reward_baseline_mode == "ema":
+            if running_energy_baseline is None:
+                energy_baseline = all_energies.mean().detach()
+            else:
+                energy_baseline = running_energy_baseline.to(device=device, dtype=all_energies.dtype)
+        else:
+            raise ValueError(
+                f"Unsupported reward_baseline_mode={reward_baseline_mode!r}. "
+                "Expected one of {'batch_mean', 'ema', 'fixed'}."
+            )
+
+        rewards = -reward_scale * beta * (all_energies - energy_baseline)
         if normalize_advantages:
             advantages = (rewards - rewards.mean()) / rewards.std(unbiased=False).clamp(min=1e-6)
         else:
             advantages = rewards
 
-        policy_loss = -(advantages.detach() * log_probs).mean()
+        selected_global_indices: Optional[torch.Tensor] = None
+        total_replay_count = int(advantages.numel())
+        if replay_subset_size is not None:
+            replay_subset_size_int = max(1, min(int(replay_subset_size), int(advantages.numel())))
+            if replay_subset_size_int < int(advantages.numel()):
+                if replay_subset_mode == "abs_advantage":
+                    selected_global_indices = torch.topk(
+                        advantages.abs(),
+                        k=replay_subset_size_int,
+                        largest=True,
+                    ).indices.sort().values
+                elif replay_subset_mode == "reward":
+                    selected_global_indices = torch.topk(
+                        rewards,
+                        k=replay_subset_size_int,
+                        largest=True,
+                    ).indices.sort().values
+                elif replay_subset_mode == "random":
+                    selected_global_indices = torch.randperm(
+                        int(advantages.numel()),
+                        device=advantages.device,
+                    )[:replay_subset_size_int].sort().values
+                else:
+                    raise ValueError(
+                        f"Unsupported replay_subset_mode={replay_subset_mode!r}. "
+                        "Expected one of {'abs_advantage', 'reward', 'random'}."
+                    )
+                total_replay_count = replay_subset_size_int
+
+        if reward_baseline_mode == "ema":
+            step_energy_mean = all_energies.mean().detach().cpu()
+            if running_energy_baseline is None:
+                running_energy_baseline = step_energy_mean
+            else:
+                running_energy_baseline = (
+                    reward_baseline_momentum * running_energy_baseline
+                    + (1.0 - reward_baseline_momentum) * step_energy_mean
+                )
+
+        offset = 0
+        for chunk in rollout_chunks:
+            current_batch_size = int(chunk["batch_size"])
+            next_offset = offset + current_batch_size
+            chunk_advantages = advantages[offset:next_offset]
+            chunk_selected_indices: Optional[torch.Tensor] = None
+            if selected_global_indices is not None:
+                keep_mask = (selected_global_indices >= offset) & (selected_global_indices < next_offset)
+                if bool(keep_mask.any()):
+                    chunk_selected_indices = (selected_global_indices[keep_mask] - offset).to(dtype=torch.long)
+                else:
+                    offset = next_offset
+                    continue
+            replay_batch_size = min(max(1, replay_microbatch_size), current_batch_size)
+            replay_target_count = int(chunk_selected_indices.numel()) if chunk_selected_indices is not None else current_batch_size
+            replay_batch_count = max(1, math.ceil(replay_target_count / replay_batch_size))
+            local_offset = 0
+            chunk_logprob_parts = []
+            for replay_idx in range(replay_batch_count):
+                local_end = min(replay_target_count, local_offset + replay_batch_size)
+                if chunk_selected_indices is None:
+                    sub_rollout = _slice_rollout(chunk["rollout"], local_offset, local_end)
+                    sub_advantages = chunk_advantages[local_offset:local_end]
+                else:
+                    sub_indices = chunk_selected_indices[local_offset:local_end]
+                    sub_rollout = _index_rollout(chunk["rollout"], sub_indices.cpu())
+                    sub_advantages = chunk_advantages.index_select(0, sub_indices)
+                sub_log_probs = _replay_policy_log_probs(
+                    diffusion,
+                    rollout=sub_rollout,
+                    node_features=node_features,
+                    skip_prefix=logprob_skip_prefix,
+                    tail_steps=logprob_tail_steps,
+                ).to(device=device, dtype=torch.float32).view(-1)
+                micro_policy_loss = -(
+                    sub_advantages.detach() * sub_log_probs
+                ).sum() / max(1, total_replay_count if selected_global_indices is not None else batch_size)
+                micro_policy_loss.backward()
+                policy_loss_value += float(micro_policy_loss.item())
+                chunk_logprob_parts.append(sub_log_probs.detach())
+                local_offset = local_end
+
+            if chunk_selected_indices is None:
+                reward_chunks.append(rewards[offset:next_offset].detach())
+                advantage_chunks.append(chunk_advantages.detach())
+            else:
+                reward_chunks.append(rewards[offset:next_offset].index_select(0, chunk_selected_indices).detach())
+                advantage_chunks.append(chunk_advantages.index_select(0, chunk_selected_indices).detach())
+            logprob_chunks.append(torch.cat(chunk_logprob_parts, dim=0))
+            offset = next_offset
+
+        energies = all_energies
+
+        policy_loss = torch.tensor(policy_loss_value, device=device)
         ref_loss = reference_l2_weight * _parameter_l2(model, reference_model)
-        total_loss = policy_loss + ref_loss
-        total_loss.backward()
+        anchor_loss = torch.tensor(0.0, device=device)
+        anchor_eps_mse = torch.tensor(float("nan"), device=device)
+        if anchor_positions is not None and anchor_weight > 0.0:
+            anchor_indices = torch.randint(
+                low=0,
+                high=int(anchor_positions.shape[0]),
+                size=(max(1, anchor_batch_size),),
+            )
+            anchor_coords = anchor_positions[anchor_indices].to(device=device, dtype=torch.float32)
+            anchor_terms = diffusion.training_loss(
+                model=model,
+                coordinates=anchor_coords,
+                node_features=node_features,
+            )
+            anchor_loss = anchor_weight * anchor_terms["loss"]
+            anchor_eps_mse = anchor_terms["eps_mse"].detach()
+        ref_loss.backward()
+        if anchor_loss.requires_grad:
+            anchor_loss.backward()
+        total_loss = policy_loss + ref_loss + anchor_loss
         if grad_clip > 0.0:
             torch.nn.utils.clip_grad_norm_(trainable.parameters(), grad_clip)
         optimizer.step()
+
+        replayed_rewards = torch.cat(reward_chunks, dim=0) if reward_chunks else rewards.detach()
+        replayed_advantages = torch.cat(advantage_chunks, dim=0) if advantage_chunks else advantages.detach()
+        log_probs = torch.cat(logprob_chunks, dim=0) if logprob_chunks else torch.empty(0, device=device)
 
         metrics = {
             "step": step,
@@ -574,31 +850,30 @@ def main() -> None:
             "reward_std": float(rewards.std(unbiased=False).item()),
             "energy_mean": float(energies.mean().item()),
             "energy_std": float(energies.std(unbiased=False).item()),
-            "adv_mean": float(advantages.mean().item()),
-            "adv_std": float(advantages.std(unbiased=False).item()),
-            "logprob_mean": float(log_probs.mean().item()),
+            "energy_baseline": float(energy_baseline.item()) if energy_baseline is not None else float("nan"),
+            "adv_mean": float(replayed_advantages.mean().item()),
+            "adv_std": float(replayed_advantages.std(unbiased=False).item()),
+            "logprob_mean": float(log_probs.mean().item()) if log_probs.numel() > 0 else float("nan"),
             "policy_loss": float(policy_loss.item()),
             "ref_loss": float(ref_loss.item()),
+            "anchor_loss": float(anchor_loss.item()),
+            "anchor_eps_mse": float(anchor_eps_mse.item()) if torch.isfinite(anchor_eps_mse) else float("nan"),
             "total_loss": float(total_loss.item()),
+            "replay_count": int(log_probs.numel()),
             "elapsed_sec": float(time.time() - train_start),
         }
-        if isinstance(sample_info, dict):
-            for key, value in sample_info.items():
-                if isinstance(value, (int, float)):
-                    metrics[f"sample/{key}"] = float(value)
+        for key, total_value in sample_metric_totals.items():
+            metrics[f"sample/{key}"] = float(total_value / batch_size)
 
         if run is not None and (step % log_every == 0 or step == 1):
             wandb.log({f"train/{k}": v for k, v in metrics.items() if k != "step"}, step=step)
-
-        latest_path = save_dir / "checkpoint_latest.pt"
-        if step % save_every == 0 or step == total_steps:
-            _save_checkpoint(
-                latest_path,
-                step=step,
-                cfg=cfg,
-                model=model,
-                diffusion=diffusion,
-                metrics=metrics,
+        if step % log_every == 0 or step == 1:
+            print(
+                "[posttrain] "
+                f"step={step} reward_mean={metrics['reward_mean']:.4f} "
+                f"energy_mean={metrics['energy_mean']:.4f} "
+                f"policy_loss={metrics['policy_loss']:.4f} "
+                f"ref_loss={metrics['ref_loss']:.4e}"
             )
 
         eval_metrics = {}
@@ -610,6 +885,17 @@ def main() -> None:
                 step=step,
                 run=run,
                 save_dir=save_dir,
+            )
+
+        latest_path = save_dir / "checkpoint_latest.pt"
+        if step % save_every == 0 or step == total_steps:
+            _save_checkpoint(
+                latest_path,
+                step=step,
+                cfg=cfg,
+                model=model,
+                diffusion=diffusion,
+                metrics={**metrics, **{f"eval/{k}": v for k, v in eval_metrics.items()}},
             )
 
         tracked_value = eval_metrics.get(best_metric_name)

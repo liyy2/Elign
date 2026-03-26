@@ -421,6 +421,7 @@ def create_dataloaders(
         "atom_names": processed.topology.atom_names,
         "residue_names": processed.topology.residue_names,
         "residue_ids": processed.topology.residue_ids,
+        "bond_pairs": processed.topology.bond_pairs,
         "phi_indices": processed.topology.phi_indices,
         "psi_indices": processed.topology.psi_indices,
         "reference_positions": processed.reference_positions,

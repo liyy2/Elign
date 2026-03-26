@@ -8,6 +8,7 @@
     "hidden_nf": 128,
     "n_layers": 6,
     "in_node_nf": 4,
+    "atom_index_embed_dim": 16,
     "norm_constant": 1.0,
     "normalization_factor": 1.0,
     "device": "cuda"
@@ -37,7 +38,8 @@
       0.0
     ],
     "default_dtype": "float32",
-    "position_scale": 1.0
+    "position_scale": 1.0,
+    "microbatch_size": 2
   },
   "train": {
     "steps": 2000,
