@@ -2,12 +2,50 @@
 MLFF utility functions.
 """
 
+import os
+from contextlib import contextmanager
 import logging
 from typing import Optional, Sequence, Tuple, Union
 
 import torch
 
 logger = logging.getLogger(__name__)
+
+
+@contextmanager
+def _trusted_torch_load_context():
+    """Temporarily enable trusted checkpoint deserialization for UMA/FairChem assets.
+
+    FairChem's UMA stack still contains a few internal ``torch.load`` call sites that
+    rely on the pre-PyTorch-2.6 default ``weights_only=False`` behavior. During model
+    initialization those loads happen transitively inside Hydra-instantiated modules,
+    so we cannot pass ``weights_only=False`` directly from this repository. Instead we
+    scope the compatibility override to the trusted UMA load path only.
+    """
+
+    env_key = "TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"
+    previous = os.environ.get(env_key)
+    os.environ[env_key] = "1"
+
+    safe_globals = getattr(torch.serialization, "safe_globals", None)
+    if safe_globals is None:
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop(env_key, None)
+            else:
+                os.environ[env_key] = previous
+        return
+
+    try:
+        with safe_globals([slice]):
+            yield
+    finally:
+        if previous is None:
+            os.environ.pop(env_key, None)
+        else:
+            os.environ[env_key] = previous
 
 
 class LoadedMLFFPredictor:
@@ -183,7 +221,8 @@ def get_mlff_predictor(
         if model_name == "uma-s-1":
             model_name = "uma-s-1p1"
 
-        predictor = pretrained_mlip.get_predict_unit(model_name, device=load_device)
+        with _trusted_torch_load_context():
+            predictor = pretrained_mlip.get_predict_unit(model_name, device=load_device)
         logger.info("Successfully loaded MLFF predictor: %s", model_name)
 
         if predictor is not None and hasattr(predictor, "lazy_model_initialized"):

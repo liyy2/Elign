@@ -77,6 +77,8 @@ SDE_MIN_SIGMA="${SDE_MIN_SIGMA:-1e-6}"
 FORCE_ALIGNMENT_ENABLED="${FORCE_ALIGNMENT_ENABLED:-false}"
 
 USE_ENERGY="${USE_ENERGY:-true}"
+REWARD_TYPE="${REWARD_TYPE:-polar_mace}"  # polar_mace | uma | dummy
+MLFF_BACKEND="${MLFF_BACKEND:-$REWARD_TYPE}"  # polar_mace | uma
 MLFF_MODEL="${MLFF_MODEL:-polar-1-m}"
 MLFF_BATCH_SIZE="${MLFF_BATCH_SIZE:-32}"
 FORCE_AGGREGATION="${FORCE_AGGREGATION:-rms}"
@@ -91,7 +93,7 @@ TERMINAL_WEIGHT="${TERMINAL_WEIGHT:-5.0}"
 
 ENABLE_NOVELTY_PENALTY="${ENABLE_NOVELTY_PENALTY:-false}"
 NOVELTY_PENALTY_SCALE="${NOVELTY_PENALTY_SCALE:-0.5}"
-ENABLE_FILTERING="${ENABLE_FILTERING:-true}"
+ENABLE_FILTERING="${ENABLE_FILTERING:-false}"
 INVALID_PENALTY_SCALE="${INVALID_PENALTY_SCALE:-2.0}"
 DUPLICATE_PENALTY_SCALE="${DUPLICATE_PENALTY_SCALE:-0.0}"
 
@@ -173,7 +175,8 @@ fi
   train.epoch_per_rollout="${EPOCH_PER_ROLLOUT}" \
   train.force_alignment_enabled="${FORCE_ALIGNMENT_ENABLED}" \
   reward.use_energy="${USE_ENERGY}" \
-  reward.type="polar_mace" \
+  reward.type="${REWARD_TYPE}" \
+  reward.mlff_backend="${MLFF_BACKEND}" \
   reward.mlff_model="${MLFF_MODEL}" \
   reward.shaping.mlff_batch_size="${MLFF_BATCH_SIZE}" \
   reward.force_aggregation="${FORCE_AGGREGATION}" \

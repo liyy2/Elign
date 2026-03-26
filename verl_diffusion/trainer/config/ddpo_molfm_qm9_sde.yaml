@@ -4,6 +4,9 @@ defaults:
 
 name: molfm-qm9-sde
 
+filters:
+  enable_filtering: false
+
 model:
   backend: molfm
   # Place the upstream MolFM QM9 sampling bundle here:

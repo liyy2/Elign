@@ -16,7 +16,9 @@ dataloader:
   epoches: 200
 
 filters:
-  enable_filtering: true
+  # Keep duplicate rollouts for GRPO; hard dedup before advantage normalization
+  # collapses many groups to size 1 and zeros the learning signal.
+  enable_filtering: false
   enable_penalty: false
   penalty_scale: 0.0
   invalid_penalty_scale: 2.0
