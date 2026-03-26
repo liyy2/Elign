@@ -235,3 +235,5 @@ codex_scripts/__pycache__/
 geom_drugs_30.npy
 geom_permutation.npy
 pretrained/geoldm/
+data/ala2/
+external/timewarp-code/

@@ -1,0 +1,72 @@
+{
+  "run_name": "ala2_base",
+  "seed": 42,
+  "device": "auto",
+  "save_dir": "/home/yl2428/logs/ala2_scratch/pretrain",
+  "output_root": "outputs/ala2_scratch",
+  "wandb": {
+    "enabled": true,
+    "project": "ala2-diffusion",
+    "entity": null,
+    "group": "ala2-300k",
+    "tags": [
+      "ala2",
+      "pretrain",
+      "coordinate-diffusion"
+    ],
+    "mode": "online",
+    "name": "ala2_base_ad1_stride100"
+  },
+  "data": {
+    "dataset_path": "data/ala2/ala2_300k.npz",
+    "topology_path": "data/ala2/ala2_topology.json",
+    "metadata_path": "data/ala2/ala2_topology.json",
+    "split_path": "data/ala2/ala2_splits.npz",
+    "batch_size": 64,
+    "num_workers": 0,
+    "pin_memory": true,
+    "align": true,
+    "center": true,
+    "split": {
+      "train_fraction": 0.8,
+      "val_fraction": 0.1,
+      "test_fraction": 0.1
+    }
+  },
+  "model": {
+    "hidden_nf": 128,
+    "n_layers": 6,
+    "in_node_nf": 4,
+    "dropout": 0.0,
+    "attention": true,
+    "norm_constant": 1.0,
+    "normalization_factor": 1.0
+  },
+  "diffusion": {
+    "num_steps": 500,
+    "beta_schedule": "polynomial_2",
+    "noise_precision": 1e-5,
+    "prediction_type": "epsilon"
+  },
+  "train": {
+    "epochs": 25,
+    "ema_decay": 0.999,
+    "ema_start_step": 1000,
+    "learning_rate": 0.0002,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.999,
+    "adam_epsilon": 1e-08,
+    "weight_decay": 0.0001,
+    "scheduler": "cosine",
+    "max_grad_norm": 1.0,
+    "log_every": 10,
+    "eval_every": 1,
+    "sample_every": 1,
+    "save_every": 1,
+    "val_batches": 8,
+    "eval_seed": 42
+  },
+  "eval": {
+    "enable_eval_hook": true
+  }
+}

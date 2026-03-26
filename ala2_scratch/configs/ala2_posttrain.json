@@ -1,0 +1,77 @@
+{
+  "seed": 42,
+  "device": "cuda",
+  "save_dir": "/home/yl2428/logs/ala2_scratch/posttrain_terminal_energy",
+  "pretrained_checkpoint": "/home/yl2428/logs/ala2_scratch/pretrain/checkpoints/latest.pt",
+  "reference_checkpoint": null,
+  "model": {
+    "hidden_nf": 128,
+    "n_layers": 6,
+    "in_node_nf": 4,
+    "norm_constant": 1.0,
+    "normalization_factor": 1.0,
+    "device": "cuda"
+  },
+  "diffusion": {
+    "num_steps": 500,
+    "beta_schedule": "polynomial_2",
+    "noise_precision": 1e-5,
+    "device": "cuda"
+  },
+  "data": {
+    "dataset_path": "data/ala2/ala2_300k.npz",
+    "topology_path": "data/ala2/ala2_topology.json",
+    "metadata_path": "data/ala2/ala2_topology.json",
+    "split_path": "data/ala2/ala2_splits.npz",
+    "atomic_numbers": []
+  },
+  "mlff": {
+    "model_name": "polar-1-m",
+    "backend": null,
+    "device": "cuda",
+    "charge": 0,
+    "spin": 1,
+    "external_field": [
+      0.0,
+      0.0,
+      0.0
+    ],
+    "default_dtype": "float32",
+    "position_scale": 1.0
+  },
+  "train": {
+    "steps": 2000,
+    "batch_size": 16,
+    "lr": 1e-5,
+    "weight_decay": 0.0,
+    "grad_clip": 1.0,
+    "log_every": 10,
+    "save_every": 100,
+    "eval_every": 200,
+    "normalize_advantages": true,
+    "reference_l2_weight": 1e-4,
+    "reward_scale": 1.0,
+    "temperature_kelvin": 300.0,
+    "energy_offset": null,
+    "best_metric_name": "phi_psi_jsd",
+    "best_metric_mode": "min"
+  },
+  "eval": {
+    "sample_count": 256,
+    "sample_batch_size": 64,
+    "histogram_bins": 72
+  },
+  "wandb": {
+    "enabled": true,
+    "entity": null,
+    "project": "ala2-diffusion",
+    "group": "ala2-300k",
+    "name": "posttrain_terminal_energy",
+    "tags": [
+      "ala2",
+      "terminal-energy",
+      "scratch"
+    ],
+    "mode": "offline"
+  }
+}
