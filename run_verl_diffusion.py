@@ -298,7 +298,7 @@ def main(cfg: DictConfig) -> None:
         reward_type = str(reward_cfg.get("type", reward_type)).lower()
 
     reward_device = device
-    mlff_device = device if device.type == "cuda" else "cpu"
+    mlff_device = reward_cfg.get("mlff_device", device if device.type == "cuda" else "cpu")
     if reward_type in {"xtb", "dft", "pyscf"}:
         reward_device = torch.device("cpu")
 

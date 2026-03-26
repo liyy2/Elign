@@ -58,6 +58,12 @@ CLIP_RANGE="${CLIP_RANGE:-2e-3}"
 TRAIN_MICRO_BATCH_SIZE="${TRAIN_MICRO_BATCH_SIZE:-8}"
 EPOCH_PER_ROLLOUT="${EPOCH_PER_ROLLOUT:-1}"
 KL_PENALTY_WEIGHT="${KL_PENALTY_WEIGHT:-0.08}"
+EPOCHES="${EPOCHES:-}"
+MAX_TIME_HOURS="${MAX_TIME_HOURS:-}"
+EARLY_STOP_METRIC="${EARLY_STOP_METRIC:-}"
+EARLY_STOP_MODE="${EARLY_STOP_MODE:-}"
+EARLY_STOP_PATIENCE_MINUTES="${EARLY_STOP_PATIENCE_MINUTES:-}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-}"
 
 SAMPLE_GROUP_SIZE="${SAMPLE_GROUP_SIZE:-4}"
 EACH_PROMPT_SAMPLE="${EACH_PROMPT_SAMPLE:-6}"
@@ -140,6 +146,26 @@ if [[ -n "${CHECKPOINT_PATH}" ]]; then
   RESUME_FLAGS=("resume=true" "checkpoint_path=${CHECKPOINT_PATH}")
 fi
 
+declare -a TRAIN_CONTROL_FLAGS=()
+if [[ -n "${EPOCHES}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("dataloader.epoches=${EPOCHES}")
+fi
+if [[ -n "${MAX_TIME_HOURS}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("train.max_time_hours=${MAX_TIME_HOURS}")
+fi
+if [[ -n "${EARLY_STOP_METRIC}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("train.early_stop_metric=${EARLY_STOP_METRIC}")
+fi
+if [[ -n "${EARLY_STOP_MODE}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("train.early_stop_mode=${EARLY_STOP_MODE}")
+fi
+if [[ -n "${EARLY_STOP_PATIENCE_MINUTES}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("train.early_stop_patience_minutes=${EARLY_STOP_PATIENCE_MINUTES}")
+fi
+if [[ -n "${EARLY_STOP_MIN_DELTA}" ]]; then
+  TRAIN_CONTROL_FLAGS+=("train.early_stop_min_delta=${EARLY_STOP_MIN_DELTA}")
+fi
+
 if [[ "${USE_TORCHRUN}" == "1" ]]; then
   LAUNCHER=(torchrun --standalone --nproc_per_node="${GPUS_PER_NODE}")
 else
@@ -193,4 +219,5 @@ fi
   train.scheduler.warmup_steps="${SCHEDULER_WARMUP_STEPS}" \
   train.scheduler.total_steps="${SCHEDULER_TOTAL_STEPS}" \
   train.scheduler.min_lr_ratio="${SCHEDULER_MIN_LR_RATIO}" \
+  "${TRAIN_CONTROL_FLAGS[@]}" \
   "${SHAPING_FLAGS[@]}"

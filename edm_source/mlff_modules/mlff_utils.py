@@ -62,6 +62,12 @@ class LoadedMLFFPredictor:
         spin: int = 1,
         external_field: Sequence[float] = (0.0, 0.0, 0.0),
         default_dtype: str = "float32",
+        model: Optional[object] = None,
+        z_table: Optional[object] = None,
+        r_max: Optional[float] = None,
+        available_heads: Optional[Sequence[str]] = None,
+        head: Optional[str] = None,
+        model_dtype: Optional[torch.dtype] = None,
     ) -> None:
         self.backend = str(backend).lower()
         self.predictor = predictor
@@ -71,7 +77,15 @@ class LoadedMLFFPredictor:
         self.spin = int(spin)
         self.external_field = tuple(float(v) for v in external_field)
         self.default_dtype = str(default_dtype)
-        self.calculator = predictor if self.backend == "polar_mace" else None
+        self.model = model
+        self.z_table = z_table
+        self.r_max = None if r_max is None else float(r_max)
+        self.available_heads = tuple(available_heads) if available_heads is not None else ()
+        self.head = head
+        self.model_dtype = model_dtype
+        self.calculator = (
+            predictor if self.backend == "polar_mace" and hasattr(predictor, "calculate") else None
+        )
 
     def predict(self, *args, **kwargs):
         if not hasattr(self.predictor, "predict"):
@@ -121,6 +135,17 @@ def _normalize_external_field(
     if len(values) != 3:
         raise ValueError("external_field must contain exactly three components")
     return tuple(float(v) for v in values)
+
+
+def _resolve_mace_head(model) -> Tuple[Tuple[str, ...], str]:
+    available_heads = tuple(getattr(model, "heads", None) or ("Default",))
+    if len(available_heads) == 1:
+        return available_heads, available_heads[0]
+
+    for candidate in available_heads:
+        if str(candidate).lower() == "default":
+            return available_heads, candidate
+    return available_heads, available_heads[-1]
 
 
 def resolve_mlff_backend(mlff_model: Optional[str], backend: Optional[str] = None) -> str:
@@ -174,22 +199,43 @@ def get_mlff_predictor(
             model_name = "polar-1-m"
         try:
             from mace.calculators import mace_polar
+            from mace.tools import utils as mace_utils
 
-            calculator = mace_polar(
+            model = mace_polar(
                 model=str(model_name),
                 device=target_device,
                 default_dtype=str(default_dtype),
+                return_raw_model=True,
+            )
+            if str(default_dtype) == "float64":
+                model = model.double()
+            else:
+                model = model.float()
+            model = model.to(target_device)
+            model.eval()
+            for param in model.parameters():
+                param.requires_grad = False
+
+            available_heads, head = _resolve_mace_head(model)
+            z_table = mace_utils.AtomicNumberTable(
+                [int(z) for z in getattr(model, "atomic_numbers")]
             )
             logger.info("Successfully loaded Polar MACE predictor: %s", model_name)
             return LoadedMLFFPredictor(
                 backend="polar_mace",
-                predictor=calculator,
+                predictor=model,
                 device=target_device,
                 model_name=str(model_name),
                 charge=charge,
                 spin=spin,
                 external_field=field,
                 default_dtype=str(default_dtype),
+                model=model,
+                z_table=z_table,
+                r_max=float(getattr(model, "r_max")),
+                available_heads=available_heads,
+                head=head,
+                model_dtype=next(model.parameters()).dtype,
             )
         except Exception as e:
             logger.error("Failed to load Polar MACE predictor '%s': %s", model_name, e)
