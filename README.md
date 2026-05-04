@@ -1,6 +1,6 @@
 <div align="center">
 
-# ICML 2026 ELIGN
+# [ICML 2026] ELIGN
 
 **Equivariant Diffusion Alignment with Foundational ML Force Fields**
 
